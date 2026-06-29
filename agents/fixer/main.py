@@ -11,11 +11,15 @@ tracking record lifecycle, and PR creation are all UNCHANGED.
 import logging
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json as _json
 
 from github import Github
 from scan_report_client import ScanReportClient, ScanReportError
 from scan_fetcher import ScanFetcher, ScanFetchError
+from scan_poller import ScanPoller
 from repo_ops import RepoOps
 from code_fixer import CodeFixer, InvalidRetryError
 from pr_client import PRClient
@@ -36,23 +40,111 @@ logger = logging.getLogger("fixer.main")
 MAX_PARALLEL_FIXES = int(os.environ.get("MAX_PARALLEL_FIXES", "5"))
 AUTO_FETCH_SCAN    = os.environ.get("AUTO_FETCH_SCAN", "0") == "1"
 
+# Prevents concurrent fresh-scan runs if the poller fires while one is in progress.
+_fresh_scan_lock = threading.Lock()
+
 
 def main():
     retry_tracking_id = os.environ.get("RETRY_TRACKING_ID")
+    server_mode       = os.environ.get("FIXER_SERVER_MODE", "0") == "1"
+
     if retry_tracking_id:
         _run_retry(retry_tracking_id)
+    elif server_mode:
+        _run_server()
     else:
         _run_fresh_scan()
+
+
+# ── Mode C: server (always-on for local simulation) ───────────────────────────
+
+def _run_server():
+    """
+    Long-running mode used by `docker compose up -d`.
+
+    Starts two background workers:
+      1. ScanPoller — polls GitHub every SCAN_POLL_INTERVAL seconds for new
+         completed security-scan.yml runs and triggers _run_fresh_scan() when found.
+      2. HTTP server on :8080 — accepts POST /retry from the Watcher and
+         invokes _run_retry() for CI-failure re-fix attempts.
+    """
+    github_repo = os.environ["GITHUB_REPO_TARGET"]
+    github_pat  = os.environ["GITHUB_PAT"]
+    report_dir  = os.environ.get("SCAN_REPORT_PATH", "/reports")
+    poll_interval = int(os.environ.get("SCAN_POLL_INTERVAL", "60"))
+
+    logger.info("Fixer server mode: starting scan poller and HTTP retry server.")
+
+    poller = ScanPoller(
+        repo_full_name=github_repo,
+        github_pat=github_pat,
+        report_dir=report_dir,
+        on_new_scan_ready=_run_fresh_scan,
+        poll_interval=poll_interval,
+    )
+    poller_thread = threading.Thread(target=poller.poll_forever, daemon=True, name="scan-poller")
+    poller_thread.start()
+
+    server = _make_retry_server(port=8080)
+    logger.info("Fixer HTTP server listening on :8080")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Fixer server shutting down.")
+
+
+def _make_retry_server(port: int) -> HTTPServer:
+    class RetryHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path != "/retry":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            body   = self.rfile.read(length)
+            try:
+                data = _json.loads(body)
+                tracking_id = data["tracking_id"]
+            except (KeyError, ValueError):
+                self.send_error(400, "Expected JSON with tracking_id")
+                return
+
+            self.send_response(202)
+            self.end_headers()
+
+            threading.Thread(
+                target=_run_retry,
+                args=(tracking_id,),
+                daemon=True,
+                name=f"retry-{tracking_id[:8]}",
+            ).start()
+            logger.info("Retry accepted for tracking_id=%s", tracking_id[:8])
+
+        def log_message(self, fmt, *args):  # suppress default access log noise
+            logger.debug("HTTP %s", fmt % args)
+
+    return HTTPServer(("0.0.0.0", port), RetryHandler)
 
 
 # ── Mode A: fresh scan ────────────────────────────────────────────────────────
 
 def _run_fresh_scan():
+    if not _fresh_scan_lock.acquire(blocking=False):
+        logger.info("Fresh scan already in progress — skipping this trigger.")
+        return
+    try:
+        _do_fresh_scan()
+    finally:
+        _fresh_scan_lock.release()
+
+
+def _do_fresh_scan():
     logger.info("Mode: FRESH SCAN (scheduler-triggered)")
 
     github_repo     = os.environ["GITHUB_REPO_TARGET"]
     github_repo_url = f"https://github.com/{github_repo}.git"
     github_pat      = os.environ["GITHUB_PAT"]
+
+    server_mode = os.environ.get("FIXER_SERVER_MODE", "0") == "1"
 
     if AUTO_FETCH_SCAN:
         report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
@@ -66,6 +158,8 @@ def _run_fresh_scan():
             fetcher.trigger_and_download()
         except ScanFetchError as exc:
             logger.error("Scan fetch failed: %s", exc)
+            if server_mode:
+                return
             sys.exit(1)
 
     tracking_store = make_tracking_store()
@@ -75,6 +169,8 @@ def _run_fresh_scan():
         findings = scanner.get_vulnerability_report()
     except ScanReportError as exc:
         logger.error("Scan report load failed: %s", exc)
+        if server_mode:
+            return
         sys.exit(1)
 
     if not findings:

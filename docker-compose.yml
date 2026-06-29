@@ -1,52 +1,14 @@
 services:
 
-  # ── Fixer ──────────────────────────────────────────────────────────────────
-  # Runs once per invocation (batch job). Two modes:
-  #   Fresh scan:  docker compose run --rm fixer
-  #   Retry:       docker compose run --rm -e RETRY_TRACKING_ID=<id> fixer
-  fixer:
-    build:
-      context: .
-      dockerfile: agents/fixer/Dockerfile
-    env_file: config/.env
-    environment:
-      TRACKING_STORE_PATH: /data/tracking.json
-      SCAN_REPORT_PATH: /reports
-    volumes:
-      # Scan reports produced by security-scan.yml (download the artifact here)
-      - ./scan-reports:/reports:ro
-      # Shared tracking state — survives container restarts
-      - tracking-data:/data
-      # GCP credentials for Vertex AI (ADC)
-      - ./config/my-google-service-account.json:/gcp/adc.json:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  # ── Watcher ────────────────────────────────────────────────────────────────
-  # Runs once per invocation (batch job). Trigger manually or via cron:
-  #   docker compose run --rm watcher
+  # ── Fixer server (always-on) ──────────────────────────────────────────────
+  # Start with: docker compose up -d
   #
-  # On CI failure the Watcher uses HttpFixerInvoker to POST to the fixer
-  # service. Start fixer as a long-running service first if you need retries:
-  #   docker compose up -d fixer-server  (see fixer-server service below)
-  watcher:
-    build:
-      context: .
-      dockerfile: agents/watcher/Dockerfile
-    env_file: config/.env
-    environment:
-      TRACKING_STORE_PATH: /data/tracking.json
-      FIXER_RETRY_URL: http://fixer-server:8080/retry
-    volumes:
-      - tracking-data:/data
-    depends_on:
-      - fixer-server
-
-  # ── Fixer (server mode for retry invocation) ───────────────────────────────
-  # Keeps the fixer container alive to receive retry POSTs from the Watcher.
-  # Only needed if you want the full retry loop locally.
-  #   docker compose up -d fixer-server
-  #   docker compose run --rm watcher
+  # Runs two background workers:
+  #   1. ScanPoller — polls GitHub every SCAN_POLL_INTERVAL seconds. When the
+  #      security-scan.yml workflow you triggered manually completes, it
+  #      downloads the artifact and kicks off the fix flow automatically.
+  #   2. HTTP server on :8080 — accepts POST /retry from the Watcher when
+  #      a remediation PR fails CI and needs another fix attempt.
   fixer-server:
     build:
       context: .
@@ -56,12 +18,66 @@ services:
       TRACKING_STORE_PATH: /data/tracking.json
       SCAN_REPORT_PATH: /reports
       FIXER_SERVER_MODE: "1"
+      SCAN_POLL_INTERVAL: "60"      # seconds between GitHub Actions polls
     ports:
       - "8080:8080"
     volumes:
-      - ./scan-reports:/reports:ro
+      # Writable — the ScanPoller downloads artifacts here
+      - ./scan-reports:/reports
+      # Shared tracking state — survives container restarts
+      - tracking-data:/data
+      # GCP credentials for Vertex AI (ADC)
+      - ./config/my-google-service-account.json:/gcp/adc.json:ro
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── Watcher (always-on) ───────────────────────────────────────────────────
+  # Starts automatically with: docker compose up -d
+  #
+  # Runs a cycle every WATCHER_SLEEP_SECONDS (default 15 min):
+  #   - Finds open fix/* PRs in the target repo
+  #   - Polls CI status for each
+  #   - On CI pass → marks tracking record resolved
+  #   - On CI fail → invokes the fixer-server /retry endpoint
+  watcher:
+    build:
+      context: .
+      dockerfile: agents/watcher/Dockerfile
+    env_file: config/.env
+    environment:
+      TRACKING_STORE_PATH: /data/tracking.json
+      FIXER_RETRY_URL: http://fixer-server:8080/retry
+      WATCHER_DAEMON: "1"
+      WATCHER_SLEEP_SECONDS: "900"  # 15 minutes
+    volumes:
+      - tracking-data:/data
+    depends_on:
+      - fixer-server
+    restart: unless-stopped
+
+  # ── Fixer one-shot (manual use) ───────────────────────────────────────────
+  # For ad-hoc runs outside the always-on flow.
+  #   Fresh scan (reports already in ./scan-reports):
+  #     docker compose run --rm fixer
+  #   Fresh scan + auto-trigger + download:
+  #     docker compose run --rm -e AUTO_FETCH_SCAN=1 fixer
+  #   Retry a specific tracking ID:
+  #     docker compose run --rm -e RETRY_TRACKING_ID=<id> fixer
+  fixer:
+    build:
+      context: .
+      dockerfile: agents/fixer/Dockerfile
+    env_file: config/.env
+    environment:
+      TRACKING_STORE_PATH: /data/tracking.json
+      SCAN_REPORT_PATH: /reports
+    volumes:
+      - ./scan-reports:/reports
       - tracking-data:/data
       - ./config/my-google-service-account.json:/gcp/adc.json:ro
+    profiles:
+      - manual
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

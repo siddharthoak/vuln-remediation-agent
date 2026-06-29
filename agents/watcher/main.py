@@ -20,6 +20,7 @@ The Watcher NEVER:
 import logging
 import os
 import sys
+import time
 
 from github import Github
 from ci_status import CIStatusWatcher, CIOutcome
@@ -51,10 +52,27 @@ def find_open_remediation_prs(repo):
 
 
 def main():
-    github_repo = os.environ["GITHUB_REPO_TARGET"]
-    github_pat = os.environ["GITHUB_PAT"]
+    daemon   = os.environ.get("WATCHER_DAEMON", "0") == "1"
+    interval = int(os.environ.get("WATCHER_SLEEP_SECONDS", "900"))  # default 15 min
 
-    gh = Github(github_pat)
+    if daemon:
+        logger.info("Watcher daemon mode: cycling every %d seconds.", interval)
+        while True:
+            try:
+                _run_once()
+            except Exception as exc:
+                logger.error("Watcher cycle error: %s", exc, exc_info=True)
+            logger.info("Watcher sleeping %d seconds until next cycle.", interval)
+            time.sleep(interval)
+    else:
+        _run_once()
+
+
+def _run_once():
+    github_repo = os.environ["GITHUB_REPO_TARGET"]
+    github_pat  = os.environ["GITHUB_PAT"]
+
+    gh   = Github(github_pat)
     repo = gh.get_repo(github_repo)
 
     remediation_prs = find_open_remediation_prs(repo)
@@ -65,9 +83,9 @@ def main():
     logger.info("Watching %d open remediation PR(s).", len(remediation_prs))
 
     tracking_store = make_tracking_store()
-    ci_watcher = CIStatusWatcher(repo_full_name=github_repo, github_pat=github_pat)
-    pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
-    retry_gate = RetryGate(
+    ci_watcher     = CIStatusWatcher(repo_full_name=github_repo, github_pat=github_pat)
+    pr_client      = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+    retry_gate     = RetryGate(
         tracking_store=tracking_store,
         pr_client=pr_client,
         fixer_invoker=make_fixer_invoker(),

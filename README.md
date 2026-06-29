@@ -8,7 +8,7 @@ Migrated from `nexus-remediation-agent`. Same Fixer + Watcher architecture, swap
 | Vulnerability source | Nexus IQ Server API | OWASP DC / Trivy / Grype JSON reports |
 | Tracking store | Azure Cosmos DB | JSON file (local) / Firestore (GCP) |
 | Fixer invocation | Azure AI Foundry SDK | HTTP POST (local) / Cloud Run Job (GCP) |
-| Scheduling | AAF hosted agent schedule | `docker compose run` / Cloud Scheduler |
+| Scheduling | AAF hosted agent schedule | `docker compose up -d` (local) / Cloud Scheduler (GCP) |
 
 **What is identical:** `RetryGate`, `PRClient`, `RepoOps`, `CIStatusWatcher`, `TrackingRecord`, the four tool handler methods, `FRESH_FIX_PROMPT`, `RETRY_FIX_PROMPT`, retry bound logic.
 
@@ -16,14 +16,17 @@ Migrated from `nexus-remediation-agent`. Same Fixer + Watcher architecture, swap
 
 ## Local Testing Guide
 
-Full end-to-end walkthrough — from opening a PR on the target repo to a remediated dependency on a merged `fix/` branch.
+Full end-to-end walkthrough — from triggering a scan on the target repo to remediated dependencies on merged `fix/` branches.
 
 **Pipeline at a glance:**
 
 ```
-[1 Open PR] → [2 Scan runs] → [3 Download reports] → [4 Fixer (Gemini)] → [5 CI runs] → [6 Watcher + retry] → [CI_PASSED]
-  GitHub         GH Actions       You (manual)            Docker              GH Actions      Docker
+[1 Start agents] → [2 Trigger scan] → [3 Auto-fetch reports] → [4 Fixer (Gemini)] → [5 CI runs] → [6 Watcher + retry] → [CI_PASSED]
+  docker compose     GitHub Actions        ScanPoller                 fixer-server       GH Actions      watcher daemon
+  up -d              (manual dispatch)     (auto, ~60s poll)
 ```
+
+Both `fixer-server` and `watcher` run as long-lived services. You only need to trigger the GitHub Action — the agents do everything else.
 
 ---
 
@@ -32,7 +35,7 @@ Full end-to-end walkthrough — from opening a PR on the target repo to a remedi
 - Docker ≥ 24 and Docker Compose ≥ 2.20
 - A GCP project with **Vertex AI API** enabled and billing active
 - `gcloud` CLI installed; run `gcloud auth application-default login` before starting
-- GitHub PAT with `repo` and `pull_request` scopes
+- GitHub PAT with `repo`, `pull_request`, and `actions:read` scopes
 - A fork (or your own copy) of `vulnerable-java-app` as the remediation target — the repo the agent will open PRs against
 
 ---
@@ -53,24 +56,45 @@ Edit `config/.env` — the required values:
 | Variable | Example | Where to get it |
 |---|---|---|
 | `GITHUB_REPO_TARGET` | `your-org/vulnerable-java-app` | The fork you set up |
-| `GITHUB_PAT` | `ghp_xxxxxxxxxxxx` | GitHub → Settings → Developer settings → Tokens (needs `repo` + `pull_request` scopes) |
+| `GITHUB_PAT` | `ghp_xxxxxxxxxxxx` | GitHub → Settings → Developer settings → Tokens (needs `repo` + `pull_request` + `actions:read` scopes) |
 | `GOOGLE_CLOUD_PROJECT` | `my-gcp-project-id` | GCP Console → Project info |
 | `GOOGLE_APPLICATION_CREDENTIALS` | `/gcp/adc.json` | Leave as-is — this is the in-container path where `docker-compose.yml` mounts the SA key |
 
 Place your GCP Service Account JSON at `config/my-google-service-account.json`. `docker-compose.yml` mounts it into every container at `/gcp/adc.json`. The SA account needs the `roles/aiplatform.user` role on the GCP project.
 
 ```bash
-# Build the fixer, watcher, and fixer-server images
+# Build all images
 docker compose build
 ```
 
 ---
 
-### Phase 1 — Trigger a security scan on the target repo
+### Phase 1 — Start the agents
+
+```bash
+docker compose up -d
+```
+
+This starts two always-on services:
+
+| Service | What it runs |
+|---|---|
+| `fixer-server` | **ScanPoller** (background thread) — polls `security-scan.yml` workflow runs every 60s; downloads the artifact and kicks off fixes when a new completed run is detected. **HTTP server** on `:8080` — accepts `POST /retry` from the Watcher for CI-failure re-fix attempts. |
+| `watcher` | Daemon loop — runs a PR-watching cycle every 15 minutes, polls CI status, and triggers retries via `fixer-server` on CI failure. |
+
+Tail logs while you work:
+
+```bash
+docker compose logs -f fixer-server watcher
+```
+
+---
+
+### Phase 2 — Trigger a security scan on the target repo
 
 The `security-scan.yml` workflow in `vulnerable-java-app` runs on every PR targeting `main`, and on manual `workflow_dispatch`. Either path works.
 
-**Option A — Manual dispatch (no PR needed)**
+**Option A — Manual dispatch (recommended for local testing)**
 
 1. Go to your fork on GitHub → **Actions** tab
 2. Select **Security Scan** in the left sidebar
@@ -98,66 +122,18 @@ git push origin test/trigger-scan
 
 The workflow runs three scanners — OWASP Dependency-Check (~4 min), Trivy (~1 min), Grype (~1 min). All three run even if one fails (`if: always()` on each step). Total runtime: 5–10 minutes.
 
----
-
-### Phase 2 — Stage the scan reports
-
-The Fixer needs the three scanner JSON reports in `./scan-reports/` before it can run. There are two ways to get them there.
+**You don't need to do anything else.** The `fixer-server`'s ScanPoller detects the completed run within `SCAN_POLL_INTERVAL` seconds, downloads the `vulnerability-reports` artifact into `./scan-reports/`, and immediately starts the fix flow. Watch `docker compose logs -f fixer-server` to see it happen.
 
 ---
 
-#### Option A — Automatic (recommended): `AUTO_FETCH_SCAN=1`
+### What happens automatically after the scan completes
 
-Set `AUTO_FETCH_SCAN=1` in `config/.env`, then skip ahead to Phase 3. When the Fixer container starts it will:
+**Fixer (inside `fixer-server`):**
 
-1. Trigger the `security-scan.yml` workflow on `GITHUB_REPO_TARGET` via `workflow_dispatch`
-2. Poll until the run completes (OWASP DC + Trivy + Grype takes ~8–12 min)
-3. Download the `vulnerability-reports` artifact and extract it into `/reports` (the container's view of `./scan-reports/`)
-
-The workflow always uploads its artifact even when the run conclusion is `failure` (expected — the app has intentional CVEs that trip `--failOnCVSS 7`).
-
-> **PAT requirement:** `AUTO_FETCH_SCAN=1` requires the PAT to have `actions:write` permission (fine-grained) or the `workflow` scope (classic) so it can trigger `workflow_dispatch`.
-
----
-
-#### Option B — Manual: download with `gh` CLI
-
-```bash
-# Trigger the scan first (if it hasn't run yet)
-gh workflow run security-scan.yml --repo your-org/vulnerable-java-app
-
-# Wait for it to finish, then download the artifact
-gh run download \
-  --repo your-org/vulnerable-java-app \
-  --name vulnerability-reports \
-  --dir scan-reports
-```
-
-Expected directory layout after download:
-
-```
-scan-reports/
-├── trivy-report.json
-├── grype-report.json
-└── dependency-check-report/
-    └── dependency-check-report.json
-```
-
-`ScanReportClient` reads all three formats, deduplicates findings by `(component_name, current_version)`, and presents a merged list to the Fixer. A missing file logs a warning but does not abort the run — you can test with a single scanner's output.
-
----
-
-### Phase 3 — Run the Fixer (fresh scan mode)
-
-```bash
-docker compose run --rm fixer
-```
-
-**What happens inside the container:**
-
-1. `ScanReportClient` reads the three JSON files from `/reports` (bind-mounted from `./scan-reports/`) and produces a deduplicated findings list.
-2. A `CREATED` tracking record is written to `tracking.json` (on the `tracking-data` Docker volume) for each finding.
-3. Up to `MAX_PARALLEL_FIXES=5` findings are processed concurrently. For each:
+1. ScanPoller detects the new completed run and downloads the `vulnerability-reports` artifact.
+2. `ScanReportClient` reads the three JSON files and produces a deduplicated findings list.
+3. A `CREATED` tracking record is written to `tracking.json` (on the `tracking-data` Docker volume) for each finding.
+4. Up to `MAX_PARALLEL_FIXES=5` findings are processed concurrently. For each:
 
 | Step | What happens |
 |---|---|
@@ -177,68 +153,29 @@ Verify PRs were opened:
 gh pr list --repo your-org/vulnerable-java-app --head "fix/"
 ```
 
----
+**Watcher (on its next 15-minute cycle):**
 
-### Phase 4 — Run the Watcher and the retry loop
-
-The Watcher polls CI status on all open `fix/` PRs. On failure it triggers an informed retry via the fixer-server.
-
-**Start the fixer-server** (keep running):
-
-```bash
-docker compose up -d fixer-server
-docker compose logs -f fixer-server   # tail logs in a second terminal
-```
-
-**Run the Watcher:**
-
-```bash
-# Run once; re-run to simulate the 15-minute polling schedule
-docker compose run --rm watcher
-```
-
-**What happens for each open PR:**
+For each open `fix/` PR:
 
 | CI result | Watcher action |
 |---|---|
 | **CI passed** | Record updated to `CI_PASSED`. PR is ready for human review. |
-| **CI timed out** | Warning logged. Record stays `CI_PENDING`. Re-checked on next watcher run. |
-| **CI failed — under retry limit** | Record → `CI_FAILED`. Child record created: `RETRY_REQUESTED` with `failure_log_excerpt` (CI failure log, truncated to 4,000 chars). POST sent to `http://fixer-server:8080/retry`. |
+| **CI timed out** | Warning logged. Record stays `CI_PENDING`. Re-checked on next cycle. |
+| **CI failed — under retry limit** | Record → `CI_FAILED`. Child record created: `RETRY_REQUESTED` with `failure_log_excerpt` (CI failure log, truncated to 4,000 chars). `POST /retry` sent to `fixer-server`. |
 | **CI failed — limit reached** | Record → `FAILED_MAX_RETRIES`. Escalation comment posted on the PR. Fixer never invoked again for this PR. |
 
-**What fixer-server does on retry (Entry Point B):**
+**What fixer-server does on retry:**
 
 1. Reads the `RETRY_REQUESTED` tracking record by ID.
 2. Validates: status must be exactly `RETRY_REQUESTED`; attempt number ≤ `MAX_RETRY_ATTEMPTS`.
 3. Checks out the **existing PR branch** — no new branch.
 4. Runs `RETRY_FIX_PROMPT` with the CI failure log at the top. Gemini sees exactly what broke and why.
 5. Pushes a corrective commit to the same branch. CI reruns automatically.
-6. Updates tracking record to `CI_PENDING`. Watcher picks it up on the next run.
-
-**To force a CI failure for testing**, temporarily add a Maven Enforcer rule that checks for an undefined property:
-
-```xml
-<!-- Add to vulnerable-java-app pom.xml temporarily -->
-<plugin>
-  <groupId>org.apache.maven.plugins</groupId>
-  <artifactId>maven-enforcer-plugin</artifactId>
-  <version>3.4.1</version>
-  <executions><execution><goals><goal>enforce</goal></goals>
-    <configuration><rules>
-      <requireProperty>
-        <property>DELIBERATELY_FAIL</property>
-        <message>Set DELIBERATELY_FAIL to trigger retry</message>
-      </requireProperty>
-    </rules></configuration>
-  </execution></executions>
-</plugin>
-```
-
-Set `MAX_RETRY_ATTEMPTS=1` in `config/.env` to reach `FAILED_MAX_RETRIES` quickly.
+6. Updates tracking record to `CI_PENDING`. Watcher picks it up on its next cycle.
 
 ---
 
-### Phase 5 — Inspect tracking state
+### Phase 3 — Inspect tracking state
 
 ```bash
 # Pretty-print the full tracking store
@@ -273,13 +210,43 @@ CREATED → PR_OPENED → CI_PENDING → CI_PASSED              (human review)
 | `failure_log_excerpt` | CI failure log injected into the retry prompt (retry records only) |
 | `token_usage` | Gemini prompt + completion tokens for this attempt |
 
-**Manual retry (without fixer-server):**
+---
+
+### Ad-hoc / manual operations
+
+The one-shot `fixer` service is available for manual use (it's excluded from `docker compose up -d` via a Docker profile):
 
 ```bash
-# The Watcher logs the RETRY_TRACKING_ID it would have POSTed.
-# Pass it directly to the fixer container:
-docker compose run --rm -e RETRY_TRACKING_ID=<id-from-watcher-log> fixer
+# Fresh scan using reports already in ./scan-reports/
+docker compose run --rm --profile manual fixer
+
+# Fresh scan + trigger + download (AUTO_FETCH_SCAN)
+docker compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
+
+# Manual retry for a specific tracking ID
+docker compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
 ```
+
+To force a CI failure for testing, temporarily add a Maven Enforcer rule:
+
+```xml
+<!-- Add to vulnerable-java-app pom.xml temporarily -->
+<plugin>
+  <groupId>org.apache.maven.plugins</groupId>
+  <artifactId>maven-enforcer-plugin</artifactId>
+  <version>3.4.1</version>
+  <executions><execution><goals><goal>enforce</goal></goals>
+    <configuration><rules>
+      <requireProperty>
+        <property>DELIBERATELY_FAIL</property>
+        <message>Set DELIBERATELY_FAIL to trigger retry</message>
+      </requireProperty>
+    </rules></configuration>
+  </execution></executions>
+</plugin>
+```
+
+Set `MAX_RETRY_ATTEMPTS=1` in `config/.env` to reach `FAILED_MAX_RETRIES` quickly.
 
 ---
 
@@ -287,13 +254,13 @@ docker compose run --rm -e RETRY_TRACKING_ID=<id-from-watcher-log> fixer
 
 | Scenario | How to trigger | What to observe |
 |---|---|---|
-| **Happy path** | Run fixer with the default 8-CVE pom.xml | 8 `fix/` PRs opened; records progress to `CI_PASSED` |
-| **Informed retry** | Force CI failure; run watcher | `RETRY_REQUESTED` record has `failure_log_excerpt`; fixer-server pushes a corrective commit |
+| **Happy path** | `docker compose up -d`; trigger scan | `fix/` PRs opened automatically; records progress to `CI_PASSED` |
+| **Informed retry** | Force CI failure via Enforcer rule | `RETRY_REQUESTED` record has `failure_log_excerpt`; fixer-server pushes a corrective commit |
 | **Retry exhaustion** | `MAX_RETRY_ATTEMPTS=1`; force CI failure | Record reaches `FAILED_MAX_RETRIES` after one retry; PR gets escalation comment |
-| **New CVE mid-run** | Add a new vulnerable dep; re-run scan; re-stage reports; re-run fixer | Only the new finding gets a fresh PR (existing records not re-processed) |
+| **New CVE mid-run** | Add a new vulnerable dep; trigger scan again | ScanPoller detects the new completed run; only the new finding gets a fresh PR |
 | **Single scanner** | Remove `grype-report.json` from `scan-reports/` | Fixer logs a warning; continues with Trivy + OWASP DC only |
 | **Compile error recovery** | Upgrade a library with a known API removal | First `run_maven_compile` fails; Gemini reads stderr, calls `apply_file_change` again; second compile passes |
-| **Idempotent PR** | Run fixer twice without merging PRs | Second run skips PR creation for branches that already have an open PR |
+| **Idempotent PR** | Scan poller fires twice for the same run | Checkpoint prevents re-download; already-open PRs are skipped |
 
 ---
 
@@ -301,7 +268,7 @@ docker compose run --rm -e RETRY_TRACKING_ID=<id-from-watcher-log> fixer
 
 > **Not yet implemented.** These agents are planned; see `nexus-remediation-agent/DiscussionPoints-v1.md` for the full specification. The current Fixer goes directly from scan reports to the Gemini tool-use loop, relying on parametric (training-data) knowledge.
 
-Phase 2 inserts two new agents before the Fixer, changing what happens in Phase 3 above:
+Phase 2 inserts two new agents before the Fixer, changing what happens after the ScanPoller triggers:
 
 ```
 [scan reports] → [Knowledge Agent] → [Classifier] → [Fixer] → ...
@@ -345,17 +312,21 @@ The Classifier writes its bucket decision and rationale to each finding's tracki
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `GITHUB_REPO_TARGET` | ✓ | — | `owner/repo` of the repo to remediate |
-| `GITHUB_PAT` | ✓ | — | PAT with `repo` + `pull_request` scopes |
+| `GITHUB_PAT` | ✓ | — | PAT with `repo` + `pull_request` + `actions:read` scopes |
 | `GOOGLE_CLOUD_PROJECT` | ✓ | — | GCP project for Vertex AI |
 | `VERTEX_LOCATION` | | `us-central1` | Vertex AI region |
 | `VERTEX_MODEL` | | `gemini-2.0-flash-001` | Gemini model name |
 | `GOOGLE_APPLICATION_CREDENTIALS` | ✓ | — | In-container path to GCP credentials JSON; `docker-compose.yml` mounts `./config/my-google-service-account.json` here as `/gcp/adc.json` |
+| `FIXER_SERVER_MODE` | | `0` | Set to `1` to run the fixer as a long-lived server (ScanPoller + HTTP retry endpoint). Set automatically by `fixer-server` in `docker-compose.yml`. |
+| `SCAN_POLL_INTERVAL` | | `60` | Seconds between GitHub Actions polls in server mode |
+| `WATCHER_DAEMON` | | `0` | Set to `1` to run the watcher as a daemon loop instead of a one-shot batch job. Set automatically by the `watcher` service in `docker-compose.yml`. |
+| `WATCHER_SLEEP_SECONDS` | | `900` | Seconds between watcher cycles in daemon mode (default 15 min) |
 | `MAX_RETRY_ATTEMPTS` | | `3` | Hard retry bound per PR |
 | `MAX_PARALLEL_FIXES` | | `5` | Concurrent fixer workers |
 | `CI_POLL_INTERVAL` | | `30` | Seconds between CI status checks |
 | `CI_TIMEOUT_SECONDS` | | `1800` | Max wait for CI (30 min) |
 | `SCAN_REPORT_PATH` | | `/reports` | Directory containing scanner JSON files |
 | `TRACKING_STORE_PATH` | | `/data/tracking.json` | State file path inside container |
-| `FIXER_RETRY_URL` | | — | HTTP endpoint for retry invocation (fixer-server mode) |
-| `AUTO_FETCH_SCAN` | | `0` | Set to `1` to trigger the scan workflow and download reports automatically before fixing |
-| `RETRY_TRACKING_ID` | | — | Set by Watcher for Mode B (retry) runs |
+| `FIXER_RETRY_URL` | | — | HTTP endpoint for retry invocation (set to `http://fixer-server:8080/retry` by the watcher service) |
+| `AUTO_FETCH_SCAN` | | `0` | Set to `1` on one-shot fixer runs to trigger + download the scan workflow before fixing (alternative to ScanPoller for manual use) |
+| `RETRY_TRACKING_ID` | | — | Set by Watcher for retry runs, or pass manually to the one-shot fixer |
