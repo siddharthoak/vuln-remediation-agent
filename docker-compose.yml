@@ -8,7 +8,7 @@ services:
     build:
       context: .
       dockerfile: agents/fixer/Dockerfile
-    env_file: .env
+    env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
       SCAN_REPORT_PATH: /reports
@@ -18,7 +18,7 @@ services:
       # Shared tracking state — survives container restarts
       - tracking-data:/data
       # GCP credentials for Vertex AI (ADC)
-      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/adc.json:ro
+      - ./config/my-google-service-account.json:/gcp/adc.json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -33,7 +33,7 @@ services:
     build:
       context: .
       dockerfile: agents/watcher/Dockerfile
-    env_file: .env
+    env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
       FIXER_RETRY_URL: http://fixer-server:8080/retry
@@ -51,7 +51,7 @@ services:
     build:
       context: .
       dockerfile: agents/fixer/Dockerfile
-    env_file: .env
+    env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
       SCAN_REPORT_PATH: /reports
@@ -61,7 +61,7 @@ services:
     volumes:
       - ./scan-reports:/reports:ro
       - tracking-data:/data
-      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/adc.json:ro
+      - ./config/my-google-service-account.json:/gcp/adc.json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

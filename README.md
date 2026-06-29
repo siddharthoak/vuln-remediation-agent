@@ -44,25 +44,25 @@ Full end-to-end walkthrough — from opening a PR on the target repo to a remedi
 git clone <vuln-remediation-agent-repo>
 cd vuln-remediation-agent
 
-# Create your .env
-cp .env.example .env
+# Create your config/.env
+cp .env.example config/.env
 ```
 
-Edit `.env` — the required values:
+Edit `config/.env` — the required values:
 
 | Variable | Example | Where to get it |
 |---|---|---|
 | `GITHUB_REPO_TARGET` | `your-org/vulnerable-java-app` | The fork you set up |
-| `GITHUB_PAT` | `ghp_xxxxxxxxxxxx` | GitHub → Settings → Developer settings → Tokens |
+| `GITHUB_PAT` | `ghp_xxxxxxxxxxxx` | GitHub → Settings → Developer settings → Tokens (needs `repo` + `pull_request` scopes) |
 | `GOOGLE_CLOUD_PROJECT` | `my-gcp-project-id` | GCP Console → Project info |
-| `GOOGLE_APPLICATION_CREDENTIALS` | `/Users/you/.config/gcloud/application_default_credentials.json` | Written by `gcloud auth application-default login` |
+| `GOOGLE_APPLICATION_CREDENTIALS` | `/gcp/adc.json` | Leave as-is — this is the in-container path where `docker-compose.yml` mounts the SA key |
+
+Place your GCP Service Account JSON at `config/my-google-service-account.json`. `docker-compose.yml` mounts it into every container at `/gcp/adc.json`. The SA account needs the `roles/aiplatform.user` role on the GCP project.
 
 ```bash
 # Build the fixer, watcher, and fixer-server images
 docker compose build
 ```
-
-> **ADC credentials** — `docker-compose.yml` mounts `GOOGLE_APPLICATION_CREDENTIALS` into every container at `/gcp/adc.json`. Make sure this path on your host machine points to the file written by `gcloud auth application-default login`.
 
 ---
 
@@ -218,7 +218,7 @@ docker compose run --rm watcher
 </plugin>
 ```
 
-Set `MAX_RETRY_ATTEMPTS=1` in `.env` to reach `FAILED_MAX_RETRIES` quickly.
+Set `MAX_RETRY_ATTEMPTS=1` in `config/.env` to reach `FAILED_MAX_RETRIES` quickly.
 
 ---
 
@@ -333,7 +333,7 @@ The Classifier writes its bucket decision and rationale to each finding's tracki
 | `GOOGLE_CLOUD_PROJECT` | ✓ | — | GCP project for Vertex AI |
 | `VERTEX_LOCATION` | | `us-central1` | Vertex AI region |
 | `VERTEX_MODEL` | | `gemini-2.0-flash-001` | Gemini model name |
-| `GOOGLE_APPLICATION_CREDENTIALS` | ✓ | ADC default path | Path to ADC JSON on host machine |
+| `GOOGLE_APPLICATION_CREDENTIALS` | ✓ | — | In-container path to GCP credentials JSON; `docker-compose.yml` mounts `./config/my-google-service-account.json` here as `/gcp/adc.json` |
 | `MAX_RETRY_ATTEMPTS` | | `3` | Hard retry bound per PR |
 | `MAX_PARALLEL_FIXES` | | `5` | Concurrent fixer workers |
 | `CI_POLL_INTERVAL` | | `30` | Seconds between CI status checks |
@@ -342,4 +342,3 @@ The Classifier writes its bucket decision and rationale to each finding's tracki
 | `TRACKING_STORE_PATH` | | `/data/tracking.json` | State file path inside container |
 | `FIXER_RETRY_URL` | | — | HTTP endpoint for retry invocation (fixer-server mode) |
 | `RETRY_TRACKING_ID` | | — | Set by Watcher for Mode B (retry) runs |
-# vuln-remediation-agent
