@@ -21,10 +21,10 @@ Full end-to-end walkthrough — from triggering a scan on the target repo to rem
 **Pipeline at a glance:**
 
 ```
-[1 Start agents] → [2 Trigger scan] → [3 Auto-fetch reports] → [4 Fixer (Gemini)] → [5 CI runs] → [6 Watcher + retry] → [CI_PASSED]
-  docker compose     GitHub Actions        ScanPoller                 fixer-server       GH Actions      watcher daemon         ↓
-  up -d              (manual dispatch)     (auto, ~60s poll)                                                              [Dashboard]
-                                                                                                                      streamlit run …
+[1 Start agents] → [2 Trigger scan] → [3 Auto-fetch] → [4 KB hydrate + classify] → [5 Fixer (Gemini)] → [6 CI runs] → [7 Watcher + retry] → [CI_PASSED]
+  docker compose     GitHub Actions      ScanPoller       Knowledge Agent               fixer-server       GH Actions     watcher daemon          ↓
+  up -d              (manual dispatch)   (60s poll)       + Classifier                  (B2/B3 only)                                          [Dashboard]
+                                                          B1/B4 → GitHub Issues                                                          streamlit run …
 ```
 
 Both `fixer-server` and `watcher` run as long-lived services. You only need to trigger the GitHub Action — the agents do everything else. The Streamlit dashboard gives you live visibility into every step.
@@ -137,19 +137,20 @@ The workflow runs three scanners — OWASP Dependency-Check (~4 min), Trivy (~1 
 1. ScanPoller detects the new completed run and downloads the `vulnerability-reports` artifact.
 2. `ScanReportClient` reads the three JSON files and produces a deduplicated findings list.
 3. A `CREATED` tracking record is written to `./data/tracking.json` (bind-mounted, readable by the dashboard) for each finding.
-4. Up to `MAX_PARALLEL_FIXES=5` findings are processed concurrently. For each:
+4. **Knowledge Agent** hydrates the Knowledge Store (`./data/kb.json`) for each `(component, from, to)` tuple not already present — fetching from OSV.dev and GitHub Releases, then extracting structured migration info via Gemini.
+5. **Classifier** assigns each finding to a bucket; Bucket 1/4 findings create a GitHub Issue immediately and are skipped by the Fixer.
+6. Up to `MAX_PARALLEL_FIXES=5` Bucket 2/3 findings are processed concurrently. For each:
 
 | Step | What happens |
 |---|---|
 | Clone | Local hardlink clone of `GITHUB_REPO_TARGET` into a temp directory |
 | Bump pom.xml | XML-parser rewrite of the dependency version — never string-replace |
+| KB context | If a KB entry exists (tier1_learned / tier2_playbook / knowledge_agent), it is rendered into `FRESH_FIX_PROMPT` — breaking changes, migration steps, and find/replace patterns become ground truth for Gemini |
 | Gemini tool-use loop | ADK `Agent` runs `FRESH_FIX_PROMPT` with four tools: `grep_files` → `read_file` → `apply_file_change` → `run_maven_compile` |
 | Self-correction | If `run_maven_compile` returns `FAILURE`, Gemini reads stderr and calls `apply_file_change` again. Repeats until compile passes or model ends the turn. |
 | Commit + push | Branch `fix/<component>-<safe-version>` pushed. Only after compile gate passes. |
 | Open PR | Idempotent: skips if a PR from that branch already exists. |
-| Update record | `PR_OPENED` → `CI_PENDING` with `pr_number`, `branch_name`, token usage. |
-
-> **Gemini uses parametric knowledge in this phase.** It infers what APIs changed between versions from training data. In Phase 2 (see [Roadmap](#phase-2-roadmap--knowledge-base--classifier)), a Knowledge Agent will pre-hydrate a Knowledge Store from official release notes before the Fixer runs, replacing inference with retrieved ground truth.
+| Update record | `PR_OPENED` → `CI_PENDING` with `pr_number`, `branch_name`, `kb_bucket`, token usage. |
 
 Verify PRs were opened:
 
@@ -163,7 +164,7 @@ For each open `fix/` PR:
 
 | CI result | Watcher action |
 |---|---|
-| **CI passed** | Record updated to `CI_PASSED`. PR is ready for human review. |
+| **CI passed** | Record updated to `CI_PASSED`. **PatternLearner** extracts find/replace patterns from the PR diff via Gemini and writes a `tier1_learned` KB entry — so the next run of the same upgrade uses confirmed patterns directly. PR is ready for human review. |
 | **CI timed out** | Warning logged. Record stays `CI_PENDING`. Re-checked on next cycle. |
 | **CI failed — under retry limit** | Record → `CI_FAILED`. Child record created: `RETRY_REQUESTED` with `failure_log_excerpt` (CI failure log, truncated to 4,000 chars). `POST /retry` sent to `fixer-server`. |
 | **CI failed — limit reached** | Record → `FAILED_MAX_RETRIES`. Escalation comment posted on the PR. Fixer never invoked again for this PR. |
@@ -191,11 +192,13 @@ Open [http://localhost:8501](http://localhost:8501). Run this in a separate term
 - **Fixer-server** — time since the last ScanPoller checkpoint write (goes yellow if the server is idle or unreachable)
 - **Scan reports** — which scanner JSON files are present in `./scan-reports/` and how old they are
 
-**Run History tab** — filterable table of every fix attempt with status, version change, PR number, token usage, and resolution time.
+**Run History tab** — filterable table of every fix attempt with status, version change, PR number, KB bucket, token usage, and resolution time.
 
 **Retry Lineage tab** — select any PR number to see the full attempt chain. Each attempt expands to show component details, token usage, and the CI failure excerpt that was injected into the retry prompt.
 
 **Metrics tab** — resolution rate, in-progress / escalated counts, avg/p50/p95 time-to-resolution, total token consumption, and charts for status distribution and retry depth.
+
+**Knowledge Base tab** — browse all KB entries currently in `./data/kb.json`. Filterable by source tier (`tier1_learned`, `tier2_playbook`, `knowledge_agent`). Each entry expands to show breaking changes, migration steps, find→replace patterns, and API removals.
 
 **State machine:**
 
@@ -256,49 +259,68 @@ Set `MAX_RETRY_ATTEMPTS=1` in `config/.env` to reach `FAILED_MAX_RETRIES` quickl
 | **Single scanner** | Remove `grype-report.json` from `scan-reports/` | Fixer logs a warning; continues with Trivy + OWASP DC only |
 | **Compile error recovery** | Upgrade a library with a known API removal | First `run_maven_compile` fails; Gemini reads stderr, calls `apply_file_change` again; second compile passes |
 | **Idempotent PR** | Scan poller fires twice for the same run | Checkpoint prevents re-download; already-open PRs are skipped |
+| **B1 triage issue** | Scan report contains `UNKNOWN` as safe version | Classifier assigns Bucket 1; GitHub Issue opened; no PR created; no Gemini call |
+| **B4 framework triage** | Spring Boot 3→4 with no KB entry | Bucket 4; GitHub Issue with `oss-remediation-triage` label; Fixer not invoked |
+| **B3 KB-assisted fix** | log4j 1.x → 2.x (tier2 playbook exists) | Bucket 3; `FRESH_FIX_PROMPT` includes playbook migration steps; check Gemini uses them |
+| **Tier 1 learning** | Any B2/B3 fix that reaches `CI_PASSED` | Watcher writes `tier1_learned` entry to `./data/kb.json`; visible in dashboard KB tab |
+| **Skip KB hydration** | Set `KB_HYDRATION=0` in `config/.env` | Knowledge Agent step skipped; existing playbooks still used; faster local iteration |
 
 ---
 
-## Phase 2 Roadmap — Knowledge Base & Classifier
+## Phase 2 — Knowledge Base & Classifier
 
-> **Not yet implemented.** These agents are planned; see `nexus-remediation-agent/DiscussionPoints-v1.md` for the full specification. The current Fixer goes directly from scan reports to the Gemini tool-use loop, relying on parametric (training-data) knowledge.
-
-Phase 2 inserts two new agents before the Fixer, changing what happens after the ScanPoller triggers:
+Phase 2 inserts two new agents before the Fixer. After the ScanPoller downloads the artifact, the pipeline is:
 
 ```
 [scan reports] → [Knowledge Agent] → [Classifier] → [Fixer] → ...
                    (hydrates KB)      (buckets)     (with KB)
 ```
 
-### Knowledge Agent
+### Knowledge Agent (`agents/knowledge/`)
 
-For each `(component, old_version, new_version)` tuple:
+For each `(component, old_version, new_version)` tuple in the findings:
 
-1. Check the **Knowledge Store** — if an entry exists, skip (no-op).
-2. Query official release notes and migration guides via web search scoped to trusted domains.
-3. Extract: removed/renamed APIs, changed method signatures, new required imports, known breaking patterns.
-4. Persist a structured entry to the Knowledge Store.
+1. Check the **Knowledge Store** — if an entry already exists, skip (no-op).
+2. Fetch release notes from OSV.dev (CVE + Maven ecosystem lookup) and GitHub Releases (filtered by major-version range).
+3. Call Gemini with a structured extraction prompt → JSON response with breaking changes, API removals, migration steps, find/replace patterns.
+4. Persist a `knowledge_agent` entry to `./data/kb.json` (or Firestore in production).
 
-When the Fixer subsequently processes a finding, it reads the Knowledge Store first. If a pre-hydrated entry exists, it is injected into the Gemini prompt as retrieved ground truth — anchoring suggestions to documented facts rather than parametric memory, which is critical for recently published versions.
+Controlled by `KB_HYDRATION=1` (default on in `fixer-server`). Set to `"0"` to skip for faster local testing.
 
-**Tier 1 (learned patterns):** After a fix is confirmed by CI, the Watcher writes the exact `find`/`replace` pairs that worked as a KB entry. On the next run with the same version pair (in any repo), the Fixer applies them via `apply_file_change` — zero LLM calls unless pattern application fails.
+### Knowledge Store tiers (`agents/common/knowledge_store.py`)
 
-**Tier 2 (curated playbooks):** Engineer-authored YAML migration guides for major-version upgrades (log4j 1→2, Spring Boot 2→3). Read by the Fixer before any major-version attempt regardless of whether the version pair has been seen before.
+Three tiers, resolved highest-priority first:
 
-### Classifier Agent
+| Tier | Source | Written by |
+|---|---|---|
+| `tier1_learned` | Exact find/replace patterns extracted from a merged fix PR diff | Watcher PatternLearner (after `CI_PASSED`) |
+| `tier2_playbook` | Engineer-authored YAML files in `playbooks/` | Loaded at startup; `log4j-1to2.yaml`, `spring-boot-2to3.yaml`, `commons-collections-3to4.yaml` |
+| `knowledge_agent` | Gemini-extracted structured data from OSV.dev + GitHub Releases | Knowledge Agent (runs before each fresh fix batch) |
+
+Lookup matches on: exact `(component, from_version, to_version)` → same component + major range → artifact ID stem + major range.
+
+### Classifier (`agents/classifier/classifier.py`)
 
 Assigns every finding to one of four buckets before the Fixer runs:
 
 | Bucket | Trigger condition | Action |
 |---|---|---|
-| **1 — No path** | No remediation target in scan; transitive dep; EOL library | GitHub Issue created immediately; Fixer skipped |
-| **2 — Patch / Minor** | Same major version; no breaking KB entries | Fixer runs (with KB context if available) |
-| **3 — Major + KB** | Major version delta; Tier 1/2 KB hit or Knowledge Agent output exists | Fixer runs with KB injected into prompt |
-| **4 — Complex / framework** | Spring Boot, Hibernate, Angular; major delta; no KB entry or migration plan | GitHub Issue created with breaking-change analysis; Fixer not invoked |
+| **1 — No path** | `UNKNOWN` or empty safe version | GitHub Issue created; Fixer skipped |
+| **2 — Patch / Minor** | Same major version, or major upgrade that is not a complex framework | Fixer runs (KB context injected if available) |
+| **3 — Major + KB** | Major version delta; KB entry found (any tier) | Fixer runs with KB injected into prompt |
+| **4 — Complex / framework** | Spring Boot, Hibernate, Struts, Jersey, etc.; major delta; no KB entry | GitHub Issue created with triage label; Fixer not invoked |
 
-The Classifier writes its bucket decision and rationale to each finding's tracking record. The Fixer reads the bucket at startup and exits immediately for Buckets 1 and 4 — no Gemini call made.
+The bucket and rationale are stored in the tracking record (`kb_bucket`, `kb_entry_id`). Triage issues get the `oss-remediation-triage` GitHub label.
 
-**Why this matters for testing:** Without the Classifier, the current Fixer attempts every finding including transitive dependencies and framework-level upgrades. Adding the Classifier adds a pre-flight gate that prevents wasted fix attempts and creates GitHub Issues for cases that need human triage.
+### Tier 1 learning — PatternLearner (`agents/watcher/pattern_learner.py`)
+
+After the Watcher detects `CI_PASSED` on a `fix/` PR:
+
+1. Fetches the PR file diff (excluding `pom.xml`).
+2. Calls Gemini to extract find/replace patterns from changed source files.
+3. Merges the patterns into the existing KB entry (upgrading it to `tier1_learned`), or creates a new `tier1_learned` entry if none exists.
+
+On the next run with the same `(component, from_major, to_major)`, the Fixer uses the confirmed patterns as ground truth.
 
 ---
 
@@ -325,3 +347,6 @@ The Classifier writes its bucket decision and rationale to each finding's tracki
 | `FIXER_RETRY_URL` | | — | HTTP endpoint for retry invocation (set to `http://fixer-server:8080/retry` by the watcher service) |
 | `AUTO_FETCH_SCAN` | | `0` | Set to `1` on one-shot fixer runs to trigger + download the scan workflow before fixing (alternative to ScanPoller for manual use) |
 | `RETRY_TRACKING_ID` | | — | Set by Watcher for retry runs, or pass manually to the one-shot fixer |
+| `KB_STORE_PATH` | | `./data/kb.json` | Path to the Knowledge Store JSON file (bind-mounted into containers at `/data/kb.json`) |
+| `KB_HYDRATION` | | `0` | Set to `1` to enable the Knowledge Agent pre-hydration step before each fresh fix batch. Set to `"1"` automatically by `fixer-server` in `docker-compose.yml`. Set to `"0"` to skip hydration for faster local testing (existing playbooks still apply). |
+| `FIRESTORE_PROJECT` | | — | If set, `FirestoreKBStore` is used instead of `FileKnowledgeStore`. Set to your GCP project ID for production deployments. |

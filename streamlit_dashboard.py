@@ -23,8 +23,10 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "agents"))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from common.tracking_store import make_tracking_store, TrackingStatus  # noqa: E402
+from common.knowledge_store import make_knowledge_store                # noqa: E402
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -134,10 +136,11 @@ with col_count:
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_history, tab_lineage, tab_metrics = st.tabs([
+tab_history, tab_lineage, tab_metrics, tab_kb = st.tabs([
     "Run History",
     "Retry Lineage",
     "Metrics",
+    "Knowledge Base",
 ])
 
 
@@ -333,3 +336,94 @@ with tab_metrics:
         )
         depth.columns = ["Max attempts", "PR count"]
         st.bar_chart(depth.set_index("Max attempts"))
+
+
+# ── Tab 4: Knowledge Base ─────────────────────────────────────────────────────
+
+with tab_kb:
+    st.subheader("Knowledge Base")
+
+    @st.cache_data(ttl=60)
+    def load_kb_entries():
+        if not os.environ.get("KB_STORE_PATH") and not os.environ.get("FIRESTORE_PROJECT"):
+            os.environ["KB_STORE_PATH"] = "./data/kb.json"
+        try:
+            store = make_knowledge_store()
+            return store.get_all()
+        except Exception:
+            return []
+
+    kb_entries = load_kb_entries()
+
+    SOURCE_ICONS = {
+        "tier1_learned":   "🟢 tier1_learned",
+        "tier2_playbook":  "📖 tier2_playbook",
+        "knowledge_agent": "🤖 knowledge_agent",
+    }
+    CONFIDENCE_ICONS = {"high": "🔵", "medium": "🟡", "low": "🔴"}
+
+    if not kb_entries:
+        st.info(
+            "No KB entries yet.  \n\n"
+            "Tier 2 playbook entries appear once the fixer runs (they're loaded "
+            "from `playbooks/*.yaml` at startup).  \n"
+            "Knowledge Agent entries are added during each fresh scan.  \n"
+            "Tier 1 learned entries are added by the Watcher after a PR passes CI."
+        )
+    else:
+        source_counts = {}
+        for e in kb_entries:
+            source_counts[e.source] = source_counts.get(e.source, 0) + 1
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Tier 1 (learned)",   source_counts.get("tier1_learned", 0))
+        c2.metric("Tier 2 (playbooks)", source_counts.get("tier2_playbook", 0))
+        c3.metric("Knowledge Agent",    source_counts.get("knowledge_agent", 0))
+
+        st.divider()
+
+        source_filter = st.selectbox(
+            "Filter by source",
+            ["(all)"] + sorted(set(e.source for e in kb_entries)),
+        )
+        filtered = kb_entries if source_filter == "(all)" else [
+            e for e in kb_entries if e.source == source_filter
+        ]
+
+        _tier_order = {"tier1_learned": 3, "tier2_playbook": 2, "knowledge_agent": 1}
+        for entry in sorted(filtered, key=lambda e: _tier_order.get(e.source, 0), reverse=True):
+            label = (
+                f"{SOURCE_ICONS.get(entry.source, entry.source)}  |  "
+                f"{entry.component_name}  |  "
+                f"{entry.from_version or f'major {entry.from_major}'} → "
+                f"{entry.to_version or f'major {entry.to_major}'}  |  "
+                f"{CONFIDENCE_ICONS.get(entry.confidence, '')} {entry.confidence}"
+            )
+            with st.expander(label):
+                c1, c2 = st.columns(2)
+                c1.write(f"**Entry ID:** `{entry.entry_id[:8]}…`")
+                c2.write(f"**Source:** `{entry.source}`")
+
+                if entry.breaking_changes:
+                    st.markdown("**Breaking changes:**")
+                    for bc in entry.breaking_changes:
+                        st.markdown(f"- {bc}")
+
+                if entry.migration_steps:
+                    st.markdown("**Migration steps:**")
+                    for i, step in enumerate(entry.migration_steps, 1):
+                        st.markdown(f"{i}. {step}")
+
+                if entry.patterns:
+                    st.markdown(f"**Find→replace patterns ({len(entry.patterns)}):**")
+                    for p in entry.patterns:
+                        col_f, col_r = st.columns(2)
+                        col_f.code(p.get("find", ""), language="java")
+                        col_r.code(p.get("replace", ""), language="java")
+                        if p.get("description"):
+                            st.caption(p["description"])
+
+                if entry.api_removals:
+                    st.markdown("**Removed APIs:**")
+                    st.code("\n".join(entry.api_removals), language="text")
+

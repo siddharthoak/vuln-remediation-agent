@@ -136,3 +136,104 @@ class PRClient:
         pr = self._repo.get_pull(pr_number)
         pr.create_issue_comment(comment)
         logger.info("Added comment to PR #%d", pr_number)
+
+    def open_triage_issue(
+        self,
+        finding,           # VulnerabilityFinding from scan_report_client
+        bucket: int,
+        rationale: str,
+        kb_entry=None,     # Optional KnowledgeEntry
+    ) -> int:
+        """
+        Open a GitHub Issue for a finding the agent cannot automatically fix (bucket 1 or 4).
+        Idempotent: returns the existing issue number if one already exists for this component.
+        """
+        title = (
+            f"[OSS Remediation] Manual triage: {finding.component_name} "
+            f"{finding.current_version} → {finding.recommended_version}"
+        )
+
+        # Idempotency: search open issues with the triage label
+        try:
+            for issue in self._repo.get_issues(state="open", labels=["oss-remediation-triage"]):
+                if issue.title == title:
+                    logger.info(
+                        "Triage issue already exists (#%d) for %s — skipping.",
+                        issue.number, finding.component_name,
+                    )
+                    return issue.number
+        except GithubException as exc:
+            logger.warning("Could not search existing issues: %s", exc)
+
+        bucket_labels = {
+            1: "Bucket 1 — No fix path available",
+            4: "Bucket 4 — Complex framework, major upgrade, no migration KB",
+        }
+        cve_list = ", ".join(finding.cve_ids) if finding.cve_ids else "see scan report"
+
+        kb_section = ""
+        if kb_entry and (kb_entry.breaking_changes or kb_entry.migration_steps):
+            bc = "\n".join(f"- {c}" for c in kb_entry.breaking_changes)
+            steps = "\n".join(f"{i}. {s}" for i, s in enumerate(kb_entry.migration_steps, 1))
+            kb_section = f"""
+### Knowledge Base analysis ({kb_entry.source})
+
+**Breaking changes:**
+{bc or "_(none documented)_"}
+
+**Suggested migration steps:**
+{steps or "_(none documented)_"}
+"""
+
+        body = f"""## OSS Remediation — Manual Triage Required
+
+**Component:** `{finding.component_name}`
+**Vulnerable version:** `{finding.current_version}`
+**Recommended version:** `{finding.recommended_version}`
+**Severity:** {finding.severity.upper()}
+**CVEs:** {cve_list}
+
+### Why the agent skipped this
+
+**{bucket_labels.get(bucket, f'Bucket {bucket}')}**
+
+{rationale}
+{kb_section}
+### Next steps
+
+1. Review the CVEs linked above and confirm the recommended version is correct.
+2. Assess the migration complexity manually.
+3. Apply the fix in a dedicated branch and verify CI passes.
+4. Close this issue once the PR is merged.
+
+---
+> Opened automatically by the OSS Remediation Agent (bucket {bucket}).
+> Assign to the relevant team for prioritisation.
+"""
+        try:
+            # Ensure the label exists before using it
+            self._ensure_label("oss-remediation-triage", "e11d48", "Auto-triage issue from OSS Remediation Agent")
+            issue = self._repo.create_issue(
+                title=title,
+                body=body,
+                labels=["oss-remediation-triage"],
+            )
+            logger.info(
+                "Opened triage issue #%d for %s (bucket %d).",
+                issue.number, finding.component_name, bucket,
+            )
+            return issue.number
+        except GithubException as exc:
+            logger.error(
+                "Failed to create triage issue for %s: %s", finding.component_name, exc
+            )
+            return -1
+
+    def _ensure_label(self, name: str, color: str, description: str) -> None:
+        try:
+            self._repo.get_label(name)
+        except GithubException:
+            try:
+                self._repo.create_label(name=name, color=color, description=description)
+            except GithubException:
+                pass  # label creation is best-effort

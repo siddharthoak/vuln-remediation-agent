@@ -1,0 +1,21 @@
+component: "commons-collections:commons-collections"
+from_major: 3
+to_major: 4
+confidence: high
+breaking_changes:
+  - "Package renamed from org.apache.commons.collections to org.apache.commons.collections4"
+  - "GroupId changed from commons-collections to org.apache.commons"
+  - "ArtifactId changed to commons-collections4"
+  - "Unsafe deserialization gadget chains removed (CVE-2015-6420 remediation)"
+  - "Transformer, Predicate, and Closure interfaces now use generics"
+api_removals:
+  - "org.apache.commons.collections.Transformer (replaced by org.apache.commons.collections4.Transformer)"
+  - "org.apache.commons.collections.CollectionUtils (moved to collections4 package)"
+migration_steps:
+  - "Update pom.xml: groupId commons-collections → org.apache.commons, artifactId → commons-collections4"
+  - "Replace all org.apache.commons.collections.* imports with org.apache.commons.collections4.*"
+  - "Add generic type parameters to Transformer<I,O>, Predicate<T>, Closure<T> usages"
+patterns:
+  - find: "import org.apache.commons.collections."
+    replace: "import org.apache.commons.collections4."
+    description: "Update package from collections to collections4"

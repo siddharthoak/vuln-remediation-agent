@@ -70,6 +70,10 @@ class TrackingRecord:
     token_usage: Optional[dict] = None
     failure_log_excerpt: Optional[str] = None
 
+    # Phase 2 — Classifier output (Optional for backward compat with existing records)
+    kb_bucket: Optional[int] = None      # 1=no-fix 2=patch/minor 3=major+KB 4=complex
+    kb_entry_id: Optional[str] = None    # KnowledgeEntry.entry_id used for this fix
+
 
 # ── Protocol (UNCHANGED) ──────────────────────────────────────────────────────
 

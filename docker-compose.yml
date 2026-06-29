@@ -16,9 +16,11 @@ services:
     env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
+      KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
       FIXER_SERVER_MODE: "1"
       SCAN_POLL_INTERVAL: "60"      # seconds between GitHub Actions polls
+      KB_HYDRATION: "1"             # set to "0" to skip Knowledge Agent (faster local testing)
     ports:
       - "8080:8080"
     volumes:
@@ -47,6 +49,7 @@ services:
     env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
+      KB_STORE_PATH: /data/kb.json
       FIXER_RETRY_URL: http://fixer-server:8080/retry
       WATCHER_DAEMON: "1"
       WATCHER_SLEEP_SECONDS: "900"  # 15 minutes

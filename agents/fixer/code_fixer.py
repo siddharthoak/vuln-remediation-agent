@@ -73,7 +73,7 @@ changes required to upgrade a specific dependency from one version to another.
 - Component: {component_name}
 - Current version: {current_version}
 - Target version: {target_version}
-
+{kb_context}
 ## Repository file tree (paths only)
 {file_listing}
 
@@ -156,6 +156,39 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
+def _render_kb_context(kb_entry) -> str:
+    """
+    Renders a KB entry into the prompt section injected into FRESH_FIX_PROMPT.
+    Returns an empty string when no entry is available (bucket 2 with no KB).
+    """
+    if kb_entry is None:
+        return ""
+
+    lines = ["\n## Migration knowledge (from Knowledge Base)"]
+    lines.append(f"Source: {kb_entry.source} | Confidence: {kb_entry.confidence}")
+
+    if kb_entry.breaking_changes:
+        lines.append("\n**Known breaking changes:**")
+        for c in kb_entry.breaking_changes:
+            lines.append(f"- {c}")
+
+    if kb_entry.migration_steps:
+        lines.append("\n**Migration steps:**")
+        for i, step in enumerate(kb_entry.migration_steps, 1):
+            lines.append(f"{i}. {step}")
+
+    if kb_entry.patterns:
+        lines.append("\n**Verified find→replace patterns (apply these first):**")
+        for p in kb_entry.patterns:
+            lines.append(
+                f"- find: `{p.get('find', '')}` → replace: `{p.get('replace', '')}` "
+                f"({p.get('description', '')})"
+            )
+
+    lines.append("")  # trailing newline before the next section
+    return "\n".join(lines)
+
+
 class PomXMLError(Exception):
     """Raised when pom.xml cannot be parsed or the target dependency is not found."""
 
@@ -207,6 +240,7 @@ class CodeFixer:
         tracking_id: str,
         tracking_store,
         cve_ids: Optional[list] = None,
+        kb_entry=None,
     ) -> ChangeSummary:
         logger.info(
             "[fresh] %s: %s → %s (tracking=%s)",
@@ -222,6 +256,7 @@ class CodeFixer:
             target_version=target_version,
             cve_ids=cve_ids or [],
             failure_log_excerpt=None,
+            kb_entry=kb_entry,
         )
         record.token_usage = {
             "prompt_tokens": summary.prompt_tokens,
@@ -284,6 +319,7 @@ class CodeFixer:
         target_version: str,
         cve_ids: list,
         failure_log_excerpt: Optional[str],
+        kb_entry=None,
     ) -> ChangeSummary:
         self._bump_pom_version(component_name, current_version, target_version)
         self._applied_changes = []
@@ -294,6 +330,7 @@ class CodeFixer:
             target_version=target_version,
             file_listing=file_listing,
             failure_log_excerpt=failure_log_excerpt,
+            kb_entry=kb_entry,
         )
         files_changed = ["pom.xml"] + list(dict.fromkeys(self._applied_changes))
         return ChangeSummary(
@@ -353,6 +390,7 @@ class CodeFixer:
         target_version: str,
         file_listing: str,
         failure_log_excerpt: Optional[str],
+        kb_entry=None,
     ) -> tuple:
         """
         Runs the ADK Agent with the four FunctionTools against the Vertex AI backend.
@@ -376,6 +414,7 @@ class CodeFixer:
                 current_version=current_version,
                 target_version=target_version,
                 file_listing=file_listing,
+                kb_context=_render_kb_context(kb_entry),
             )
 
         tools = [

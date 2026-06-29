@@ -26,8 +26,10 @@ from github import Github
 from ci_status import CIStatusWatcher, CIOutcome
 from pr_client import PRClient
 from retry_gate import RetryGate, make_fixer_invoker
+from pattern_learner import PatternLearner
 
 from common.tracking_store import make_tracking_store, TrackingStatus
+from common.knowledge_store import make_knowledge_store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,20 +84,25 @@ def _run_once():
 
     logger.info("Watching %d open remediation PR(s).", len(remediation_prs))
 
-    tracking_store = make_tracking_store()
-    ci_watcher     = CIStatusWatcher(repo_full_name=github_repo, github_pat=github_pat)
-    pr_client      = PRClient(repo_full_name=github_repo, github_pat=github_pat)
-    retry_gate     = RetryGate(
+    tracking_store   = make_tracking_store()
+    kb_store         = make_knowledge_store()
+    ci_watcher       = CIStatusWatcher(repo_full_name=github_repo, github_pat=github_pat)
+    pr_client        = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+    retry_gate       = RetryGate(
         tracking_store=tracking_store,
         pr_client=pr_client,
         fixer_invoker=make_fixer_invoker(),
     )
+    pattern_learner  = PatternLearner(
+        repo_full_name=github_repo,
+        github_pat=github_pat,
+    )
 
     for pr in remediation_prs:
-        _process_pr(pr, tracking_store, ci_watcher, retry_gate)
+        _process_pr(pr, tracking_store, ci_watcher, retry_gate, kb_store, pattern_learner)
 
 
-def _process_pr(pr, tracking_store, ci_watcher, retry_gate) -> None:
+def _process_pr(pr, tracking_store, ci_watcher, retry_gate, kb_store, pattern_learner) -> None:
     pr_number = pr.number
 
     record = tracking_store.get_latest_for_pr(pr_number)
@@ -125,6 +132,11 @@ def _process_pr(pr, tracking_store, ci_watcher, retry_gate) -> None:
         logger.info("PR #%d: CI passed. Marking resolved.", pr_number)
         record.status = TrackingStatus.CI_PASSED.value
         tracking_store.update(record)
+        # Tier 1: learn fix patterns from this confirmed-good PR
+        try:
+            pattern_learner.learn_from_pr(pr_number, record, kb_store)
+        except Exception as exc:
+            logger.warning("PR #%d: pattern learning failed (non-fatal): %s", pr_number, exc)
         return
 
     if ci_result.status == CIOutcome.TIMEOUT:

@@ -1,0 +1,36 @@
+component: "org.apache.log4j:log4j"
+from_major: 1
+to_major: 2
+confidence: high
+breaking_changes:
+  - "The entire org.apache.log4j.* package is removed; Log4j 2.x uses org.apache.logging.log4j.*"
+  - "Logger instances are now obtained via LogManager.getLogger(), not Logger.getLogger()"
+  - "The Category class no longer exists"
+  - "AppenderSkeleton, WriterAppender, and other 1.x appenders are removed"
+  - "log4j.properties configuration format is not supported; use log4j2.xml or log4j2.properties"
+api_removals:
+  - "org.apache.log4j.Logger"
+  - "org.apache.log4j.LogManager"
+  - "org.apache.log4j.Level"
+  - "org.apache.log4j.Category"
+  - "org.apache.log4j.BasicConfigurator"
+  - "org.apache.log4j.PropertyConfigurator"
+migration_steps:
+  - "Add log4j-1.2-api bridge JAR if incremental migration is required"
+  - "Replace import org.apache.log4j.Logger with org.apache.logging.log4j.Logger and org.apache.logging.log4j.LogManager"
+  - "Replace Logger.getLogger(Foo.class) with LogManager.getLogger(Foo.class)"
+  - "Replace Logger.getRootLogger() with LogManager.getRootLogger()"
+  - "Rename log4j.properties to log4j2.properties and update format"
+patterns:
+  - find: "import org.apache.log4j.Logger;"
+    replace: "import org.apache.logging.log4j.LogManager;\nimport org.apache.logging.log4j.Logger;"
+    description: "Replace Log4j 1.x Logger import with Log4j 2.x imports"
+  - find: "Logger.getLogger("
+    replace: "LogManager.getLogger("
+    description: "Replace static factory method"
+  - find: "Logger.getRootLogger()"
+    replace: "LogManager.getRootLogger()"
+    description: "Replace root logger accessor"
+  - find: "import org.apache.log4j.Level;"
+    replace: "import org.apache.logging.log4j.Level;"
+    description: "Replace Level import"

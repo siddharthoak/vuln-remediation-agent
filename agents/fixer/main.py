@@ -29,6 +29,9 @@ from common.tracking_store import (
     make_fresh_record,
     TrackingStatus,
 )
+from common.knowledge_store import make_knowledge_store
+from knowledge.main import KnowledgeAgent
+from classifier.classifier import Classifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -182,6 +185,36 @@ def _do_fresh_scan():
     pr_client   = PRClient(repo_full_name=github_repo, github_pat=github_pat)
     base_branch = Github(github_pat).get_repo(github_repo).default_branch
 
+    # ── Phase 2: KB hydration + classification ────────────────────────────────
+    kb_store = make_knowledge_store()
+
+    knowledge_agent = KnowledgeAgent(github_pat=github_pat)
+    knowledge_agent.hydrate(findings, kb_store)
+
+    classifier = Classifier(kb_store=kb_store)
+
+    # Classify all findings; bucket 1/4 get triage issues and are skipped from fixing
+    classification = {}  # finding.component_name → ClassifierResult
+    for finding in findings:
+        result = classifier.classify(finding)
+        classification[finding.component_name] = result
+        logger.info(
+            "Classifier: %s → bucket %d (%s)",
+            finding.component_name, result.bucket, result.rationale,
+        )
+        if result.bucket in (1, 4):
+            logger.info(
+                "Bucket %d — opening triage issue for %s.",
+                result.bucket, finding.component_name,
+            )
+            pr_client.open_triage_issue(
+                finding=finding,
+                bucket=result.bucket,
+                rationale=result.rationale,
+                kb_entry=result.kb_entry,
+            )
+    # ─────────────────────────────────────────────────────────────────────────
+
     source_repo = RepoOps()
     source_path = source_repo.clone(github_repo_url, github_pat)
     logger.info(
@@ -191,6 +224,10 @@ def _do_fresh_scan():
 
     tasks = []
     for finding in findings:
+        result = classification[finding.component_name]
+        if result.bucket in (1, 4):
+            continue  # triage issue already created above
+
         branch_name = RepoOps.make_branch_name(finding.component_name, finding.current_version)
         record = make_fresh_record(
             vulnerability_id=finding.cve_ids[0] if finding.cve_ids else finding.component_name,
@@ -199,12 +236,14 @@ def _do_fresh_scan():
             old_version=finding.current_version,
             new_version=finding.recommended_version,
         )
-        record.branch_name = branch_name
+        record.branch_name  = branch_name
+        record.kb_bucket    = result.bucket
+        record.kb_entry_id  = result.kb_entry.entry_id if result.kb_entry else None
         tracking_store.create(record)
-        tasks.append((finding, branch_name, record))
+        tasks.append((finding, branch_name, record, result.kb_entry))
 
     def _fix_one(task):
-        finding, branch_name, record = task
+        finding, branch_name, record, kb_entry = task
         logger.info("Processing %s → branch %s", finding.component_name, branch_name)
 
         with RepoOps() as repo:
@@ -226,6 +265,7 @@ def _do_fresh_scan():
                     tracking_id=record.tracking_id,
                     tracking_store=tracking_store,
                     cve_ids=finding.cve_ids,
+                    kb_entry=kb_entry,
                 )
             except Exception as exc:
                 logger.error("Fix failed for %s: %s", finding.component_name, exc)

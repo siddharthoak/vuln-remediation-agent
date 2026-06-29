@@ -11,6 +11,9 @@ COPY agents/fixer/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY agents/common/ /app/common/
+COPY agents/knowledge/ /app/knowledge/
+COPY agents/classifier/ /app/classifier/
 COPY agents/fixer/ /app/
+COPY playbooks/ /app/playbooks/
 
 CMD ["python", "main.py"]

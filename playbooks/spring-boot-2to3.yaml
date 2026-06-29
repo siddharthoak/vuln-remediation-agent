@@ -1,0 +1,38 @@
+component: "org.springframework.boot:spring-boot"
+from_major: 2
+to_major: 3
+confidence: high
+breaking_changes:
+  - "Requires Java 17 minimum (was Java 8)"
+  - "javax.* packages renamed to jakarta.* (Jakarta EE 9+ migration)"
+  - "Spring Security 6: SecurityFilterChain bean required; WebSecurityConfigurerAdapter removed"
+  - "spring.datasource.initialization-mode renamed to spring.sql.init.mode"
+  - "HttpMethod constants changed from String to enum in Spring MVC"
+  - "Actuator endpoint IDs must not contain dots"
+api_removals:
+  - "javax.servlet.* (replaced by jakarta.servlet.*)"
+  - "javax.persistence.* (replaced by jakarta.persistence.*)"
+  - "org.springframework.security.config.annotation.web.configuration.WebSecurityConfigurerAdapter"
+  - "javax.validation.* (replaced by jakarta.validation.*)"
+migration_steps:
+  - "Upgrade Java source/target to 17 in pom.xml"
+  - "Run the OpenRewrite spring-boot-3 recipe or replace all javax.* imports with jakarta.*"
+  - "Replace WebSecurityConfigurerAdapter subclass with SecurityFilterChain @Bean"
+  - "Update spring.datasource.initialization-mode to spring.sql.init.mode in application.properties"
+  - "Review Actuator endpoint configuration for dot-separated IDs"
+patterns:
+  - find: "import javax.servlet."
+    replace: "import jakarta.servlet."
+    description: "Servlet API namespace migration"
+  - find: "import javax.persistence."
+    replace: "import jakarta.persistence."
+    description: "JPA namespace migration"
+  - find: "import javax.validation."
+    replace: "import jakarta.validation."
+    description: "Bean Validation namespace migration"
+  - find: "import javax.annotation."
+    replace: "import jakarta.annotation."
+    description: "Annotation namespace migration"
+  - find: "spring.datasource.initialization-mode"
+    replace: "spring.sql.init.mode"
+    description: "Datasource init property rename"
