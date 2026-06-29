@@ -100,24 +100,40 @@ The workflow runs three scanners — OWASP Dependency-Check (~4 min), Trivy (~1 
 
 ---
 
-### Phase 2 — Download and stage the scan reports
+### Phase 2 — Stage the scan reports
 
-After the workflow run completes, download the `vulnerability-reports` artifact and place it in `./scan-reports/`:
+The Fixer needs the three scanner JSON reports in `./scan-reports/` before it can run. There are two ways to get them there.
+
+---
+
+#### Option A — Automatic (recommended): `AUTO_FETCH_SCAN=1`
+
+Set `AUTO_FETCH_SCAN=1` in `config/.env`, then skip ahead to Phase 3. When the Fixer container starts it will:
+
+1. Trigger the `security-scan.yml` workflow on `GITHUB_REPO_TARGET` via `workflow_dispatch`
+2. Poll until the run completes (OWASP DC + Trivy + Grype takes ~8–12 min)
+3. Download the `vulnerability-reports` artifact and extract it into `/reports` (the container's view of `./scan-reports/`)
+
+The workflow always uploads its artifact even when the run conclusion is `failure` (expected — the app has intentional CVEs that trip `--failOnCVSS 7`).
+
+> **PAT requirement:** `AUTO_FETCH_SCAN=1` requires the PAT to have `actions:write` permission (fine-grained) or the `workflow` scope (classic) so it can trigger `workflow_dispatch`.
+
+---
+
+#### Option B — Manual: download with `gh` CLI
 
 ```bash
-# Using gh CLI
+# Trigger the scan first (if it hasn't run yet)
+gh workflow run security-scan.yml --repo your-org/vulnerable-java-app
+
+# Wait for it to finish, then download the artifact
 gh run download \
   --repo your-org/vulnerable-java-app \
   --name vulnerability-reports \
-  --dir /tmp/vuln-reports
-
-mkdir -p scan-reports
-cp /tmp/vuln-reports/trivy-report.json           scan-reports/
-cp /tmp/vuln-reports/grype-report.json           scan-reports/
-cp -r /tmp/vuln-reports/dependency-check-report  scan-reports/
+  --dir scan-reports
 ```
 
-Expected directory layout:
+Expected directory layout after download:
 
 ```
 scan-reports/
@@ -341,4 +357,5 @@ The Classifier writes its bucket decision and rationale to each finding's tracki
 | `SCAN_REPORT_PATH` | | `/reports` | Directory containing scanner JSON files |
 | `TRACKING_STORE_PATH` | | `/data/tracking.json` | State file path inside container |
 | `FIXER_RETRY_URL` | | — | HTTP endpoint for retry invocation (fixer-server mode) |
+| `AUTO_FETCH_SCAN` | | `0` | Set to `1` to trigger the scan workflow and download reports automatically before fixing |
 | `RETRY_TRACKING_ID` | | — | Set by Watcher for Mode B (retry) runs |

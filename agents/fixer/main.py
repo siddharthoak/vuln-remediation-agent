@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from github import Github
 from scan_report_client import ScanReportClient, ScanReportError
+from scan_fetcher import ScanFetcher, ScanFetchError
 from repo_ops import RepoOps
 from code_fixer import CodeFixer, InvalidRetryError
 from pr_client import PRClient
@@ -33,6 +34,7 @@ logging.basicConfig(
 logger = logging.getLogger("fixer.main")
 
 MAX_PARALLEL_FIXES = int(os.environ.get("MAX_PARALLEL_FIXES", "5"))
+AUTO_FETCH_SCAN    = os.environ.get("AUTO_FETCH_SCAN", "0") == "1"
 
 
 def main():
@@ -51,6 +53,20 @@ def _run_fresh_scan():
     github_repo     = os.environ["GITHUB_REPO_TARGET"]
     github_repo_url = f"https://github.com/{github_repo}.git"
     github_pat      = os.environ["GITHUB_PAT"]
+
+    if AUTO_FETCH_SCAN:
+        report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
+        logger.info("AUTO_FETCH_SCAN=1 — triggering security-scan workflow on %s", github_repo)
+        fetcher = ScanFetcher(
+            repo_full_name=github_repo,
+            github_pat=github_pat,
+            report_dir=report_dir,
+        )
+        try:
+            fetcher.trigger_and_download()
+        except ScanFetchError as exc:
+            logger.error("Scan fetch failed: %s", exc)
+            sys.exit(1)
 
     tracking_store = make_tracking_store()
 

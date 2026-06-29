@@ -47,7 +47,9 @@ class ScanReportClient:
 
     TRIVY_FILE    = "trivy-report.json"
     GRYPE_FILE    = "grype-report.json"
-    OWASP_FILE    = "dependency-check-report.json"
+    # The workflow artifact preserves the directory structure, so the OWASP
+    # report lands at <report_dir>/dependency-check-report/dependency-check-report.json
+    OWASP_FILE    = "dependency-check-report/dependency-check-report.json"
 
     def __init__(self, report_dir: Optional[str] = None):
         self._report_dir = Path(report_dir or os.environ["SCAN_REPORT_PATH"])
