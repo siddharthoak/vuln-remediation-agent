@@ -1,4 +1,8 @@
+# secrets / credentials
 .env
+config/.env
+config/my-google-service-account.json
+
 config.yaml
 __pycache__/
 *.pyc
