@@ -1,0 +1,69 @@
+# Fixer Agent — Google Cloud Run Job configuration
+#
+# Replaces: infra/agents/fixer.agent.yaml (Azure AI Foundry format)
+#
+# All {{PLACEHOLDER}} values are substituted by config.yaml at deploy time.
+# Used by: infra/gcp/main.tf (google_cloud_run_v2_job resource)
+#
+# HOW TO USE:
+#   1. cp config.yaml.example config.yaml  and fill in all values
+#   2. terraform apply in infra/gcp/
+#   3. The Terraform resource reads these values directly from config.yaml
+
+name: vuln-fixer-agent
+description: >
+  Reads vulnerability scan reports (OWASP DC, Trivy, Grype), upgrades vulnerable
+  Maven dependencies, fixes source-level breakage via Gemini on Vertex AI, and
+  opens a GitHub PR per finding. Retries are triggered by the Watcher via
+  Cloud Run Job execution with RETRY_TRACKING_ID set.
+
+image: "{{GCR_REGISTRY}}/fixer-agent:{{IMAGE_TAG}}"
+
+trigger:
+  # Cloud Scheduler job triggers this Cloud Run Job on a cron schedule.
+  # The scheduler job is defined in infra/gcp/main.tf.
+  schedule: "{{FIXER_SCHEDULE}}"
+  timezone: "UTC"
+
+environment:
+  - name: GOOGLE_CLOUD_PROJECT
+    value: "{{GOOGLE_CLOUD_PROJECT}}"
+
+  - name: VERTEX_LOCATION
+    value: "{{VERTEX_LOCATION}}"
+
+  - name: VERTEX_MODEL
+    value: "{{VERTEX_MODEL}}"           # default: gemini-2.0-flash-001
+
+  - name: FIRESTORE_PROJECT
+    value: "{{GOOGLE_CLOUD_PROJECT}}"   # same project as Cloud Run
+
+  - name: GITHUB_REPO_TARGET
+    value: "{{GITHUB_REPO_TARGET}}"
+
+  - name: SCAN_REPORT_PATH
+    value: "{{SCAN_REPORT_PATH}}"       # local path where reports are mounted/downloaded
+
+  - name: FIXER_JOB_NAME
+    value: "{{FIXER_JOB_NAME}}"         # this job's own name (for self-invocation on retry)
+
+  - name: CLOUD_RUN_REGION
+    value: "{{CLOUD_RUN_REGION}}"
+
+  - name: MAX_RETRY_ATTEMPTS
+    value: "{{MAX_RETRY_ATTEMPTS}}"
+
+  - name: MAX_PARALLEL_FIXES
+    value: "5"
+
+  # Secrets — referenced from Google Secret Manager, never hardcoded.
+  - name: GITHUB_PAT
+    secretRef:
+      secret: "{{GITHUB_PAT_SECRET_NAME}}"
+      version: latest
+
+resources:
+  cpu: "1"
+  memory: "2Gi"
+
+serviceAccount: "{{SERVICE_ACCOUNT_EMAIL}}"

@@ -1,0 +1,38 @@
+# vuln-remediation-agent — configuration reference
+#
+# HOW TO USE:
+#   1. cp config.yaml.example config.yaml
+#   2. Fill in every value marked  ← SET THIS
+#   3. Export as env vars or use the .env file for docker compose
+#
+# config.yaml is gitignored — never commit it (it contains live credentials).
+
+# ── Vertex AI (Gemini backend) ────────────────────────────────────────────────
+vertex:
+  project: ""                         # ← SET THIS: GCP project ID
+  location: "us-central1"             # Vertex AI region
+  model: "gemini-2.0-flash-001"       # Model used by the Fixer agent
+
+# ── GitHub ────────────────────────────────────────────────────────────────────
+github:
+  repo_target: "org/repo-name"        # ← SET THIS: target repo in "owner/repo" format
+  pat_secret: "github-pat"            # Secret Manager secret name (GCP) or literal value (.env)
+
+# ── Scan reports ──────────────────────────────────────────────────────────────
+# Local path where vulnerability reports are available to the Fixer container.
+# In docker compose this is a bind-mounted directory (./scan-reports).
+# Populate it by downloading the vulnerability-reports artifact from GitHub Actions.
+scan:
+  report_path: "/reports"             # path inside the fixer container
+
+# ── Agent settings ────────────────────────────────────────────────────────────
+runtime:
+  max_retry_attempts: "3"
+  max_parallel_fixes: "5"
+  ci_poll_interval: "30"
+  ci_timeout_seconds: "1800"
+
+# ── Schedules (cron, UTC) ─────────────────────────────────────────────────────
+schedules:
+  fixer:   "0 2 * * 1"       # Every Monday at 02:00 UTC (run manually locally)
+  watcher: "*/15 * * * *"    # Every 15 minutes (run manually locally)

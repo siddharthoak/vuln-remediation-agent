@@ -1,0 +1,8 @@
+google-adk>=0.3.0
+google-cloud-aiplatform>=1.60.0
+google-auth>=2.29.0
+vertexai>=1.60.0
+requests>=2.31.0
+GitPython>=3.1.41
+PyGithub>=2.1.1
+lxml>=4.9.0

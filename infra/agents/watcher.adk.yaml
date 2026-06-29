@@ -1,0 +1,56 @@
+# Watcher Agent — Google Cloud Run Job configuration
+#
+# Replaces: infra/agents/watcher.agent.yaml (Azure AI Foundry format)
+#
+# All {{PLACEHOLDER}} values are substituted by config.yaml at deploy time.
+# Used by: infra/gcp/main.tf (google_cloud_run_v2_job resource)
+
+name: vuln-watcher-agent
+description: >
+  Monitors CI status on remediation PRs (branch prefix fix/) via the GitHub
+  Checks API. On CI failure, delegates to RetryGate which triggers a new Fixer
+  Cloud Run Job execution with RETRY_TRACKING_ID set. Runs every 15 minutes via
+  Cloud Scheduler. Makes no model calls — pure orchestration.
+
+image: "{{GCR_REGISTRY}}/watcher-agent:{{IMAGE_TAG}}"
+
+trigger:
+  schedule: "{{WATCHER_SCHEDULE}}"     # default: */15 * * * *
+  timezone: "UTC"
+
+environment:
+  - name: GOOGLE_CLOUD_PROJECT
+    value: "{{GOOGLE_CLOUD_PROJECT}}"
+
+  - name: FIRESTORE_PROJECT
+    value: "{{GOOGLE_CLOUD_PROJECT}}"
+
+  - name: GITHUB_REPO_TARGET
+    value: "{{GITHUB_REPO_TARGET}}"
+
+  - name: FIXER_JOB_NAME
+    value: "{{FIXER_JOB_NAME}}"
+
+  - name: CLOUD_RUN_REGION
+    value: "{{CLOUD_RUN_REGION}}"
+
+  - name: MAX_RETRY_ATTEMPTS
+    value: "{{MAX_RETRY_ATTEMPTS}}"
+
+  - name: CI_POLL_INTERVAL
+    value: "{{CI_POLL_INTERVAL}}"
+
+  - name: CI_TIMEOUT_SECONDS
+    value: "{{CI_TIMEOUT_SECONDS}}"
+
+  # Secrets — referenced from Google Secret Manager, never hardcoded.
+  - name: GITHUB_PAT
+    secretRef:
+      secret: "{{GITHUB_PAT_SECRET_NAME}}"
+      version: latest
+
+resources:
+  cpu: "1"
+  memory: "512Mi"
+
+serviceAccount: "{{SERVICE_ACCOUNT_EMAIL}}"

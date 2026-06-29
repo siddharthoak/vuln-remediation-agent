@@ -1,0 +1,29 @@
+# Top-level requirements — covers both fixer and watcher.
+# The per-agent requirements.txt files in agents/fixer/ and agents/watcher/
+# are what actually get installed in the Docker images.
+
+# ── LLM / ADK ────────────────────────────────────────────────────────────────
+google-adk>=0.3.0
+google-cloud-aiplatform>=1.60.0
+google-auth>=2.29.0
+vertexai>=1.60.0
+
+# ── GCP (watcher + optional production store) ────────────────────────────────
+google-cloud-firestore>=2.16.0
+google-cloud-run>=0.10.0
+
+# ── GitHub / Git ─────────────────────────────────────────────────────────────
+PyGithub>=2.1.1
+GitPython>=3.1.41
+
+# ── General ──────────────────────────────────────────────────────────────────
+requests>=2.31.0
+lxml>=4.9.0
+PyYAML>=6.0.1
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-cov>=4.1.0
+
+# ── Linting ───────────────────────────────────────────────────────────────────
+ruff>=0.3.0

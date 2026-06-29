@@ -1,0 +1,69 @@
+services:
+
+  # ── Fixer ──────────────────────────────────────────────────────────────────
+  # Runs once per invocation (batch job). Two modes:
+  #   Fresh scan:  docker compose run --rm fixer
+  #   Retry:       docker compose run --rm -e RETRY_TRACKING_ID=<id> fixer
+  fixer:
+    build:
+      context: .
+      dockerfile: agents/fixer/Dockerfile
+    env_file: .env
+    environment:
+      TRACKING_STORE_PATH: /data/tracking.json
+      SCAN_REPORT_PATH: /reports
+    volumes:
+      # Scan reports produced by security-scan.yml (download the artifact here)
+      - ./scan-reports:/reports:ro
+      # Shared tracking state — survives container restarts
+      - tracking-data:/data
+      # GCP credentials for Vertex AI (ADC)
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/adc.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── Watcher ────────────────────────────────────────────────────────────────
+  # Runs once per invocation (batch job). Trigger manually or via cron:
+  #   docker compose run --rm watcher
+  #
+  # On CI failure the Watcher uses HttpFixerInvoker to POST to the fixer
+  # service. Start fixer as a long-running service first if you need retries:
+  #   docker compose up -d fixer-server  (see fixer-server service below)
+  watcher:
+    build:
+      context: .
+      dockerfile: agents/watcher/Dockerfile
+    env_file: .env
+    environment:
+      TRACKING_STORE_PATH: /data/tracking.json
+      FIXER_RETRY_URL: http://fixer-server:8080/retry
+    volumes:
+      - tracking-data:/data
+    depends_on:
+      - fixer-server
+
+  # ── Fixer (server mode for retry invocation) ───────────────────────────────
+  # Keeps the fixer container alive to receive retry POSTs from the Watcher.
+  # Only needed if you want the full retry loop locally.
+  #   docker compose up -d fixer-server
+  #   docker compose run --rm watcher
+  fixer-server:
+    build:
+      context: .
+      dockerfile: agents/fixer/Dockerfile
+    env_file: .env
+    environment:
+      TRACKING_STORE_PATH: /data/tracking.json
+      SCAN_REPORT_PATH: /reports
+      FIXER_SERVER_MODE: "1"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./scan-reports:/reports:ro
+      - tracking-data:/data
+      - ${GOOGLE_APPLICATION_CREDENTIALS:-~/.config/gcloud/application_default_credentials.json}:/gcp/adc.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  tracking-data:
