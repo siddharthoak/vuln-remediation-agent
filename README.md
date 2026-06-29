@@ -22,11 +22,12 @@ Full end-to-end walkthrough — from triggering a scan on the target repo to rem
 
 ```
 [1 Start agents] → [2 Trigger scan] → [3 Auto-fetch reports] → [4 Fixer (Gemini)] → [5 CI runs] → [6 Watcher + retry] → [CI_PASSED]
-  docker compose     GitHub Actions        ScanPoller                 fixer-server       GH Actions      watcher daemon
-  up -d              (manual dispatch)     (auto, ~60s poll)
+  docker compose     GitHub Actions        ScanPoller                 fixer-server       GH Actions      watcher daemon         ↓
+  up -d              (manual dispatch)     (auto, ~60s poll)                                                              [Dashboard]
+                                                                                                                      streamlit run …
 ```
 
-Both `fixer-server` and `watcher` run as long-lived services. You only need to trigger the GitHub Action — the agents do everything else.
+Both `fixer-server` and `watcher` run as long-lived services. You only need to trigger the GitHub Action — the agents do everything else. The Streamlit dashboard gives you live visibility into every step.
 
 ---
 
@@ -63,6 +64,9 @@ Edit `config/.env` — the required values:
 Place your GCP Service Account JSON at `config/my-google-service-account.json`. `docker-compose.yml` mounts it into every container at `/gcp/adc.json`. The SA account needs the `roles/aiplatform.user` role on the GCP project.
 
 ```bash
+# Install dashboard dependencies (host-side, one-time)
+pip install streamlit pandas
+
 # Build all images
 docker compose build
 ```
@@ -132,7 +136,7 @@ The workflow runs three scanners — OWASP Dependency-Check (~4 min), Trivy (~1 
 
 1. ScanPoller detects the new completed run and downloads the `vulnerability-reports` artifact.
 2. `ScanReportClient` reads the three JSON files and produces a deduplicated findings list.
-3. A `CREATED` tracking record is written to `tracking.json` (on the `tracking-data` Docker volume) for each finding.
+3. A `CREATED` tracking record is written to `./data/tracking.json` (bind-mounted, readable by the dashboard) for each finding.
 4. Up to `MAX_PARALLEL_FIXES=5` findings are processed concurrently. For each:
 
 | Step | What happens |
@@ -175,20 +179,23 @@ For each open `fix/` PR:
 
 ---
 
-### Phase 3 — Inspect tracking state
+### Phase 3 — Observe with the dashboard
 
 ```bash
-# Pretty-print the full tracking store
-docker run --rm \
-  -v vuln-remediation-agent_tracking-data:/data \
-  alpine sh -c "cat /data/tracking.json" \
-  | python3 -m json.tool
-
-# Watch it update in real time (second terminal)
-watch -n 5 'docker run --rm \
-  -v vuln-remediation-agent_tracking-data:/data \
-  alpine sh -c "cat /data/tracking.json" | python3 -m json.tool'
+streamlit run streamlit_dashboard.py
 ```
+
+Open [http://localhost:8501](http://localhost:8501). Run this in a separate terminal alongside the agents — it reads `./data/tracking.json` directly from the bind mount and auto-refreshes every 30 seconds. No Docker required.
+
+**Sidebar** shows live agent health:
+- **Fixer-server** — time since the last ScanPoller checkpoint write (goes yellow if the server is idle or unreachable)
+- **Scan reports** — which scanner JSON files are present in `./scan-reports/` and how old they are
+
+**Run History tab** — filterable table of every fix attempt with status, version change, PR number, token usage, and resolution time.
+
+**Retry Lineage tab** — select any PR number to see the full attempt chain. Each attempt expands to show component details, token usage, and the CI failure excerpt that was injected into the retry prompt.
+
+**Metrics tab** — resolution rate, in-progress / escalated counts, avg/p50/p95 time-to-resolution, total token consumption, and charts for status distribution and retry depth.
 
 **State machine:**
 
@@ -197,18 +204,6 @@ CREATED → PR_OPENED → CI_PENDING → CI_PASSED              (human review)
                     → CI_FAILED  → RETRY_REQUESTED → CI_PENDING  (retry loop)
                                                    → FAILED_MAX_RETRIES
 ```
-
-**Key fields in each record:**
-
-| Field | What it tells you |
-|---|---|
-| `tracking_id` | UUID — unique per fix attempt |
-| `parent_tracking_id` | Set on retry records; links back to the original attempt |
-| `attempt_number` | 1 = fresh fix, 2+ = retries |
-| `pr_number` | GitHub PR number opened by the agent |
-| `branch_name` | `fix/<component>-<safe-version>` |
-| `failure_log_excerpt` | CI failure log injected into the retry prompt (retry records only) |
-| `token_usage` | Gemini prompt + completion tokens for this attempt |
 
 ---
 
@@ -254,7 +249,7 @@ Set `MAX_RETRY_ATTEMPTS=1` in `config/.env` to reach `FAILED_MAX_RETRIES` quickl
 
 | Scenario | How to trigger | What to observe |
 |---|---|---|
-| **Happy path** | `docker compose up -d`; trigger scan | `fix/` PRs opened automatically; records progress to `CI_PASSED` |
+| **Happy path** | `docker compose up -d`; `streamlit run streamlit_dashboard.py`; trigger scan | `fix/` PRs opened automatically; dashboard shows records progressing to `CI_PASSED` |
 | **Informed retry** | Force CI failure via Enforcer rule | `RETRY_REQUESTED` record has `failure_log_excerpt`; fixer-server pushes a corrective commit |
 | **Retry exhaustion** | `MAX_RETRY_ATTEMPTS=1`; force CI failure | Record reaches `FAILED_MAX_RETRIES` after one retry; PR gets escalation comment |
 | **New CVE mid-run** | Add a new vulnerable dep; trigger scan again | ScanPoller detects the new completed run; only the new finding gets a fresh PR |

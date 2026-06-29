@@ -24,8 +24,8 @@ services:
     volumes:
       # Writable — the ScanPoller downloads artifacts here
       - ./scan-reports:/reports
-      # Shared tracking state — survives container restarts
-      - tracking-data:/data
+      # Bind mount so the Streamlit dashboard can read tracking.json directly
+      - ./data:/data
       # GCP credentials for Vertex AI (ADC)
       - ./config/my-google-service-account.json:/gcp/adc.json:ro
     restart: unless-stopped
@@ -51,7 +51,7 @@ services:
       WATCHER_DAEMON: "1"
       WATCHER_SLEEP_SECONDS: "900"  # 15 minutes
     volumes:
-      - tracking-data:/data
+      - ./data:/data
     depends_on:
       - fixer-server
     restart: unless-stopped
@@ -59,11 +59,11 @@ services:
   # ── Fixer one-shot (manual use) ───────────────────────────────────────────
   # For ad-hoc runs outside the always-on flow.
   #   Fresh scan (reports already in ./scan-reports):
-  #     docker compose run --rm fixer
+  #     docker compose run --rm --profile manual fixer
   #   Fresh scan + auto-trigger + download:
-  #     docker compose run --rm -e AUTO_FETCH_SCAN=1 fixer
+  #     docker compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
   #   Retry a specific tracking ID:
-  #     docker compose run --rm -e RETRY_TRACKING_ID=<id> fixer
+  #     docker compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
   fixer:
     build:
       context: .
@@ -74,12 +74,9 @@ services:
       SCAN_REPORT_PATH: /reports
     volumes:
       - ./scan-reports:/reports
-      - tracking-data:/data
+      - ./data:/data
       - ./config/my-google-service-account.json:/gcp/adc.json:ro
     profiles:
       - manual
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
-volumes:
-  tracking-data:
