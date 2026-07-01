@@ -65,7 +65,7 @@ class KnowledgeAgent:
         model_name: Optional[str] = None,
     ):
         self._fetcher = ReleaseFetcher(github_pat=github_pat)
-        self._model_name = model_name or os.environ.get("VERTEX_MODEL", "gemini-2.0-flash-001")
+        self._model_name = model_name or os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
 
         vertexai.init(
             project=os.environ.get("GOOGLE_CLOUD_PROJECT"),

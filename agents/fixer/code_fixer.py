@@ -6,7 +6,7 @@ Migrated from nexus-remediation-agent/agents/fixer/code_fixer.py.
 What changed vs. the Azure/Anthropic version:
   - LLM client: anthropic.Anthropic() → google.adk Agent + FunctionTool
   - Model: Anthropic model name → Vertex AI model name (VERTEX_MODEL env var,
-    default: gemini-2.0-flash-001)
+    default: gemini-2.5-flash)
   - Token counting: response.usage.input/output_tokens →
     event.usage_metadata.prompt_token_count / candidates_token_count
   - Tool loop: manual stop_reason branching → ADK Runner handles the loop
@@ -219,7 +219,7 @@ class CodeFixer:
     def __init__(self, repo_path: str, model_deployment_name: Optional[str] = None):
         self._repo_path = Path(repo_path)
         self._model_name = model_deployment_name or os.environ.get(
-            "VERTEX_MODEL", "gemini-2.0-flash-001"
+            "VERTEX_MODEL", "gemini-2.5-flash"
         )
         self._max_attempts = int(os.environ.get("MAX_RETRY_ATTEMPTS", "3"))
         self._applied_changes: list = []
@@ -344,7 +344,7 @@ class CodeFixer:
             completion_tokens=completion_tokens,
         )
 
-    # ── pom.xml manipulation (UNCHANGED) ─────────────────────────────────────
+    # ── pom.xml manipulation ───────────────────────────────────────────────────
 
     def _bump_pom_version(self, component_name: str, current_version: str, target_version: str) -> None:
         pom_path = self._repo_path / "pom.xml"
@@ -353,23 +353,62 @@ class CodeFixer:
 
         tree = ET.parse(str(pom_path))
         root = tree.getroot()
-        ns = {"m": "http://maven.apache.org/POM/4.0.0"}
-        ET.register_namespace("", "http://maven.apache.org/POM/4.0.0")
+
+        ns_uri = "http://maven.apache.org/POM/4.0.0"
+        ET.register_namespace("", ns_uri)
+
+        # Support both namespaced (<project xmlns="..."/>) and bare (<project/>) pom.xml files.
+        if root.tag.startswith(f"{{{ns_uri}}}"):
+            ns = {"m": ns_uri}
+            dep_xpath = ".//m:dependency"
+            tag = lambda t: f"m:{t}"  # noqa: E731
+            subtag = lambda t: f"{{{ns_uri}}}{t}"  # noqa: E731
+            prop_xpath = lambda name: f"./m:properties/m:{name}"  # noqa: E731
+        else:
+            ns = {}
+            dep_xpath = ".//dependency"
+            tag = lambda t: t  # noqa: E731
+            subtag = lambda t: t  # noqa: E731
+            prop_xpath = lambda name: f"./properties/{name}"  # noqa: E731
 
         parts = component_name.split(":")
         artifact_id = parts[-1]
         group_id = parts[0] if len(parts) > 1 else None
 
         found = False
-        for dep in root.findall(".//m:dependency", ns):
-            aid_el = dep.find("m:artifactId", ns)
-            gid_el = dep.find("m:groupId", ns)
-            ver_el = dep.find("m:version", ns)
-            if aid_el is None or ver_el is None:
+        for dep in root.findall(dep_xpath, ns):
+            aid_el = dep.find(tag("artifactId"), ns)
+            gid_el = dep.find(tag("groupId"), ns)
+            ver_el = dep.find(tag("version"), ns)
+            if aid_el is None:
                 continue
             aid_match = aid_el.text == artifact_id
             gid_match = group_id is None or (gid_el is not None and gid_el.text == group_id)
-            if aid_match and gid_match and ver_el.text == current_version:
+            if not (aid_match and gid_match):
+                continue
+
+            if ver_el is None:
+                # Version managed by BOM/dependencyManagement — add an explicit override.
+                ET.SubElement(dep, subtag("version")).text = target_version
+                found = True
+                logger.info("pom.xml: %s added explicit version %s (was BOM-managed)", component_name, target_version)
+                break
+
+            ver_text = ver_el.text or ""
+            if ver_text.startswith("${") and ver_text.endswith("}"):
+                # Version is a Maven property reference — update the property value.
+                prop_name = ver_text[2:-1]
+                prop_el = root.find(prop_xpath(prop_name), ns)
+                if prop_el is not None:
+                    logger.info("pom.xml: property %s %s → %s", prop_name, prop_el.text, target_version)
+                    prop_el.text = target_version
+                else:
+                    logger.info("pom.xml: %s inlining version (property %s not found)", component_name, prop_name)
+                    ver_el.text = target_version
+                found = True
+                break
+
+            if ver_text == current_version:
                 ver_el.text = target_version
                 found = True
                 logger.info("pom.xml: %s %s → %s", component_name, current_version, target_version)
@@ -417,11 +456,32 @@ class CodeFixer:
                 kb_context=_render_kb_context(kb_entry),
             )
 
+        # ADK derives tool names from func.__name__. Instance methods have names
+        # like "_tool_grep_files" but the prompt tells the LLM to call "grep_files".
+        # Wrap each handler in a local function whose __name__ matches the prompt.
+        def read_file(relative_path: str) -> str:
+            """Read the full contents of a file in the cloned repository."""
+            return self._tool_read_file(relative_path)
+
+        def grep_files(pattern: str, extensions: Optional[list] = None) -> str:
+            """Search for a regex pattern across repository source files."""
+            return self._tool_grep_files(pattern, extensions)
+
+        def apply_file_change(
+            relative_path: str, find: str, replace: str, change_description: str = ""
+        ) -> str:
+            """Apply a single find→replace edit to a file in the cloned repository."""
+            return self._tool_apply_file_change(relative_path, find, replace, change_description)
+
+        def run_maven_compile() -> str:
+            """Compile the repository with 'mvn compile -q'. No tests are executed."""
+            return self._tool_run_maven_compile()
+
         tools = [
-            FunctionTool(func=self._tool_read_file),
-            FunctionTool(func=self._tool_grep_files),
-            FunctionTool(func=self._tool_apply_file_change),
-            FunctionTool(func=self._tool_run_maven_compile),
+            FunctionTool(func=read_file),
+            FunctionTool(func=grep_files),
+            FunctionTool(func=apply_file_change),
+            FunctionTool(func=run_maven_compile),
         ]
 
         agent = Agent(

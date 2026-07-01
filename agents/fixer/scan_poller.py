@@ -164,9 +164,15 @@ class ScanPoller:
             return data.get("last_run_id")
         except (FileNotFoundError, json.JSONDecodeError):
             return None
+        except OSError as exc:
+            logger.warning("ScanPoller: cannot read checkpoint (%s) — starting from latest run", exc)
+            return None
 
     def _save_checkpoint(self, run_id: int) -> None:
-        self._checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        self._checkpoint.write_text(
-            json.dumps({"last_run_id": run_id}), encoding="utf-8"
-        )
+        try:
+            self._checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            self._checkpoint.write_text(
+                json.dumps({"last_run_id": run_id}), encoding="utf-8"
+            )
+        except OSError as exc:
+            logger.warning("ScanPoller: cannot write checkpoint (%s) — progress will not be persisted", exc)

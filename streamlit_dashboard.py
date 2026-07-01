@@ -20,6 +20,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+# pandas 3.0 defaults to Arrow-backed StringDtype which conflicts with
+# Streamlit's PyArrow cache serialization on macOS, causing SIGBUS.
+pd.set_option("future.infer_string", False)
 import streamlit as st
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "agents"))
@@ -88,6 +91,45 @@ with st.sidebar:
     st.caption("Auto-refreshes every 30s via cache TTL.  \nClick **↺ Refresh** to force.")
 
 
+# ── Activity detection helpers ────────────────────────────────────────────────
+
+tracking_path_used = os.environ.get("TRACKING_STORE_PATH", "./data/tracking.json")
+tracking_file      = Path(tracking_path_used)
+
+def _fixer_active() -> bool:
+    """Return True if fixer wrote to any data file in the last 5 minutes."""
+    for p in [checkpoint_path, tracking_file]:
+        try:
+            if p.exists():
+                age = (datetime.now(tz=timezone.utc) -
+                       datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)).total_seconds()
+                if age < 300:
+                    return True
+        except OSError:
+            pass
+    return False
+
+def _scan_finding_count() -> int:
+    """Return total findings across all present scan reports (best-effort)."""
+    count = 0
+    trivy = report_files.get("Trivy")
+    if trivy and trivy.exists():
+        try:
+            data = json.loads(trivy.read_text())
+            for result in data.get("Results", []):
+                count += len(result.get("Vulnerabilities") or [])
+        except Exception:
+            pass
+    grype = report_files.get("Grype")
+    if grype and grype.exists():
+        try:
+            data = json.loads(grype.read_text())
+            count = max(count, len(data.get("matches", [])))
+        except Exception:
+            pass
+    return count
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=30)
@@ -102,8 +144,9 @@ def load_records() -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame([asdict(r) for r in records])
-    df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
-    df["updated_at"]  = pd.to_datetime(df["updated_at"],  utc=True)
+    # Keep created_at/updated_at as strings — pandas 3.0 + pyarrow causes SIGBUS
+    # on macOS ARM64 when boolean-indexing DataFrames with tz-aware datetime columns.
+    # Streamlit's DatetimeColumn config handles ISO-8601 strings natively.
 
     if "token_usage" in df.columns:
         df["prompt_tokens"]     = df["token_usage"].apply(lambda x: x.get("prompt_tokens", 0)     if isinstance(x, dict) else 0)
@@ -121,20 +164,48 @@ with col_refresh:
         load_records.clear()
         st.rerun()
 
+active = _fixer_active()
+
+# ── Top-of-page status banner ─────────────────────────────────────────────────
 if df.empty:
-    st.info(
-        "No tracking records yet.  \n\n"
-        "Start the agents with `docker compose up -d`, trigger the security scan on your "
-        "target repo, and records will appear here once the fixer picks up the reports.  \n\n"
-        f"Reading from: `{os.environ.get('TRACKING_STORE_PATH', './data/tracking.json')}`"
-    )
-    st.stop()
+    if active:
+        n = _scan_finding_count()
+        finding_str = f"{n} finding(s) detected — " if n else ""
+        st.info(
+            f"⚙️ **Fixer is initializing** — {finding_str}building the knowledge base "
+            "and preparing fix branches.  \n"
+            "Tracking records appear once PRs are opened. "
+            "**Auto-refreshing every 10 s.**"
+        )
+        # Inject a client-side meta-refresh so the page reloads automatically.
+        import streamlit.components.v1 as components
+        components.html("<meta http-equiv='refresh' content='10'>", height=0)
+    else:
+        st.info(
+            "No tracking records yet.  \n\n"
+            "Start the agents with `docker compose up -d`, trigger the security scan on your "
+            "target repo, and records will appear here once the fixer picks up the reports.  \n\n"
+            f"Reading from: `{tracking_path_used}`"
+        )
+else:
+    created_df = df[df["status"] == TrackingStatus.CREATED.value]
+    if not created_df.empty:
+        st.info(
+            f"⚙️ **Fixer is processing** — {len(created_df)} finding(s) across "
+            f"{created_df['component_name'].nunique()} component(s) are queued or in flight.  \n"
+            "Records will update as PRs are opened. "
+            "**Auto-refreshing every 10 s.**"
+        )
+        import streamlit.components.v1 as components
+        components.html("<meta http-equiv='refresh' content='10'>", height=0)
 
-with col_count:
-    st.caption(f"{len(df)} total record(s) across {df['pr_number'].nunique()} PR(s)")
+if not df.empty:
+    with col_count:
+        pr_col = df["pr_number"].dropna() if "pr_number" in df.columns else pd.Series([], dtype=float)
+        st.caption(f"{len(df)} total record(s) across {pr_col.nunique()} PR(s)")
 
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
+# ── Tabs (always rendered; history/lineage/metrics gracefully handle empty df) ─
 
 tab_history, tab_lineage, tab_metrics, tab_kb = st.tabs([
     "Run History",
@@ -149,61 +220,64 @@ tab_history, tab_lineage, tab_metrics, tab_kb = st.tabs([
 with tab_history:
     st.subheader("All Fix Attempts")
 
-    col_status, col_component, col_repo = st.columns(3)
+    if df.empty:
+        st.info("No fix attempts recorded yet. The fixer has not opened any PRs.")
+    else:
+        col_status, col_component, col_repo = st.columns(3)
 
-    with col_status:
-        statuses = ["(all)"] + sorted(df["status"].dropna().unique().tolist())
-        status_filter = st.selectbox("Status", statuses)
+        with col_status:
+            statuses = ["(all)"] + sorted(df["status"].dropna().unique().tolist())
+            status_filter = st.selectbox("Status", statuses)
 
-    with col_component:
-        components = ["(all)"] + sorted(df["component_name"].dropna().unique().tolist())
-        component_filter = st.selectbox("Component", components)
+        with col_component:
+            comps = ["(all)"] + sorted(df["component_name"].dropna().unique().tolist())
+            component_filter = st.selectbox("Component", comps)
 
-    with col_repo:
-        repos = ["(all)"] + sorted(df["repo"].dropna().unique().tolist())
-        repo_filter = st.selectbox("Repository", repos)
+        with col_repo:
+            repos = ["(all)"] + sorted(df["repo"].dropna().unique().tolist())
+            repo_filter = st.selectbox("Repository", repos)
 
-    view = df.copy()
-    if status_filter != "(all)":
-        view = view[view["status"] == status_filter]
-    if component_filter != "(all)":
-        view = view[view["component_name"] == component_filter]
-    if repo_filter != "(all)":
-        view = view[view["repo"] == repo_filter]
+        view = df.copy()
+        if status_filter != "(all)":
+            view = view[view["status"] == status_filter]
+        if component_filter != "(all)":
+            view = view[view["component_name"] == component_filter]
+        if repo_filter != "(all)":
+            view = view[view["repo"] == repo_filter]
 
-    display_cols = [
-        "created_at", "component_name", "old_version", "new_version",
-        "status", "attempt_number", "pr_number", "branch_name",
-        "time_to_resolution_seconds", "total_tokens", "tracking_id",
-    ]
-    display_cols = [c for c in display_cols if c in view.columns]
+        display_cols = [
+            "created_at", "component_name", "old_version", "new_version",
+            "status", "attempt_number", "pr_number", "branch_name",
+            "time_to_resolution_seconds", "total_tokens", "tracking_id",
+        ]
+        display_cols = [c for c in display_cols if c in view.columns]
 
-    STATUS_COLORS = {
-        TrackingStatus.CI_PASSED.value:          "🟢",
-        TrackingStatus.CI_PENDING.value:         "🟡",
-        TrackingStatus.CI_FAILED.value:          "🔴",
-        TrackingStatus.RETRY_REQUESTED.value:    "🔵",
-        TrackingStatus.FAILED_MAX_RETRIES.value: "⛔",
-        TrackingStatus.ESCALATED.value:          "⚠️",
-        TrackingStatus.CREATED.value:            "⚪",
-        TrackingStatus.PR_OPENED.value:          "🟤",
-    }
-    view = view.copy()
-    view["status"] = view["status"].apply(lambda s: f"{STATUS_COLORS.get(s, '•')} {s}")
+        STATUS_COLORS = {
+            TrackingStatus.CI_PASSED.value:          "🟢",
+            TrackingStatus.CI_PENDING.value:         "🟡",
+            TrackingStatus.CI_FAILED.value:          "🔴",
+            TrackingStatus.RETRY_REQUESTED.value:    "🔵",
+            TrackingStatus.FAILED_MAX_RETRIES.value: "⛔",
+            TrackingStatus.ESCALATED.value:          "⚠️",
+            TrackingStatus.CREATED.value:            "⚪",
+            TrackingStatus.PR_OPENED.value:          "🟤",
+        }
+        view = view.copy()
+        view["status"] = view["status"].apply(lambda s: f"{STATUS_COLORS.get(s, '•')} {s}")
 
-    st.dataframe(
-        view[display_cols].sort_values("created_at", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "created_at":                 st.column_config.DatetimeColumn("Created", format="MMM D, HH:mm"),
-            "time_to_resolution_seconds": st.column_config.NumberColumn("Resolution (s)", format="%d s"),
-            "total_tokens":               st.column_config.NumberColumn("Tokens"),
-            "pr_number":                  st.column_config.NumberColumn("PR #", format="%d"),
-            "attempt_number":             st.column_config.NumberColumn("Attempt"),
-        },
-    )
-    st.caption(f"{len(view)} record(s) shown of {len(df)} total.")
+        st.dataframe(
+            view[display_cols].sort_values("created_at", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "created_at":                 st.column_config.DatetimeColumn("Created", format="MMM D, HH:mm"),
+                "time_to_resolution_seconds": st.column_config.NumberColumn("Resolution (s)", format="%d s"),
+                "total_tokens":               st.column_config.NumberColumn("Tokens"),
+                "pr_number":                  st.column_config.NumberColumn("PR #", format="%d"),
+                "attempt_number":             st.column_config.NumberColumn("Attempt"),
+            },
+        )
+        st.caption(f"{len(view)} record(s) shown of {len(df)} total.")
 
 
 # ── Tab 2: Retry Lineage ──────────────────────────────────────────────────────
@@ -211,7 +285,10 @@ with tab_history:
 with tab_lineage:
     st.subheader("Retry Lineage by PR")
 
-    pr_numbers = sorted(df["pr_number"].dropna().astype(int).unique().tolist())
+    pr_numbers = (
+        sorted(df["pr_number"].dropna().astype(int).unique().tolist())
+        if "pr_number" in df.columns else []
+    )
     if not pr_numbers:
         st.info("No PRs with tracking records yet.")
     else:
@@ -236,7 +313,7 @@ with tab_lineage:
             icon   = ICONS.get(status, "•")
             with st.expander(
                 f"{icon} Attempt {int(row['attempt_number'])} — {status} "
-                f"({row['created_at'].strftime('%Y-%m-%d %H:%M UTC')})"
+                f"({pd.to_datetime(row['created_at']).strftime('%Y-%m-%d %H:%M UTC')})"
             ):
                 c1, c2 = st.columns(2)
                 c1.metric("Component",      row["component_name"])
@@ -268,74 +345,77 @@ with tab_lineage:
 with tab_metrics:
     st.subheader("Run Metrics")
 
-    latest = (
-        df.sort_values("attempt_number")
-          .groupby("pr_number")
-          .last()
-          .reset_index()
-    )
-
-    total_prs   = len(latest)
-    resolved    = (latest["status"] == TrackingStatus.CI_PASSED.value).sum()
-    escalated   = latest["status"].isin([
-        TrackingStatus.FAILED_MAX_RETRIES.value,
-        TrackingStatus.ESCALATED.value,
-    ]).sum()
-    in_progress = total_prs - resolved - escalated
-    resolution_rate = resolved / total_prs * 100 if total_prs else 0.0
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("PRs opened",       total_prs)
-    m2.metric("Resolved ✅",       resolved,    help="Status = CI_PASSED")
-    m3.metric("In progress ⏳",    in_progress)
-    m4.metric("Escalated ⛔",      escalated,   help="FAILED_MAX_RETRIES or ESCALATED")
-    m5.metric("Resolution rate",  f"{resolution_rate:.1f}%")
-
-    st.divider()
-
-    resolved_df = latest[latest["status"] == TrackingStatus.CI_PASSED.value]
-    if not resolved_df.empty and "time_to_resolution_seconds" in resolved_df.columns:
-        valid = resolved_df["time_to_resolution_seconds"].dropna()
-        if not valid.empty:
-            t1, t2, t3 = st.columns(3)
-            t1.metric("Avg time-to-resolution", f"{valid.mean() / 60:.1f} min")
-            t2.metric("p50",                    f"{valid.median() / 60:.1f} min")
-            t3.metric("p95",                    f"{valid.quantile(0.95) / 60:.1f} min")
-            st.divider()
-
-    if "total_tokens" in df.columns:
-        total_tokens = int(df["total_tokens"].sum())
-        avg_per_pr   = df.groupby("pr_number")["total_tokens"].sum().mean()
-        tk1, tk2 = st.columns(2)
-        tk1.metric("Total tokens consumed", f"{total_tokens:,}")
-        tk2.metric("Avg tokens per PR",     f"{avg_per_pr:,.0f}" if not pd.isna(avg_per_pr) else "—")
-
-        st.markdown("**Token usage by attempt number**")
-        token_by_attempt = (
-            df.groupby("attempt_number")["total_tokens"]
-              .sum()
+    if df.empty:
+        st.info("No metrics yet — run data will appear here once PRs are opened.")
+    else:
+        latest = (
+            df.sort_values("attempt_number")
+              .groupby("pr_number")
+              .last()
               .reset_index()
-              .rename(columns={"attempt_number": "Attempt", "total_tokens": "Total tokens"})
         )
-        st.bar_chart(token_by_attempt.set_index("Attempt"))
+
+        total_prs   = len(latest)
+        resolved    = (latest["status"] == TrackingStatus.CI_PASSED.value).sum()
+        escalated   = latest["status"].isin([
+            TrackingStatus.FAILED_MAX_RETRIES.value,
+            TrackingStatus.ESCALATED.value,
+        ]).sum()
+        in_progress = total_prs - resolved - escalated
+        resolution_rate = resolved / total_prs * 100 if total_prs else 0.0
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("PRs opened",      total_prs)
+        m2.metric("Resolved ✅",      resolved,   help="Status = CI_PASSED")
+        m3.metric("In progress ⏳",   in_progress)
+        m4.metric("Escalated ⛔",     escalated,  help="FAILED_MAX_RETRIES or ESCALATED")
+        m5.metric("Resolution rate", f"{resolution_rate:.1f}%")
+
         st.divider()
 
-    st.markdown("**Attempt status distribution**")
-    status_counts = df["status"].value_counts().reset_index()
-    status_counts.columns = ["Status", "Count"]
-    st.bar_chart(status_counts.set_index("Status"))
+        resolved_df = latest[latest["status"] == TrackingStatus.CI_PASSED.value]
+        if not resolved_df.empty and "time_to_resolution_seconds" in resolved_df.columns:
+            valid = resolved_df["time_to_resolution_seconds"].dropna()
+            if not valid.empty:
+                t1, t2, t3 = st.columns(3)
+                t1.metric("Avg time-to-resolution", f"{valid.mean() / 60:.1f} min")
+                t2.metric("p50",                    f"{valid.median() / 60:.1f} min")
+                t3.metric("p95",                    f"{valid.quantile(0.95) / 60:.1f} min")
+                st.divider()
 
-    if "attempt_number" in df.columns:
-        st.markdown("**Retry depth per PR** (max attempts used)")
-        depth = (
-            df.groupby("pr_number")["attempt_number"]
-              .max()
-              .value_counts()
-              .sort_index()
-              .reset_index()
-        )
-        depth.columns = ["Max attempts", "PR count"]
-        st.bar_chart(depth.set_index("Max attempts"))
+        if "total_tokens" in df.columns:
+            total_tokens = int(df["total_tokens"].sum())
+            avg_per_pr   = df.groupby("pr_number")["total_tokens"].sum().mean()
+            tk1, tk2 = st.columns(2)
+            tk1.metric("Total tokens consumed", f"{total_tokens:,}")
+            tk2.metric("Avg tokens per PR",     f"{avg_per_pr:,.0f}" if not pd.isna(avg_per_pr) else "—")
+
+            st.markdown("**Token usage by attempt number**")
+            token_by_attempt = (
+                df.groupby("attempt_number")["total_tokens"]
+                  .sum()
+                  .reset_index()
+                  .rename(columns={"attempt_number": "Attempt", "total_tokens": "Total tokens"})
+            )
+            st.bar_chart(token_by_attempt.set_index("Attempt"))
+            st.divider()
+
+        st.markdown("**Attempt status distribution**")
+        status_counts = df["status"].value_counts().reset_index()
+        status_counts.columns = ["Status", "Count"]
+        st.bar_chart(status_counts.set_index("Status"))
+
+        if "attempt_number" in df.columns:
+            st.markdown("**Retry depth per PR** (max attempts used)")
+            depth = (
+                df.groupby("pr_number")["attempt_number"]
+                  .max()
+                  .value_counts()
+                  .sort_index()
+                  .reset_index()
+            )
+            depth.columns = ["Max attempts", "PR count"]
+            st.bar_chart(depth.set_index("Max attempts"))
 
 
 # ── Tab 4: Knowledge Base ─────────────────────────────────────────────────────

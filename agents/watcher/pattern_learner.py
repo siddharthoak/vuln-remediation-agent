@@ -74,7 +74,7 @@ class PatternLearner:
             "X-GitHub-Api-Version": "2022-11-28",
         }
         self._base  = f"https://api.github.com/repos/{repo_full_name}"
-        self._model_name = model_name or os.environ.get("VERTEX_MODEL", "gemini-2.0-flash-001")
+        self._model_name = model_name or os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
 
         vertexai.init(
             project=os.environ.get("GOOGLE_CLOUD_PROJECT"),
