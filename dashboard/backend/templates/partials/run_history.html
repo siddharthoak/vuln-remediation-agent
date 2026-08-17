@@ -1,0 +1,50 @@
+<div id="run-history-root"
+     hx-get="/partials/run-history?status={{ selected_status | urlencode }}&component={{ selected_component | urlencode }}&repo={{ selected_repo | urlencode }}"
+     hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML">
+
+  <h2>All Fix Attempts <small>({{ view | length }} of {{ total_count }} shown)</small></h2>
+
+  {% if not total_count %}
+    <p>No fix attempts recorded yet.</p>
+  {% else %}
+    <form id="run-history-filters">
+      <select name="status" hx-get="/partials/run-history" hx-trigger="change" hx-target="#run-history-root" hx-swap="outerHTML" hx-include="#run-history-filters">
+        <option value="">Status: (all)</option>
+        {% for s in statuses %}<option value="{{ s }}" {% if s == selected_status %}selected{% endif %}>{{ s }}</option>{% endfor %}
+      </select>
+      <select name="component" hx-get="/partials/run-history" hx-trigger="change" hx-target="#run-history-root" hx-swap="outerHTML" hx-include="#run-history-filters">
+        <option value="">Component: (all)</option>
+        {% for c in components %}<option value="{{ c }}" {% if c == selected_component %}selected{% endif %}>{{ c }}</option>{% endfor %}
+      </select>
+      <select name="repo" hx-get="/partials/run-history" hx-trigger="change" hx-target="#run-history-root" hx-swap="outerHTML" hx-include="#run-history-filters">
+        <option value="">Repo: (all)</option>
+        {% for r in repos %}<option value="{{ r }}" {% if r == selected_repo %}selected{% endif %}>{{ r }}</option>{% endfor %}
+      </select>
+    </form>
+
+    <div style="overflow-x:auto; max-height: 70vh; overflow-y: auto;">
+    <table>
+      <thead><tr>
+        <th>Created</th><th>Component</th><th>Old &rarr; New</th><th>Status</th>
+        <th>Attempt</th><th>PR</th><th>Branch</th><th>Resolution (s)</th><th>Tokens</th><th>Tracking ID</th>
+      </tr></thead>
+      <tbody>
+        {% for r in view %}
+        <tr>
+          <td>{{ r.created_at[:16] if r.created_at else "—" }}</td>
+          <td>{{ r.component_name }}</td>
+          <td>{{ r.old_version }} &rarr; {{ r.new_version }}</td>
+          <td>{{ r.status_icon }} {{ r.status }}</td>
+          <td>{{ r.attempt_number }}</td>
+          <td>{{ r.pr_number if r.pr_number is not none else "—" }}</td>
+          <td>{{ r.branch_name or "—" }}</td>
+          <td>{{ r.time_to_resolution_seconds | round(0) | int if r.time_to_resolution_seconds is not none else "—" }}</td>
+          <td>{{ r.total_tokens }}</td>
+          <td><code>{{ r.tracking_id[:8] }}&hellip;</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  {% endif %}
+</div>

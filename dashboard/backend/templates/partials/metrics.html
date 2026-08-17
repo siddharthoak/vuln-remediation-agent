@@ -1,0 +1,57 @@
+<div id="metrics-root" hx-get="/partials/metrics" hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML">
+  <h2>Run Metrics</h2>
+
+  {% if not has_records %}
+    <p>No metrics yet — run data will appear here once PRs are opened.</p>
+  {% else %}
+    <div class="metric-row">
+      <div class="metric"><div class="value">{{ total_prs }}</div><div class="label">PRs opened</div></div>
+      <div class="metric"><div class="value ok">{{ resolved }}</div><div class="label">Resolved</div></div>
+      <div class="metric"><div class="value warn">{{ in_progress }}</div><div class="label">In progress</div></div>
+      <div class="metric"><div class="value err">{{ escalated }}</div><div class="label">Escalated</div></div>
+      <div class="metric"><div class="value">{{ resolution_rate | round(1) }}%</div><div class="label">Resolution rate</div></div>
+    </div>
+
+    {% if avg_resolution is not none %}
+    <div class="metric-row">
+      <div class="metric"><div class="value">{{ avg_resolution | round(1) }} min</div><div class="label">Avg time-to-resolution</div></div>
+      <div class="metric"><div class="value">{{ p50_resolution | round(1) }} min</div><div class="label">p50</div></div>
+      <div class="metric"><div class="value">{{ p95_resolution | round(1) }} min</div><div class="label">p95</div></div>
+    </div>
+    {% endif %}
+
+    <div class="metric-row">
+      <div class="metric"><div class="value">{{ "{:,}".format(total_tokens) }}</div><div class="label">Total tokens consumed</div></div>
+      {% if avg_tokens_per_pr is not none %}
+      <div class="metric"><div class="value">{{ "{:,.0f}".format(avg_tokens_per_pr) }}</div><div class="label">Avg tokens per PR</div></div>
+      {% endif %}
+    </div>
+
+    <h2>Token usage by attempt number</h2>
+    {% for b in tokens_by_attempt_bars %}
+      <div class="bar-row">
+        <div class="bar-label">Attempt {{ b.label }}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%"></div></div>
+        <div class="bar-value">{{ "{:,}".format(b.value) }}</div>
+      </div>
+    {% endfor %}
+
+    <h2>Attempt status distribution</h2>
+    {% for b in status_bars %}
+      <div class="bar-row">
+        <div class="bar-label">{{ b.label }}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%"></div></div>
+        <div class="bar-value">{{ b.value }}</div>
+      </div>
+    {% endfor %}
+
+    <h2>Retry depth per PR (max attempts used)</h2>
+    {% for b in depth_bars %}
+      <div class="bar-row">
+        <div class="bar-label">{{ b.label }} attempt(s)</div>
+        <div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%"></div></div>
+        <div class="bar-value">{{ b.value }} PR(s)</div>
+      </div>
+    {% endfor %}
+  {% endif %}
+</div>

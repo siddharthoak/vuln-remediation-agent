@@ -26,7 +26,7 @@ services:
     volumes:
       # Writable — the ScanPoller downloads artifacts here
       - ./scan-reports:/reports
-      # Bind mount so the Streamlit dashboard can read tracking.json directly
+      # Bind mount so the dashboard container can read tracking.json directly
       - ./data:/data
       # GCP credentials for Vertex AI (ADC)
       - ./config/my-google-service-account.json:/gcp/adc.json:ro
@@ -57,6 +57,26 @@ services:
       - ./data:/data
     depends_on:
       - fixer-server
+    restart: unless-stopped
+
+  # ── Dashboard (always-on) ─────────────────────────────────────────────────
+  # Starts automatically with: docker compose up -d
+  # Observability UI — read-only, reads tracking/KB state from the same
+  # bind-mounted ./data volume the fixer-server and watcher write to.
+  # View at: http://localhost:8501
+  dashboard:
+    build:
+      context: .
+      dockerfile: dashboard/Dockerfile
+    environment:
+      TRACKING_STORE_PATH: /data/tracking.json
+      KB_STORE_PATH: /data/kb.json
+      SCAN_REPORT_PATH: /reports
+    ports:
+      - "8501:8000"
+    volumes:
+      - ./data:/data:ro
+      - ./scan-reports:/reports:ro
     restart: unless-stopped
 
   # ── Fixer one-shot (manual use) ───────────────────────────────────────────

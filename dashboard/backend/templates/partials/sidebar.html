@@ -1,0 +1,27 @@
+<div id="sidebar" hx-get="/partials/sidebar" hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML">
+  <div class="card">
+    <strong>Fixer status</strong><br>
+    {% if sidebar.fixer_active %}
+      <span class="ok">&#9679; polling</span>
+    {% else %}
+      <span class="warn">&#9679; idle / no checkpoint</span>
+    {% endif %}
+    {% if sidebar.checkpoint %}
+      <br><small>last seen {{ sidebar.checkpoint.age_seconds | round(0) | int }}s ago</small>
+      {% if sidebar.checkpoint.last_run_id %}<br><small>run: {{ sidebar.checkpoint.last_run_id }}</small>{% endif %}
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <strong>Scan reports</strong>
+    {% for label, r in sidebar.reports.items() %}
+      <div>
+        {% if r.present %}<span class="ok">&#10003;</span> {{ label }} <small>({{ r.age_minutes }}m ago)</small>
+        {% else %}<span class="err">&#10007;</span> {{ label }} <small>not found</small>{% endif %}
+      </div>
+    {% endfor %}
+    {% if sidebar.scan_finding_count %}<small>{{ sidebar.scan_finding_count }} finding(s) in latest scan</small>{% endif %}
+  </div>
+
+  <small>Reading: <code>{{ sidebar.tracking_path }}</code></small>
+</div>

@@ -21,9 +21,9 @@ requests>=2.31.0
 lxml>=4.9.0
 PyYAML>=6.0.1
 
-# ── Dashboard ────────────────────────────────────────────────────────────────
-streamlit>=1.35.0
-pandas>=2.0.0
+# Dashboard is now a separate container (dashboard/) with its own
+# requirements.txt (FastAPI + uvicorn + Jinja2, server-rendered, no JS build
+# step) — nothing to install here.
 
 # ── Testing ───────────────────────────────────────────────────────────────────
 pytest>=8.0.0

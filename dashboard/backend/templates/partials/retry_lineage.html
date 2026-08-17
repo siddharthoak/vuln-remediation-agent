@@ -1,0 +1,42 @@
+<div id="retry-lineage-root"
+     hx-get="/partials/retry-lineage?pr_number={{ selected_pr if selected_pr is not none else '' }}"
+     hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML">
+
+  <h2>Retry Lineage by PR</h2>
+
+  {% if not pr_numbers %}
+    <p>No PRs with tracking records yet.</p>
+  {% else %}
+    <select hx-get="/partials/retry-lineage" hx-trigger="change" hx-target="#retry-lineage-root" hx-swap="outerHTML" name="pr_number">
+      {% for n in pr_numbers %}
+        <option value="{{ n }}" {% if n == selected_pr %}selected{% endif %}>PR #{{ n }}</option>
+      {% endfor %}
+    </select>
+
+    <p><strong>{{ lineage | length }} attempt(s)</strong> for PR #{{ selected_pr }}</p>
+
+    {% for r in lineage %}
+      <details {% if loop.last %}open{% endif %}>
+        <summary>{{ r.status_icon }} Attempt {{ r.attempt_number }} &mdash; {{ r.status }}
+          <small>({{ r.created_at[:16] if r.created_at else "—" }})</small></summary>
+        <div class="metric-row">
+          <div class="metric"><div class="value">{{ r.component_name }}</div><div class="label">Component</div></div>
+          <div class="metric"><div class="value">{{ r.old_version }} &rarr; {{ r.new_version }}</div><div class="label">Version change</div></div>
+          <div class="metric"><div class="value">{{ r.branch_name or "—" }}</div><div class="label">Branch</div></div>
+          <div class="metric"><div class="value"><code>{{ r.tracking_id[:8] }}&hellip;</code></div><div class="label">Tracking ID</div></div>
+          {% if r.time_to_resolution_seconds is not none %}
+          <div class="metric"><div class="value">{{ (r.time_to_resolution_seconds / 60) | round(1) }} min</div><div class="label">Time to outcome</div></div>
+          {% endif %}
+          {% if r.total_tokens %}
+          <div class="metric"><div class="value">{{ "{:,}".format(r.total_tokens) }}</div><div class="label">Tokens ({{ r.prompt_tokens }}p / {{ r.completion_tokens }}c)</div></div>
+          {% endif %}
+        </div>
+        {% if r.parent_tracking_id %}<p><small>Parent attempt: <code>{{ r.parent_tracking_id[:8] }}&hellip;</code></small></p>{% endif %}
+        {% if r.failure_log_excerpt %}
+          <p><strong>CI failure excerpt passed to retry prompt:</strong></p>
+          <pre>{{ r.failure_log_excerpt[:2000] }}</pre>
+        {% endif %}
+      </details>
+    {% endfor %}
+  {% endif %}
+</div>

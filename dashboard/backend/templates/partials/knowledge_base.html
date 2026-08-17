@@ -1,0 +1,57 @@
+<div id="kb-root" hx-get="/partials/kb?source={{ selected_source | urlencode }}" hx-trigger="every 60s" hx-target="this" hx-swap="outerHTML">
+  <h2>Knowledge Base</h2>
+
+  {% if not has_entries %}
+    <p>No KB entries yet. Tier 2 playbook entries load from <code>playbooks/*.yaml</code> at fixer startup;
+       Knowledge Agent entries are added during each fresh scan; Tier 1 learned entries are added by the
+       Watcher after a PR passes CI.</p>
+  {% else %}
+    <div class="metric-row">
+      <div class="metric"><div class="value">{{ source_counts.get("tier1_learned", 0) }}</div><div class="label">Tier 1 (learned)</div></div>
+      <div class="metric"><div class="value">{{ source_counts.get("tier2_playbook", 0) }}</div><div class="label">Tier 2 (playbooks)</div></div>
+      <div class="metric"><div class="value">{{ source_counts.get("knowledge_agent", 0) }}</div><div class="label">Knowledge Agent</div></div>
+    </div>
+
+    <select hx-get="/partials/kb" hx-trigger="change" hx-target="#kb-root" hx-swap="outerHTML" name="source">
+      <option value="">Source: (all)</option>
+      {% for s in sources %}<option value="{{ s }}" {% if s == selected_source %}selected{% endif %}>{{ s }}</option>{% endfor %}
+    </select>
+
+    {% for e in entries %}
+      <details>
+        <summary>
+          {{ e.source }} &nbsp;|&nbsp; {{ e.component_name }} &nbsp;|&nbsp;
+          {{ e.from_version or ("major " ~ e.from_major) }} &rarr; {{ e.to_version or ("major " ~ e.to_major) }}
+          &nbsp;|&nbsp; {{ e.confidence }}
+        </summary>
+        <p><small>Entry ID: <code>{{ e.entry_id[:8] }}&hellip;</code></small></p>
+
+        {% if e.breaking_changes %}
+          <p><strong>Breaking changes:</strong></p>
+          <ul>{% for bc in e.breaking_changes %}<li>{{ bc }}</li>{% endfor %}</ul>
+        {% endif %}
+
+        {% if e.migration_steps %}
+          <p><strong>Migration steps:</strong></p>
+          <ol>{% for step in e.migration_steps %}<li>{{ step }}</li>{% endfor %}</ol>
+        {% endif %}
+
+        {% if e.patterns %}
+          <p><strong>Find&rarr;replace patterns ({{ e.patterns | length }}):</strong></p>
+          {% for p in e.patterns %}
+            <div class="pattern">
+              <code>{{ p.get("find", "") }}</code>
+              <code>{{ p.get("replace", "") }}</code>
+            </div>
+            {% if p.get("description") %}<p><small>{{ p.description }}</small></p>{% endif %}
+          {% endfor %}
+        {% endif %}
+
+        {% if e.api_removals %}
+          <p><strong>Removed APIs:</strong></p>
+          <pre>{{ e.api_removals | join("\n") }}</pre>
+        {% endif %}
+      </details>
+    {% endfor %}
+  {% endif %}
+</div>

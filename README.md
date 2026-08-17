@@ -24,10 +24,10 @@ Full end-to-end walkthrough — from triggering a scan on the target repo to rem
 [1 Start agents] → [2 Trigger scan] → [3 Auto-fetch] → [4 KB hydrate + classify] → [5 Fixer (Gemini)] → [6 CI runs] → [7 Watcher + retry] → [CI_PASSED]
   docker compose     GitHub Actions      ScanPoller       Knowledge Agent               fixer-server       GH Actions     watcher daemon          ↓
   up -d              (manual dispatch)   (60s poll)       + Classifier                  (B2/B3 only)                                          [Dashboard]
-                                                          B1/B4 → GitHub Issues                                                          streamlit run …
+                                                          B1/B4 → GitHub Issues                                                     http://localhost:8501
 ```
 
-Both `fixer-server` and `watcher` run as long-lived services. You only need to trigger the GitHub Action — the agents do everything else. The Streamlit dashboard gives you live visibility into every step.
+`fixer-server`, `watcher`, and `dashboard` all run as long-lived services started by `docker compose up -d`. You only need to trigger the GitHub Action — the agents do everything else. The dashboard (server-rendered FastAPI + HTMX, containerized alongside the agents) gives you live visibility into every step.
 
 ---
 
@@ -64,10 +64,7 @@ Edit `config/.env` — the required values:
 Place your GCP Service Account JSON at `config/my-google-service-account.json`. `docker-compose.yml` mounts it into every container at `/gcp/adc.json`. The SA account needs the `roles/aiplatform.user` role on the GCP project.
 
 ```bash
-# Install dashboard dependencies (host-side, one-time)
-pip install streamlit pandas
-
-# Build all images
+# Build all images (fixer-server, watcher, dashboard)
 docker compose build
 ```
 
@@ -182,11 +179,9 @@ For each open `fix/` PR:
 
 ### Phase 3 — Observe with the dashboard
 
-```bash
-streamlit run streamlit_dashboard.py
-```
+The dashboard is its own container (`dashboard/`, server-rendered Jinja2 + HTMX pages served by FastAPI -- no JS build step) and starts automatically with `docker compose up -d` alongside `fixer-server` and `watcher` — no separate host-side install step.
 
-Open [http://localhost:8501](http://localhost:8501). Run this in a separate terminal alongside the agents — it reads `./data/tracking.json` directly from the bind mount and auto-refreshes every 30 seconds. No Docker required.
+Open [http://localhost:8501](http://localhost:8501). It reads `./data/tracking.json` and `./data/kb.json` from the same bind mount the fixer-server and watcher write to (read-only), and polls its own backend every 30 seconds.
 
 **Sidebar** shows live agent health:
 - **Fixer-server** — time since the last ScanPoller checkpoint write (goes yellow if the server is idle or unreachable)
@@ -252,7 +247,7 @@ Set `MAX_RETRY_ATTEMPTS=1` in `config/.env` to reach `FAILED_MAX_RETRIES` quickl
 
 | Scenario | How to trigger | What to observe |
 |---|---|---|
-| **Happy path** | `docker compose up -d`; `streamlit run streamlit_dashboard.py`; trigger scan | `fix/` PRs opened automatically; dashboard shows records progressing to `CI_PASSED` |
+| **Happy path** | `docker compose up -d`; trigger scan | `fix/` PRs opened automatically; dashboard at `:8501` shows records progressing to `CI_PASSED` |
 | **Informed retry** | Force CI failure via Enforcer rule | `RETRY_REQUESTED` record has `failure_log_excerpt`; fixer-server pushes a corrective commit |
 | **Retry exhaustion** | `MAX_RETRY_ATTEMPTS=1`; force CI failure | Record reaches `FAILED_MAX_RETRIES` after one retry; PR gets escalation comment |
 | **New CVE mid-run** | Add a new vulnerable dep; trigger scan again | ScanPoller detects the new completed run; only the new finding gets a fresh PR |
