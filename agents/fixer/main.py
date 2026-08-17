@@ -23,6 +23,9 @@ from scan_poller import ScanPoller
 from repo_ops import RepoOps
 from code_fixer import CodeFixer, InvalidRetryError
 from pr_client import PRClient
+from engines.base import EngineExecutionError
+from ecosystems.factory import get_ecosystem
+from ecosystems.base import EcosystemError
 
 from common.tracking_store import (
     make_tracking_store,
@@ -185,6 +188,48 @@ def _do_fresh_scan():
     pr_client   = PRClient(repo_full_name=github_repo, github_pat=github_pat)
     base_branch = Github(github_pat).get_repo(github_repo).default_branch
 
+    # Cloned before classification (not after, as in the original ordering) --
+    # locality resolution needs a real checkout to run `mvn dependency:tree`
+    # against before we can classify direct vs. transitive findings.
+    source_repo = RepoOps()
+    source_path = source_repo.clone(github_repo_url, github_pat)
+    logger.info(
+        "Source clone ready at %s — up to %d parallel fixes will copy from here.",
+        source_path, MAX_PARALLEL_FIXES,
+    )
+
+    # ── Locality resolution (direct vs. transitive) ───────────────────────────
+    # Ecosystem-pluggable (see ecosystems/) -- Maven-only, single-module POC
+    # scope today. A finding whose locality can't be determined defaults to
+    # is_transitive=False, i.e. falls back to today's pre-existing behavior
+    # (attempt a direct manifest bump) rather than blocking the whole batch
+    # on one lookup failure.
+    ecosystem = get_ecosystem(source_path)
+    for finding in findings:
+        try:
+            locality = ecosystem.resolve_locality(source_path, finding.component_name)
+        except EcosystemError as exc:
+            logger.warning(
+                "Locality resolution failed for %s: %s -- treating as direct.",
+                finding.component_name, exc,
+            )
+            continue
+        if not locality.found:
+            logger.warning(
+                "%s not found in the dependency tree (stale scan report or "
+                "version mismatch?) -- treating as direct.", finding.component_name,
+            )
+            continue
+        finding.is_transitive = locality.is_transitive
+        finding.introduced_by = locality.introduced_by
+        finding.transitive_depth = locality.depth
+        if locality.is_transitive:
+            logger.info(
+                "%s is transitive (depth=%d, introduced by %s).",
+                finding.component_name, locality.depth, locality.introduced_by,
+            )
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Phase 2: KB hydration + classification ────────────────────────────────
     kb_store = make_knowledge_store()
 
@@ -214,13 +259,6 @@ def _do_fresh_scan():
                 kb_entry=result.kb_entry,
             )
     # ─────────────────────────────────────────────────────────────────────────
-
-    source_repo = RepoOps()
-    source_path = source_repo.clone(github_repo_url, github_pat)
-    logger.info(
-        "Source clone ready at %s — up to %d parallel fixes will copy from here.",
-        source_path, MAX_PARALLEL_FIXES,
-    )
 
     tasks = []
     for finding in findings:
@@ -258,21 +296,33 @@ def _do_fresh_scan():
 
             fixer = CodeFixer(repo_path=repo._local_path)
             try:
-                summary = fixer.run_fresh_fix(
-                    component_name=finding.component_name,
-                    current_version=finding.current_version,
-                    target_version=finding.recommended_version,
-                    tracking_id=record.tracking_id,
-                    tracking_store=tracking_store,
-                    cve_ids=finding.cve_ids,
-                    kb_entry=kb_entry,
-                )
+                if finding.is_transitive:
+                    summary = fixer.run_transitive_fix(
+                        component_name=finding.component_name,
+                        current_version=finding.current_version,
+                        target_version=finding.recommended_version,
+                        introduced_by=finding.introduced_by,
+                        tracking_id=record.tracking_id,
+                        tracking_store=tracking_store,
+                        cve_ids=finding.cve_ids,
+                    )
+                else:
+                    summary = fixer.run_fresh_fix(
+                        component_name=finding.component_name,
+                        current_version=finding.current_version,
+                        target_version=finding.recommended_version,
+                        tracking_id=record.tracking_id,
+                        tracking_store=tracking_store,
+                        cve_ids=finding.cve_ids,
+                        kb_entry=kb_entry,
+                    )
             except Exception as exc:
                 logger.error("Fix failed for %s: %s", finding.component_name, exc)
                 return None
 
+            fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"
             commit_msg = (
-                f"fix: upgrade {finding.component_name} to {finding.recommended_version}"
+                f"fix: upgrade {finding.component_name} to {finding.recommended_version} ({fix_kind})"
                 + (f" ({', '.join(finding.cve_ids)})" if finding.cve_ids else "")
             )
             repo.commit_changes(commit_msg)
@@ -348,6 +398,37 @@ def _run_retry(tracking_id: str):
             )
         except InvalidRetryError as exc:
             logger.error("Retry validation failed: %s", exc)
+            sys.exit(1)
+        except EngineExecutionError as exc:
+            # The FixEngine itself failed to run (CLI crash/timeout/missing
+            # binary) -- it never produced a fix to evaluate, so this is not
+            # the same as a fix attempt that ran and turned out wrong. Don't
+            # let the record silently rot in RETRY_REQUESTED forever: mark it
+            # ENGINE_ERROR (excluded from count_attempts_for_pr, so it won't
+            # consume retry budget) and escalate to a human via the PR
+            # instead of leaving the Watcher polling a branch nothing was
+            # ever pushed to.
+            logger.error("Fixer engine failed to run for retry %s: %s", tracking_id[:8], exc)
+            record.status = TrackingStatus.ENGINE_ERROR.value
+            tracking_store.update(record)
+            pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+            try:
+                pr_client.add_comment(
+                    record.pr_number,
+                    "## OSS Remediation Agent — Engine Failure\n\n"
+                    f"Fix attempt {record.attempt_number} could not run "
+                    "(the tooling that generates fixes failed, not the fix itself -- "
+                    "e.g. a crash, timeout, or missing dependency). This attempt did "
+                    "not consume a retry, but automatic retries are paused pending "
+                    f"investigation.\n\n**Error:**\n```\n{str(exc)[:1500]}\n```\n\n"
+                    "Please investigate the Fixer's engine configuration before "
+                    "re-triggering a fix for this PR.",
+                )
+            except Exception as comment_exc:
+                logger.error(
+                    "Could not post engine-failure comment on PR #%s: %s",
+                    record.pr_number, comment_exc,
+                )
             sys.exit(1)
 
         commit_msg = (

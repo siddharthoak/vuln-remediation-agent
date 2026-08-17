@@ -44,6 +44,7 @@ _TERMINAL_STATUSES = {
     TrackingStatus.CI_PASSED.value,
     TrackingStatus.FAILED_MAX_RETRIES.value,
     TrackingStatus.ESCALATED.value,
+    TrackingStatus.ENGINE_ERROR.value,
 }
 
 

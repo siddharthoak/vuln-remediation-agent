@@ -53,6 +53,7 @@ class RetryGate:
         terminal_statuses = {
             TrackingStatus.FAILED_MAX_RETRIES.value,
             TrackingStatus.ESCALATED.value,
+            TrackingStatus.ENGINE_ERROR.value,
         }
         if current_tracking_record.status in terminal_statuses:
             logger.error(

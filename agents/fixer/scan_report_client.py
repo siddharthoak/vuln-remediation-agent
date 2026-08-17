@@ -32,6 +32,13 @@ class VulnerabilityFinding:
     severity: str               # critical | high | medium | low
     cve_ids: list = field(default_factory=list)
 
+    # Populated by dependency_tree.resolve_locality() in main.py before
+    # classification, not by any scanner -- scanners report against the
+    # resolved graph and don't distinguish direct from transitive.
+    is_transitive: bool = False
+    introduced_by: Optional[str] = None      # "groupId:artifactId" of the direct-dep ancestor
+    transitive_depth: Optional[int] = None   # 1 = direct, 2+ = transitive (see dependency_tree.py)
+
 
 class ScanReportClient:
     """

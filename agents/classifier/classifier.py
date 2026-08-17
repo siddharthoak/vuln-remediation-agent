@@ -87,6 +87,34 @@ class Classifier:
                 ),
             )
 
+        # ── Bucket 4: transitive dependency, risky chain ──────────────────────
+        # A transitive fix means forcing Maven's version mediation via a
+        # dependencyManagement override -- higher blast radius than a direct
+        # bump since it can silently affect unrelated code paths that use the
+        # same transitive artifact. Escalate rather than automate when: it's
+        # introduced by a complex framework (same reasoning as the bucket-4
+        # rule above), or the chain is more than one hop deep (depth > 2 --
+        # 1=direct, 2=one-hop transitive, which is the normal automatable case).
+        if finding.is_transitive:
+            introduced_by_stem = _component_stem(finding.introduced_by or "")
+            introduced_by_complex = any(f in introduced_by_stem for f in COMPLEX_FRAMEWORKS)
+            deep_chain = (finding.transitive_depth or 0) > 2
+            if introduced_by_complex or deep_chain:
+                reason = (
+                    f"introduced by complex framework {finding.introduced_by}"
+                    if introduced_by_complex
+                    else f"chain depth {finding.transitive_depth} (>2 hops from a direct dependency)"
+                )
+                return ClassifierResult(
+                    bucket=4,
+                    rationale=(
+                        f"{component} is a transitive dependency (via {finding.introduced_by}) "
+                        f"with a fix version ({old_ver} → {new_ver}) available, but {reason}. "
+                        "An automated dependencyManagement override is too risky here -- "
+                        "manual triage required."
+                    ),
+                )
+
         # ── Bucket 3: major version with KB ──────────────────────────────────
         if is_major and kb_entry is not None:
             breaking = len(kb_entry.breaking_changes)
@@ -104,9 +132,16 @@ class Classifier:
         # ── Bucket 2: patch/minor (or major without complex-framework flag) ───
         upgrade_type = "major" if is_major else ("minor" if _is_minor(old_ver, new_ver) else "patch")
         kb_note = f"KB entry ({kb_entry.source}) available." if kb_entry else "No KB entry."
+        transitive_note = (
+            f" Transitive, via {finding.introduced_by} -- fixed by dependencyManagement "
+            "override, no source changes." if finding.is_transitive else ""
+        )
         return ClassifierResult(
             bucket=2,
-            rationale=f"{upgrade_type.capitalize()}-version upgrade ({old_ver} → {new_ver}). {kb_note}",
+            rationale=(
+                f"{upgrade_type.capitalize()}-version upgrade ({old_ver} → {new_ver}). "
+                f"{kb_note}{transitive_note}"
+            ),
             kb_entry=kb_entry,
         )
 
