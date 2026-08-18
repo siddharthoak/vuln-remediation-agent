@@ -5,36 +5,143 @@
 <title>OSS Remediation Agent — Dashboard</title>
 <script src="/static/htmx.min.js"></script>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; display: flex; min-height: 100vh; }
-  aside { width: 260px; flex: none; padding: 1rem; border-right: 1px solid #8883; }
-  main { flex: 1; padding: 1.5rem; min-width: 0; }
-  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
-  h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; }
-  .card { border: 1px solid #8883; border-radius: 8px; padding: 0.75rem; margin-bottom: 0.75rem; }
-  .ok { color: #16a34a; } .warn { color: #d97706; } .err { color: #dc2626; }
-  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-  th, td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid #8883; white-space: nowrap; }
-  th { position: sticky; top: 0; background: Canvas; }
-  .tabs { display: flex; gap: 0.25rem; margin-bottom: 1rem; border-bottom: 1px solid #8883; }
-  .tabs button { padding: 0.5rem 1rem; border: none; background: none; cursor: pointer; font-size: 0.9rem; border-bottom: 2px solid transparent; }
-  .tabs button.active { border-bottom-color: currentColor; font-weight: 600; }
-  select { padding: 0.3rem; margin-right: 0.5rem; }
-  .metric-row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }
-  .metric { border: 1px solid #8883; border-radius: 8px; padding: 0.75rem 1rem; min-width: 110px; }
-  .metric .value { font-size: 1.4rem; font-weight: 700; }
-  .metric .label { font-size: 0.75rem; opacity: 0.7; }
-  .bar-row { display: flex; align-items: center; gap: 0.5rem; margin: 0.25rem 0; font-size: 0.8rem; }
-  .bar-label { width: 140px; flex: none; text-align: right; opacity: 0.8; }
+  :root {
+    color-scheme: light dark;
+    --accent: #6366f1;
+    --ok: #16a34a; --ok-bg: #16a34a14;
+    --warn: #d97706; --warn-bg: #d9770614;
+    --err: #dc2626; --err-bg: #dc262614;
+    --card-bg: canvas;
+    --stripe-bg: #80808010;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; display: flex; min-height: 100vh; background: #80808008; }
+  aside { width: 260px; flex: none; padding: 1.25rem; border-right: 1px solid #8883; }
+  main { flex: 1; padding: 1.5rem 2rem; min-width: 0; }
+  #tab-content { max-width: 900px; }
+  h1 { font-size: 1.2rem; margin: 0 0 1.25rem; letter-spacing: -0.01em; }
+  h2 { font-size: 0.95rem; margin: 1.75rem 0 0.6rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.65; font-weight: 700; }
+  h2:first-of-type { margin-top: 0.25rem; }
+  .card { border: 1px solid #8883; border-radius: 10px; padding: 0.8rem 0.9rem; margin-bottom: 0.75rem; background: var(--card-bg); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+
+  .tabs { display: flex; gap: 0.25rem; margin-bottom: 1.25rem; border-bottom: 1px solid #8883; }
+  .tabs button { padding: 0.6rem 1.1rem; border: none; background: none; cursor: pointer; font-size: 0.88rem;
+    border-bottom: 2px solid transparent; opacity: 0.6; transition: opacity 0.15s; }
+  .tabs button:hover { opacity: 1; }
+  .tabs button.active { border-bottom-color: var(--accent); color: var(--accent); font-weight: 600; opacity: 1; }
+
+  select { padding: 0.35rem 0.5rem; margin-right: 0.5rem; border-radius: 6px; border: 1px solid #8886; background: var(--card-bg); }
+
+  .metric-row { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  /* max-width applies to every tile, not just the long-text ones below --
+     a long LABEL (e.g. "Classifier bucket, KB: be59702e...") can make a tile
+     look oversized even when its value is short ("Bucket 2"), so both value
+     and label truncate with an ellipsis + tooltip rather than wrapping/
+     growing the tile to fit. */
+  .metric { border: 1px solid #8883; border-radius: 10px; padding: 0.75rem 1rem; min-width: 110px; max-width: 220px; background: #80808006; }
+  .metric .value { font-size: 1.35rem; font-weight: 700; }
+  .metric .label { font-size: 0.72rem; opacity: 0.65; margin-top: 0.1rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Text-content tiles (branch names, CVE ids, component names) don't get
+     the big bold numeric-stat treatment -- at 1.35rem bold, a value like
+     "fix/org-springframework-spring-core-c09e05ff" dwarfs neighboring tiles
+     showing a single number. Smaller monospace-ish size + truncate with a
+     tooltip for the full value instead of growing the tile to fit. */
+  .metric-text { max-width: 220px; }
+  .metric-text .value { font-size: 0.82rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .bar-row { display: flex; align-items: center; gap: 0.6rem; margin: 0.3rem 0; font-size: 0.8rem; }
+  .bar-label { width: 150px; flex: none; text-align: right; opacity: 0.75; }
   .bar-track { flex: 1; background: #8882; border-radius: 4px; height: 14px; overflow: hidden; }
-  .bar-fill { background: #3b82f6; height: 100%; }
-  .bar-value { width: 60px; flex: none; opacity: 0.8; }
-  details { border: 1px solid #8883; border-radius: 8px; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; }
-  summary { cursor: pointer; }
+  .bar-fill { background: var(--accent); height: 100%; border-radius: 4px; }
+  .bar-value { width: 70px; flex: none; opacity: 0.75; font-variant-numeric: tabular-nums; }
+
+  /* Expandable record cards (Run History, Retry Lineage) -- status-colored
+     left accent + alternating background so a long list stays scannable. */
+  .record-list { display: flex; flex-direction: column; gap: 0.6rem; margin-top: 0.75rem; }
+  details { border: 1px solid #8883; border-left: 3px solid #8886; border-radius: 8px; padding: 0.55rem 0.85rem; background: var(--card-bg); }
+  .record-card:nth-child(even) { background: var(--stripe-bg); }
+  details.status-ok { border-left-color: var(--ok); }
+  details.status-warn { border-left-color: var(--warn); }
+  details.status-err { border-left-color: var(--err); }
+  summary { cursor: pointer; list-style: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary:hover { opacity: 0.85; }
+
+  /* One run-group per (repo, scan-trigger minute) -- see _group_by_run in
+     app.py. Visually distinct from the individual record cards nested
+     inside it (no status color, since a group spans multiple statuses). */
+  .run-group { border-left-color: #8886; background: #80808008; padding: 0.6rem 0.85rem; }
+  .run-group-summary { display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap; font-size: 0.85rem; }
+  .run-group-repo { font-weight: 700; }
+  .run-group-label { opacity: 0.7; }
+  .run-group-count { opacity: 0.7; font-size: 0.8rem; }
+  .run-group-tally { margin-left: auto; font-size: 0.78rem; display: flex; gap: 0.6rem; }
+  .run-group-records { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.7rem; }
+  /* Fixed grid columns -- NOT flex -- so a long value in one column (e.g.
+     component name) truncates in place instead of pushing every column
+     after it out of alignment across rows. */
+  .record-card summary {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) 130px minmax(0, 1.9fr) 96px;
+    align-items: center;
+    gap: 0.75rem;
+    font-size: 0.85rem;
+  }
+  .record-card summary > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .record-card summary .col-component { font-weight: 600; }
+  .record-card summary .col-version { opacity: 0.75; font-size: 0.8rem; }
+  .record-card summary .col-status small { opacity: 0.6; font-weight: 400; }
+  .record-card summary .col-pr { text-align: right; overflow: visible; }
+  .link { color: var(--accent); text-decoration: none; }
+  .link:hover { text-decoration: underline; }
+
+  /* Discoverable help affordance -- hover (title attr, multi-line: general
+     bucket definition + this finding's specific classifier rationale) for
+     "why did this land in Bucket N" without cluttering the tile itself. */
+  .help-icon { opacity: 0.55; cursor: help; font-size: 0.85em; }
+  .help-icon:hover { opacity: 1; }
+
+  /* GitHub-style PR-state pill badges -- colored background + white label,
+     matching github.com's own Open/Merged/Closed badges (not a colored
+     dot icon). "None" is deliberately muted/outlined so it doesn't compete
+     visually with the colored states -- it's the absence of one. */
+  .pr-badge {
+    display: inline-flex; align-items: center; white-space: nowrap;
+    padding: 0.2rem 0.65rem; border-radius: 999px;
+    font-size: 0.72rem; font-weight: 600; text-decoration: none;
+  }
+  .pr-badge.open   { background: #1a7f37; color: #fff; }
+  .pr-badge.merged { background: #8250df; color: #fff; }
+  .pr-badge.closed { background: #cf222e; color: #fff; }
+  .pr-badge.unknown { background: #6e7781; color: #fff; }
+  .pr-badge.none { background: transparent; color: inherit; opacity: 0.55; border: 1px dashed #8888; font-weight: 500; }
+  .pr-badge.open:hover, .pr-badge.merged:hover, .pr-badge.closed:hover, .pr-badge.unknown:hover { filter: brightness(1.1); }
+  details[open] { border-left-width: 4px; }
+  details > *:not(summary) { margin-top: 0.6rem; }
+
   code, pre { background: #8881; border-radius: 4px; padding: 0.1rem 0.3rem; }
   pre { padding: 0.5rem; overflow-x: auto; white-space: pre-wrap; }
   .pattern { display: flex; gap: 0.5rem; }
   .pattern code { flex: 1; }
+
+  /* Knowledge Base table -- fixed column widths (table-layout: fixed, not
+     content-driven) so a long component name or version string can't push
+     other columns out of alignment, same reasoning as the record-card grid. */
+  .kb-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 0.85rem; margin-top: 0.75rem; }
+  .kb-table col.col-source     { width: 130px; }
+  .kb-table col.col-component  { width: 26%; }
+  .kb-table col.col-version    { width: 190px; }
+  .kb-table col.col-confidence { width: 100px; }
+  .kb-table col.col-details    { width: auto; }
+  .kb-table th, .kb-table td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid #8883; vertical-align: top; }
+  .kb-table th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; opacity: 0.65; font-weight: 700; }
+  .kb-table tbody tr:nth-child(even) { background: var(--stripe-bg); }
+  .kb-table td.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .kb-table .muted { opacity: 0.4; }
+  .kb-table details { border: none; padding: 0; margin: 0; }
+  .kb-table details summary { color: var(--accent); font-size: 0.8rem; }
+  .kb-table details[open] { padding: 0.5rem 0; }
 </style>
 </head>
 <body>

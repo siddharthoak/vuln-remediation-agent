@@ -16,8 +16,11 @@ swaps that element out for a different tab (no JS needed to pause it).
 """
 
 import json
+import logging
 import os
 import sys
+import time
+import urllib.request
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +33,8 @@ from fastapi.templating import Jinja2Templates
 
 from common.tracking_store import make_tracking_store, TrackingStatus  # noqa: E402
 from common.knowledge_store import make_knowledge_store  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="OSS Remediation Agent Dashboard")
 
@@ -60,11 +65,152 @@ STATUS_ICONS = {
     TrackingStatus.PR_OPENED.value:          "\U0001F7E4",
 }
 
+# Plain-language explanation of each status -- the raw enum name alone
+# (e.g. "CREATED") isn't self-explanatory to anyone who hasn't read
+# tracking_store.py's state machine.
+#
+# This describes what the FIXER PIPELINE believes happened -- distinct from
+# the PR-state badge (open/closed/merged), which is what's actually true on
+# GitHub right now. They usually agree, but not always: a human can close a
+# PR manually and nothing tells the pipeline that happened, so "status" can
+# go stale relative to the real PR state. See _records_as_dicts' staleness
+# check below, which flags exactly that case instead of hiding it.
+STATUS_DESCRIPTIONS = {
+    TrackingStatus.CREATED.value:            "pipeline: finding detected, fix not started yet",
+    TrackingStatus.PR_OPENED.value:           "pipeline: fix applied, PR opened",
+    TrackingStatus.CI_PENDING.value:          "pipeline: PR open, waiting on CI",
+    TrackingStatus.CI_PASSED.value:           "pipeline: fix verified, CI passed",
+    TrackingStatus.CI_FAILED.value:           "pipeline: CI failed on this attempt",
+    TrackingStatus.RETRY_REQUESTED.value:     "pipeline: Watcher requested a corrective retry",
+    TrackingStatus.FAILED_MAX_RETRIES.value:  "pipeline: retry budget exhausted -- needs human review",
+    TrackingStatus.ESCALATED.value:           "pipeline: escalated to human (invocation or retry-limit issue)",
+    TrackingStatus.ENGINE_ERROR.value:        "pipeline: fix engine failed to run (infra issue, not a bad fix) -- needs human review",
+}
+
+# If the pipeline still thinks a PR is active but GitHub says otherwise,
+# that's a real, useful mismatch to surface -- not something to hide by
+# treating the status column as redundant with the PR badge.
+_ACTIVE_PR_STATUSES = {TrackingStatus.PR_OPENED.value, TrackingStatus.CI_PENDING.value}
+
+# General bucket-taxonomy definitions, matching agents/classifier/classifier.py's
+# own docstring. A TrackingRecord only ever exists for bucket 2 or 3 -- bucket
+# 1/4 findings get a GitHub triage issue instead and never reach the fixer, so
+# 1/4 are still explained here for completeness (in case someone asks "why
+# isn't X in the list at all") but never actually appear on a record.
+BUCKET_DEFINITIONS = {
+    1: "No fix path -- scanner reported no safe version. A GitHub Issue is opened for manual triage; the fixer never runs on this finding.",
+    2: "Patch/minor upgrade, or a major upgrade that isn't a complex framework. Automated fix runs directly.",
+    3: "Major-version upgrade with a Knowledge Base entry available (breaking changes / migration steps / find-replace patterns). Automated fix runs with that KB context injected into the prompt.",
+    4: "Either a major upgrade to a complex framework (Spring, Hibernate, Struts, ...) with no KB entry, or a transitive-dependency fix judged too risky to automate (introduced by a complex framework, or more than 2 hops deep). A GitHub Issue is opened for human triage instead.",
+}
+
+# How much to trust a KB entry's breaking-changes/migration-steps/patterns
+# before injecting them into a fix prompt -- determined differently per
+# source (see agents/common/knowledge_store.py, agents/knowledge/main.py's
+# EXTRACTION_PROMPT, agents/watcher/pattern_learner.py):
+KB_CONFIDENCE_HELP = (
+    "How much to trust this entry's breaking-changes/migration-steps/patterns "
+    "before the fixer uses them as context for a fix:\n\n"
+    "tier1_learned -- always High: learned only after a real fix's PR actually "
+    "passed CI, so it's empirically proven, not inferred.\n\n"
+    "tier2_playbook -- always High: hand-curated by a human when the playbook "
+    "was written.\n\n"
+    "knowledge_agent -- genuinely variable: the LLM self-rates per its own "
+    "extraction prompt -- High if the release notes it read were authoritative, "
+    "Medium if inferred, Low if speculative."
+)
+
+# Used by the Metrics tab's "Escalated" business-metric count -- terminal,
+# needs-a-human states only. Kept separate from _ERR_DISPLAY_STATUSES below:
+# CI_FAILED is a normal transient failure (a retry is expected next), not an
+# escalation, even though it should still render with an "err" red accent.
 _ESCALATED_STATUSES = {
     TrackingStatus.FAILED_MAX_RETRIES.value,
     TrackingStatus.ESCALATED.value,
     TrackingStatus.ENGINE_ERROR.value,
 }
+
+# ok/warn/err drives the card accent color in the templates -- a purely
+# visual grouping, not a business metric.
+_OK_STATUSES = {TrackingStatus.CI_PASSED.value}
+_ERR_DISPLAY_STATUSES = _ESCALATED_STATUSES | {TrackingStatus.CI_FAILED.value}
+
+
+def _status_class(status: str) -> str:
+    if status in _OK_STATUSES:
+        return "ok"
+    if status in _ERR_DISPLAY_STATUSES:
+        return "err"
+    return "warn"
+
+
+# ── Live PR-state lookup (open/closed/merged) ──────────────────────────────
+# GitHub-style pill badges (colored background, label) -- matches github.com's
+# own PR-list badge styling (green Open / purple Merged / red Closed), not a
+# generic colored-dot icon.
+_PR_STATE_BADGES = {
+    "open":   {"label": "Open",   "css": "open"},
+    "merged": {"label": "Merged", "css": "merged"},
+    "closed": {"label": "Closed", "css": "closed"},
+}
+_PR_STATE_CACHE: dict = {}   # repo -> (fetched_at, {pr_number: {"state", "icon", "url"}})
+_PR_STATE_CACHE_TTL = 90     # seconds
+
+
+def _fetch_pr_states(repo: str) -> dict:
+    """One batched `GET /repos/{repo}/pulls?state=all` call -- not one call
+    per PR -- so this stays well within GitHub's rate limits even at
+    dashboard-poll frequency (every 30s). Cached per-repo for
+    _PR_STATE_CACHE_TTL seconds. Uses GITHUB_PAT if set (higher rate limit,
+    5000/hr vs 60/hr), otherwise unauthenticated -- works fine for a public
+    repo. Fails soft: any error (network, rate limit, bad/expired token)
+    falls back to a stale cache entry if one exists, or {} otherwise, so a
+    broken token degrades to "no PR-state icons," not a broken dashboard.
+    """
+    now = time.time()
+    cached = _PR_STATE_CACHE.get(repo)
+    if cached and (now - cached[0]) < _PR_STATE_CACHE_TTL:
+        return cached[1]
+
+    url = f"https://api.github.com/repos/{repo}/pulls?state=all&per_page=100"
+    pat = os.environ.get("GITHUB_PAT")
+
+    prs = None
+    if pat:
+        try:
+            req = urllib.request.Request(
+                url, headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {pat}"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                prs = json.loads(resp.read())
+        except Exception as exc:
+            # A bad/expired token shouldn't take down a feature that can
+            # work unauthenticated for a public repo -- fall through and
+            # retry without auth instead of giving up immediately.
+            logger.warning("Authenticated PR-state fetch failed for %s (%s) -- retrying unauthenticated.", repo, exc)
+
+    if prs is None:
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                prs = json.loads(resp.read())
+        except Exception as exc:
+            logger.warning("Could not fetch PR states for %s: %s", repo, exc)
+            return cached[1] if cached else {}
+
+    states = {}
+    for pr in prs:
+        state = "merged" if pr.get("merged_at") else pr.get("state", "")
+        badge = _PR_STATE_BADGES.get(state, {"label": state.title() or "Unknown", "css": "unknown"})
+        states[pr["number"]] = {
+            "state": state,
+            "badge_label": badge["label"],
+            "badge_css": badge["css"],
+            "url": pr.get("html_url", ""),
+        }
+
+    _PR_STATE_CACHE[repo] = (now, states)
+    return states
 
 
 # ── Data access (same env-var fallback convention as streamlit_dashboard.py) ──
@@ -116,6 +262,7 @@ def _scan_finding_count() -> int:
 def _records_as_dicts() -> list:
     store = _get_tracking_store()
     out = []
+    pr_states_by_repo: dict = {}  # fetched at most once per repo per call
     for r in store.get_all():
         d = asdict(r)
         tu = d.get("token_usage")
@@ -125,6 +272,56 @@ def _records_as_dicts() -> list:
         d["completion_tokens"] = completion_tokens
         d["total_tokens"] = prompt_tokens + completion_tokens
         d["status_icon"] = STATUS_ICONS.get(d["status"], "•")
+        d["status_class"] = _status_class(d["status"])
+
+        d["pr_state"] = None
+        d["pr_badge_label"] = None
+        d["pr_badge_css"] = None
+        if d.get("pr_number") is not None:
+            repo = d["repo"]
+            if repo not in pr_states_by_repo:
+                pr_states_by_repo[repo] = _fetch_pr_states(repo)
+            info = pr_states_by_repo[repo].get(d["pr_number"])
+            if info:
+                d["pr_state"] = info["state"]
+                d["pr_badge_label"] = info["badge_label"]
+                d["pr_badge_css"] = info["badge_css"]
+
+        # The pipeline's own status can go stale relative to the PR's real
+        # GitHub state (e.g. status=PR_OPENED but a human closed the PR
+        # manually) -- surface that mismatch explicitly instead of letting
+        # the status text quietly disagree with the badge next to it.
+        description = STATUS_DESCRIPTIONS.get(d["status"], "")
+        if d["status"] in _ACTIVE_PR_STATUSES and d["pr_state"] == "closed":
+            description += " -- stale: PR was since closed on GitHub"
+        d["status_description"] = description
+
+        # NVD is the standard public reference for a CVE ID -- vulnerability_id
+        # isn't always a CVE though (make_fresh_record falls back to the raw
+        # component name when a finding has no CVE), so only link when it
+        # actually looks like one.
+        vuln_id = d.get("vulnerability_id") or ""
+        d["vulnerability_url"] = (
+            f"https://nvd.nist.gov/vuln/detail/{vuln_id}" if vuln_id.upper().startswith("CVE-") else None
+        )
+
+        # Bucket help: the general taxonomy definition always shows; the
+        # specific per-finding "why this one landed here" only shows for
+        # records created after classifier_rationale started being captured
+        # (older records genuinely never had it computed-and-stored, so
+        # showing a note about that is more honest than fabricating one).
+        if d.get("kb_bucket") is not None:
+            help_text = BUCKET_DEFINITIONS.get(d["kb_bucket"], "")
+            if d.get("classifier_rationale"):
+                help_text += f"\n\nWhy this finding: {d['classifier_rationale']}"
+            else:
+                help_text += "\n\n(No per-finding rationale recorded for this older record.)"
+            if d.get("kb_entry_id"):
+                help_text += f"\n\nKB entry: {d['kb_entry_id']} (see Knowledge Base tab)"
+            d["bucket_help"] = help_text
+        else:
+            d["bucket_help"] = ""
+
         out.append(d)
     return out
 
@@ -187,6 +384,44 @@ def partial_sidebar(request: Request):
     return templates.TemplateResponse(request, "partials/sidebar.html", {"sidebar": _sidebar_status()})
 
 
+def _group_by_run(view: list) -> list:
+    """Groups records by (repo, created_at truncated to the minute).
+
+    TrackingRecord has no explicit run/batch id -- this is a proxy for "came
+    from the same scan trigger". Records from one _do_fresh_scan() call are
+    all created back-to-back in a synchronous loop with no I/O between them
+    (classify -> make_fresh_record per finding), so they share created_at
+    down to the second in practice; truncating to the minute is forgiving of
+    any small variance while still separating genuinely different runs.
+    Keyed by repo too, so two fixers running against two different repos in
+    the same minute produce two groups, not one merged group.
+    """
+    groups: dict = {}
+    order: list = []
+    for r in view:
+        minute = (r.get("created_at") or "")[:16]
+        key = (r.get("repo", ""), minute)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
+    result = []
+    for key in order:
+        recs = groups[key]
+        repo, minute = key
+        result.append({
+            "repo": repo,
+            "run_label": minute.replace("T", " ") if minute else "unknown time",
+            "records": recs,
+            "count": len(recs),
+            "ok_count": sum(1 for r in recs if r["status_class"] == "ok"),
+            "warn_count": sum(1 for r in recs if r["status_class"] == "warn"),
+            "err_count": sum(1 for r in recs if r["status_class"] == "err"),
+        })
+    return result
+
+
 def _run_history_context(records: list, status: str = "", component: str = "", repo: str = "") -> dict:
     statuses = sorted({r["status"] for r in records if r.get("status")})
     components = sorted({r["component_name"] for r in records if r.get("component_name")})
@@ -203,6 +438,7 @@ def _run_history_context(records: list, status: str = "", component: str = "", r
 
     return {
         "view": view,
+        "groups": _group_by_run(view),
         "statuses": statuses,
         "components": components,
         "repos": repos,
@@ -281,6 +517,8 @@ def partial_metrics(request: Request):
     for r in records:
         status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
     status_bars = _bars(sorted(status_counts.items(), key=lambda kv: -kv[1]))
+    for b in status_bars:
+        b["title"] = STATUS_DESCRIPTIONS.get(b["label"], "")
 
     depth_per_pr: dict = {}
     for r in records:
@@ -341,4 +579,5 @@ def partial_kb(request: Request, source: str = ""):
         "source_counts": source_counts,
         "selected_source": source,
         "sources": sorted({e.source for e in entries}),
+        "confidence_help": KB_CONFIDENCE_HELP,
     })

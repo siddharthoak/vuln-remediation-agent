@@ -22,29 +22,77 @@
       </select>
     </form>
 
-    <div style="overflow-x:auto; max-height: 70vh; overflow-y: auto;">
-    <table>
-      <thead><tr>
-        <th>Created</th><th>Component</th><th>Old &rarr; New</th><th>Status</th>
-        <th>Attempt</th><th>PR</th><th>Branch</th><th>Resolution (s)</th><th>Tokens</th><th>Tracking ID</th>
-      </tr></thead>
-      <tbody>
-        {% for r in view %}
-        <tr>
-          <td>{{ r.created_at[:16] if r.created_at else "—" }}</td>
-          <td>{{ r.component_name }}</td>
-          <td>{{ r.old_version }} &rarr; {{ r.new_version }}</td>
-          <td>{{ r.status_icon }} {{ r.status }}</td>
-          <td>{{ r.attempt_number }}</td>
-          <td>{{ r.pr_number if r.pr_number is not none else "—" }}</td>
-          <td>{{ r.branch_name or "—" }}</td>
-          <td>{{ r.time_to_resolution_seconds | round(0) | int if r.time_to_resolution_seconds is not none else "—" }}</td>
-          <td>{{ r.total_tokens }}</td>
-          <td><code>{{ r.tracking_id[:8] }}&hellip;</code></td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="record-list">
+      {% for g in groups %}
+        <details class="run-group" open>
+          <summary class="run-group-summary">
+            <span class="run-group-repo" title="{{ g.repo }}">{{ g.repo }}</span>
+            <span class="run-group-label">Run: {{ g.run_label }}</span>
+            <span class="run-group-count">{{ g.count }} finding(s)</span>
+            <span class="run-group-tally">
+              {% if g.ok_count %}<span class="ok">{{ g.ok_count }} ok</span>{% endif %}
+              {% if g.warn_count %}<span class="warn">{{ g.warn_count }} in progress</span>{% endif %}
+              {% if g.err_count %}<span class="err">{{ g.err_count }} needs attention</span>{% endif %}
+            </span>
+          </summary>
+
+          <div class="run-group-records">
+            {% for r in g.records %}
+              <details class="record-card status-{{ r.status_class }}">
+                <summary>
+                  <span class="col-component" title="{{ r.component_name }}">{{ r.component_name }}</span>
+                  <span class="col-version" title="{{ r.old_version }} → {{ r.new_version }}">{{ r.old_version }} &rarr; {{ r.new_version }}</span>
+                  <span class="col-status" title="{{ r.status }} — {{ r.status_description }}">{{ r.status_icon }} {{ r.status }} <small>&mdash; {{ r.status_description }}</small></span>
+                  <span class="col-pr">
+                    {% if r.pr_number is not none %}
+                      <a class="pr-badge {{ r.pr_badge_css or 'unknown' }}" href="https://github.com/{{ r.repo }}/pull/{{ r.pr_number }}" target="_blank" rel="noopener" onclick="event.stopPropagation()">{{ r.pr_badge_label or "Unknown" }} #{{ r.pr_number }}</a>
+                    {% else %}
+                      <span class="pr-badge none">No PR</span>
+                    {% endif %}
+                  </span>
+                </summary>
+
+                <div class="metric-row">
+                  <div class="metric"><div class="value">{{ r.attempt_number }}</div><div class="label">Attempt</div></div>
+                  <div class="metric metric-text">
+                    <div class="value" title="{{ r.branch_name }}">
+                      {% if r.branch_name %}<a class="link" href="https://github.com/{{ r.repo }}/tree/{{ r.branch_name }}" target="_blank" rel="noopener">{{ r.branch_name }}</a>{% else %}—{% endif %}
+                    </div>
+                    <div class="label">Branch</div>
+                  </div>
+                  <div class="metric metric-text">
+                    <div class="value" title="{{ r.vulnerability_id or '' }}">
+                      {% if r.vulnerability_url %}<a class="link" href="{{ r.vulnerability_url }}" target="_blank" rel="noopener" onclick="event.stopPropagation()">{{ r.vulnerability_id }}</a>{% else %}{{ r.vulnerability_id or "—" }}{% endif %}
+                    </div>
+                    <div class="label">Vulnerability{% if r.vulnerability_url %} (NVD){% endif %}</div>
+                  </div>
+                  {% if r.time_to_resolution_seconds is not none %}
+                  <div class="metric"><div class="value">{{ (r.time_to_resolution_seconds / 60) | round(1) }} min</div><div class="label">Time to outcome</div></div>
+                  {% endif %}
+                  {% if r.total_tokens %}
+                  <div class="metric"><div class="value">{{ "{:,}".format(r.total_tokens) }}</div><div class="label">Tokens ({{ r.prompt_tokens }}p / {{ r.completion_tokens }}c)</div></div>
+                  {% endif %}
+                  {% if r.kb_bucket is not none %}
+                  <div class="metric">
+                    <div class="value">Bucket {{ r.kb_bucket }} <span class="help-icon" title="{{ r.bucket_help }}">&#9432;</span></div>
+                    <div class="label">Classifier bucket{% if r.kb_entry_id %}, KB: {{ r.kb_entry_id[:8] }}&hellip;{% endif %}</div>
+                  </div>
+                  {% endif %}
+                </div>
+
+                <p><small>Tracking ID: <code>{{ r.tracking_id }}</code>
+                  {% if r.parent_tracking_id %} &nbsp;|&nbsp; Parent attempt: <code>{{ r.parent_tracking_id[:8] }}&hellip;</code>{% endif %}
+                  &nbsp;|&nbsp; Last updated: {{ r.updated_at[:16] if r.updated_at else "—" }}</small></p>
+
+                {% if r.failure_log_excerpt %}
+                  <p><strong>CI failure excerpt passed to retry prompt:</strong></p>
+                  <pre>{{ r.failure_log_excerpt[:2000] }}</pre>
+                {% endif %}
+              </details>
+            {% endfor %}
+          </div>
+        </details>
+      {% endfor %}
     </div>
   {% endif %}
 </div>

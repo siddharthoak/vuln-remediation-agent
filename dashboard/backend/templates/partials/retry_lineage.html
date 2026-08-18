@@ -13,17 +13,21 @@
       {% endfor %}
     </select>
 
-    <p><strong>{{ lineage | length }} attempt(s)</strong> for PR #{{ selected_pr }}</p>
+    <p><strong>{{ lineage | length }} attempt(s)</strong> for PR #{{ selected_pr }}
+      {% if lineage %}<a class="pr-badge {{ lineage[0].pr_badge_css or 'unknown' }}" href="https://github.com/{{ lineage[0].repo }}/pull/{{ selected_pr }}" target="_blank" rel="noopener">{{ lineage[0].pr_badge_label or "Unknown" }}</a>{% endif %}
+    </p>
 
     {% for r in lineage %}
-      <details {% if loop.last %}open{% endif %}>
-        <summary>{{ r.status_icon }} Attempt {{ r.attempt_number }} &mdash; {{ r.status }}
+      <details class="record-card status-{{ r.status_class }}" {% if loop.last %}open{% endif %}>
+        <summary>{{ r.status_icon }} Attempt {{ r.attempt_number }} &mdash; {{ r.status }} <small>&mdash; {{ r.status_description }}</small>
           <small>({{ r.created_at[:16] if r.created_at else "—" }})</small></summary>
         <div class="metric-row">
-          <div class="metric"><div class="value">{{ r.component_name }}</div><div class="label">Component</div></div>
-          <div class="metric"><div class="value">{{ r.old_version }} &rarr; {{ r.new_version }}</div><div class="label">Version change</div></div>
-          <div class="metric"><div class="value">{{ r.branch_name or "—" }}</div><div class="label">Branch</div></div>
-          <div class="metric"><div class="value"><code>{{ r.tracking_id[:8] }}&hellip;</code></div><div class="label">Tracking ID</div></div>
+          <div class="metric metric-text"><div class="value" title="{{ r.component_name }}">{{ r.component_name }}</div><div class="label">Component</div></div>
+          <div class="metric metric-text"><div class="value" title="{{ r.old_version }} → {{ r.new_version }}">{{ r.old_version }} &rarr; {{ r.new_version }}</div><div class="label">Version change</div></div>
+          <div class="metric metric-text">
+            <div class="value" title="{{ r.branch_name }}">{% if r.branch_name %}<a class="link" href="https://github.com/{{ r.repo }}/tree/{{ r.branch_name }}" target="_blank" rel="noopener">{{ r.branch_name }}</a>{% else %}—{% endif %}</div>
+            <div class="label">Branch</div>
+          </div>
           {% if r.time_to_resolution_seconds is not none %}
           <div class="metric"><div class="value">{{ (r.time_to_resolution_seconds / 60) | round(1) }} min</div><div class="label">Time to outcome</div></div>
           {% endif %}
@@ -31,7 +35,7 @@
           <div class="metric"><div class="value">{{ "{:,}".format(r.total_tokens) }}</div><div class="label">Tokens ({{ r.prompt_tokens }}p / {{ r.completion_tokens }}c)</div></div>
           {% endif %}
         </div>
-        {% if r.parent_tracking_id %}<p><small>Parent attempt: <code>{{ r.parent_tracking_id[:8] }}&hellip;</code></small></p>{% endif %}
+        <p><small>Tracking ID: <code>{{ r.tracking_id }}</code>{% if r.parent_tracking_id %} &nbsp;|&nbsp; Parent attempt: <code>{{ r.parent_tracking_id[:8] }}&hellip;</code>{% endif %}</small></p>
         {% if r.failure_log_excerpt %}
           <p><strong>CI failure excerpt passed to retry prompt:</strong></p>
           <pre>{{ r.failure_log_excerpt[:2000] }}</pre>

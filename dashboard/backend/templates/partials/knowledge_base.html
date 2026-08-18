@@ -17,41 +17,69 @@
       {% for s in sources %}<option value="{{ s }}" {% if s == selected_source %}selected{% endif %}>{{ s }}</option>{% endfor %}
     </select>
 
-    {% for e in entries %}
-      <details>
-        <summary>
-          {{ e.source }} &nbsp;|&nbsp; {{ e.component_name }} &nbsp;|&nbsp;
-          {{ e.from_version or ("major " ~ e.from_major) }} &rarr; {{ e.to_version or ("major " ~ e.to_major) }}
-          &nbsp;|&nbsp; {{ e.confidence }}
-        </summary>
-        <p><small>Entry ID: <code>{{ e.entry_id[:8] }}&hellip;</code></small></p>
+    <table class="kb-table">
+      <colgroup>
+        <col class="col-source">
+        <col class="col-component">
+        <col class="col-version">
+        <col class="col-confidence">
+        <col class="col-details">
+      </colgroup>
+      <thead>
+        <tr>
+          <th>Source</th>
+          <th>Component</th>
+          <th>Version change</th>
+          <th>Confidence <span class="help-icon" title="{{ confidence_help }}">&#9432;</span></th>
+          <th>Details</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in entries %}
+        <tr>
+          <td>{{ e.source }}</td>
+          <td class="truncate" title="{{ e.component_name }}">{{ e.component_name }}</td>
+          <td class="truncate">{{ e.from_version or ("major " ~ e.from_major) }} &rarr; {{ e.to_version or ("major " ~ e.to_major) }}</td>
+          <td>{{ e.confidence }}</td>
+          <td>
+            {% if e.breaking_changes or e.migration_steps or e.patterns or e.api_removals %}
+              <details>
+                <summary>View details</summary>
+                <p><small>Entry ID: <code>{{ e.entry_id }}</code></small></p>
 
-        {% if e.breaking_changes %}
-          <p><strong>Breaking changes:</strong></p>
-          <ul>{% for bc in e.breaking_changes %}<li>{{ bc }}</li>{% endfor %}</ul>
-        {% endif %}
+                {% if e.breaking_changes %}
+                  <p><strong>Breaking changes:</strong></p>
+                  <ul>{% for bc in e.breaking_changes %}<li>{{ bc }}</li>{% endfor %}</ul>
+                {% endif %}
 
-        {% if e.migration_steps %}
-          <p><strong>Migration steps:</strong></p>
-          <ol>{% for step in e.migration_steps %}<li>{{ step }}</li>{% endfor %}</ol>
-        {% endif %}
+                {% if e.migration_steps %}
+                  <p><strong>Migration steps:</strong></p>
+                  <ol>{% for step in e.migration_steps %}<li>{{ step }}</li>{% endfor %}</ol>
+                {% endif %}
 
-        {% if e.patterns %}
-          <p><strong>Find&rarr;replace patterns ({{ e.patterns | length }}):</strong></p>
-          {% for p in e.patterns %}
-            <div class="pattern">
-              <code>{{ p.get("find", "") }}</code>
-              <code>{{ p.get("replace", "") }}</code>
-            </div>
-            {% if p.get("description") %}<p><small>{{ p.description }}</small></p>{% endif %}
-          {% endfor %}
-        {% endif %}
+                {% if e.patterns %}
+                  <p><strong>Find&rarr;replace patterns ({{ e.patterns | length }}):</strong></p>
+                  {% for p in e.patterns %}
+                    <div class="pattern">
+                      <code>{{ p.get("find", "") }}</code>
+                      <code>{{ p.get("replace", "") }}</code>
+                    </div>
+                    {% if p.get("description") %}<p><small>{{ p.description }}</small></p>{% endif %}
+                  {% endfor %}
+                {% endif %}
 
-        {% if e.api_removals %}
-          <p><strong>Removed APIs:</strong></p>
-          <pre>{{ e.api_removals | join("\n") }}</pre>
-        {% endif %}
-      </details>
-    {% endfor %}
+                {% if e.api_removals %}
+                  <p><strong>Removed APIs:</strong></p>
+                  <pre>{{ e.api_removals | join("\n") }}</pre>
+                {% endif %}
+              </details>
+            {% else %}
+              <span class="muted">&mdash;</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
   {% endif %}
 </div>

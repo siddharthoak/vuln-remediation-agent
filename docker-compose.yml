@@ -68,6 +68,11 @@ services:
     build:
       context: .
       dockerfile: dashboard/Dockerfile
+    # GITHUB_PAT (from config/.env, same as the other services) is optional
+    # here -- only used for higher-rate-limit PR-state lookups (open/closed/
+    # merged icons). Falls back to unauthenticated GitHub API calls if unset
+    # or invalid, which works fine for a public repo at a lower rate limit.
+    env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
       KB_STORE_PATH: /data/kb.json

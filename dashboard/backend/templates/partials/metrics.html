@@ -38,7 +38,7 @@
 
     <h2>Attempt status distribution</h2>
     {% for b in status_bars %}
-      <div class="bar-row">
+      <div class="bar-row" title="{{ b.title }}">
         <div class="bar-label">{{ b.label }}</div>
         <div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%"></div></div>
         <div class="bar-value">{{ b.value }}</div>
