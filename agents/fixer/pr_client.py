@@ -84,6 +84,31 @@ class PRClient:
         logger.info("Created PR #%d: %s", pr.number, pr.html_url)
         return PRResult(pr_number=pr.number, pr_url=pr.html_url, was_existing=False)
 
+    def find_any_pr(self, branch_name: str, base_branch: str) -> Optional[PRResult]:
+        """Return the most recent PR for head=branch_name in ANY state (open,
+        closed, or merged), or None if no PR was ever opened for this branch.
+
+        Read-only -- never creates anything. Used when a branch already
+        exists from a prior run (main.py's _fix_one skip-path): the branch
+        existing means a PR was very likely opened for it before, but that
+        PR may since have been closed manually -- _find_open_pr's
+        state="open" filter would miss it entirely, leaving the new tracking
+        record permanently stuck at CREATED with no PR ever attached even
+        though one genuinely exists. This surfaces it regardless of state so
+        the dashboard can still link to it.
+        """
+        try:
+            pulls = self._repo.get_pulls(
+                state="all",
+                head=f"{self._repo.owner.login}:{branch_name}",
+                base=base_branch,
+            )
+            for pr in pulls:
+                return PRResult(pr_number=pr.number, pr_url=pr.html_url, was_existing=True)
+        except GithubException as exc:
+            logger.warning("Error checking for any PR on branch '%s': %s", branch_name, exc)
+        return None
+
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _find_open_pr(self, branch_name: str, base_branch: str):

@@ -78,6 +78,7 @@ class TrackingRecord:
     # Phase 2 — Classifier output (Optional for backward compat with existing records)
     kb_bucket: Optional[int] = None      # 1=no-fix 2=patch/minor 3=major+KB 4=complex
     kb_entry_id: Optional[str] = None    # KnowledgeEntry.entry_id used for this fix
+    classifier_rationale: Optional[str] = None  # Classifier.classify()'s per-finding "why this bucket" explanation
 
 
 # ── Protocol (UNCHANGED) ──────────────────────────────────────────────────────

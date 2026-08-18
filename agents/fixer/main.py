@@ -277,6 +277,7 @@ def _do_fresh_scan():
         record.branch_name  = branch_name
         record.kb_bucket    = result.bucket
         record.kb_entry_id  = result.kb_entry.entry_id if result.kb_entry else None
+        record.classifier_rationale = result.rationale
         tracking_store.create(record)
         tasks.append((finding, branch_name, record, result.kb_entry))
 
@@ -288,10 +289,28 @@ def _do_fresh_scan():
             repo.clone_local(source_path, github_repo_url, github_pat)
             branch_created = repo.create_branch(branch_name, skip_if_exists=True)
             if not branch_created:
-                logger.info(
-                    "Branch already exists — PR likely open. Skipping %s.",
-                    finding.component_name,
-                )
+                # The branch existing means a PR was very likely opened for
+                # it on some earlier run -- attach it (whatever its current
+                # state) rather than silently abandoning this tracking
+                # record at CREATED forever. find_any_pr checks state="all",
+                # not just "open", so a PR that's since been closed manually
+                # still gets linked -- see PRClient.find_any_pr's docstring.
+                existing_pr = pr_client.find_any_pr(branch_name, base_branch)
+                if existing_pr:
+                    logger.info(
+                        "Branch already exists for %s -- found PR #%d (%s), attaching to tracking record.",
+                        finding.component_name, existing_pr.pr_number, existing_pr.pr_url,
+                    )
+                    current = tracking_store.get(record.tracking_id)
+                    current.pr_number = existing_pr.pr_number
+                    current.status = TrackingStatus.PR_OPENED.value
+                    tracking_store.update(current)
+                else:
+                    logger.warning(
+                        "Branch already exists for %s but no PR found for it in any "
+                        "state -- leaving tracking record as CREATED for manual investigation.",
+                        finding.component_name,
+                    )
                 return None
 
             fixer = CodeFixer(repo_path=repo._local_path)
