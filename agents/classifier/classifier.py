@@ -1,5 +1,5 @@
 """
-Classifier — assigns each VulnerabilityFinding to a processing bucket (1–4).
+Classifier — assigns each VulnerabilityFinding to a processing bucket (1-4).
 
 Pure Python: no LLM calls, no network I/O. Reads only from the KB store.
 
