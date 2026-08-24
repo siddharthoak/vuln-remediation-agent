@@ -218,7 +218,36 @@
   .kb-table .muted { opacity: 0.4; }
   .kb-table details { border: none; padding: 0; margin: 0; }
   .kb-table details summary { color: var(--accent); font-size: 0.8rem; }
-  .kb-table details[open] { padding: 0.5rem 0; }
+  /* The Details column is narrow by design (the fixed-width columns before it
+     take most of the table's 900px budget) -- multi-paragraph breaking-changes/
+     migration-steps content wrapping inside that sliver is unreadable. Instead
+     of growing the column (which would just shrink the others), the expanded
+     panel breaks out as a wide floating overlay anchored to its own cell,
+     rather than being constrained to the column's own width. */
+  .kb-table td:last-child { position: relative; }
+  .kb-table .kb-detail-panel {
+    position: absolute;
+    top: 100%; right: 0;
+    width: min(32rem, 90vw);
+    max-height: 26rem;
+    overflow-y: auto;
+    margin-top: 0.35rem;
+    background: var(--card-bg);
+    border: 1px solid var(--scheme-outline-variant);
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+    z-index: 20;
+    white-space: normal;
+    position: relative; /* positioning context for the close button below */
+  }
+  .kb-detail-close {
+    position: absolute; top: 0.4rem; right: 0.5rem;
+    border: none; background: none; cursor: pointer;
+    font-size: 1.1rem; line-height: 1; opacity: 0.5; padding: 0.2rem;
+    color: var(--scheme-on-background);
+  }
+  .kb-detail-close:hover { opacity: 1; }
 </style>
 </head>
 <body>
@@ -253,5 +282,18 @@
   </div>
 </main>
 
+<script>
+  // Close any open <details> (record cards, KB detail panels) when the user
+  // clicks outside it -- native <details> only toggles on its own <summary>.
+  // Bound once at the document level (not per-element) so it keeps working
+  // after htmx swaps content in/out; a click on anything *inside* the open
+  // element (its own summary, a link, the close button below) doesn't count
+  // as "outside" since Node.contains() covers descendants.
+  document.addEventListener("click", function (e) {
+    document.querySelectorAll("details[open]").forEach(function (d) {
+      if (!d.contains(e.target)) d.removeAttribute("open");
+    });
+  });
+</script>
 </body>
 </html>
