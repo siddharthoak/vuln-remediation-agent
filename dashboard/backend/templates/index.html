@@ -5,33 +5,87 @@
 <title>OSS Remediation Agent — Dashboard</title>
 <script src="/static/htmx.min.js"></script>
 <style>
+  /* ── Neurealm Typography System: Dual-Font Track ─────────────────────────
+     Vendored locally (no CDN dependency) in dashboard/backend/static/fonts/.
+     Both are variable fonts -- one file covers the whole 400-700 weight axis,
+     declared as a range so normal font-weight usage interpolates correctly. */
+  @font-face {
+    font-family: "Exo"; font-style: normal; font-weight: 400 700;
+    src: url("/static/fonts/Exo.woff2") format("woff2");
+    font-display: swap;
+  }
+  @font-face {
+    font-family: "Gabarito"; font-style: normal; font-weight: 400 700;
+    src: url("/static/fonts/Gabarito.woff2") format("woff2");
+    font-display: swap;
+  }
+
   :root {
-    color-scheme: light dark;
-    --accent: #6366f1;
-    --ok: #16a34a; --ok-bg: #16a34a14;
-    --warn: #d97706; --warn-bg: #d9770614;
-    --err: #dc2626; --err-bg: #dc262614;
-    --card-bg: canvas;
-    --stripe-bg: #80808010;
+    /* Neurealm's design system only ships a Light Mode applied-scheme (no
+       dark-mode skill exists yet) -- pinned to light, not following OS
+       preference, since there's no dark scheme to honor faithfully. */
+    color-scheme: light;
+
+    /* ── Neurealm Design System: Light Mode Applied Schemes ── */
+    --scheme-primary: #081160;              --scheme-on-primary: #F1F0FF;
+    --scheme-primary-container: #081160;    --scheme-on-primary-container: #DDE1FF;
+    --scheme-secondary: #4EA0EF;            --scheme-on-secondary: #F1F7FF;
+    --scheme-secondary-container: #D1E9FF;  --scheme-on-secondary-container: #00335F;
+    --scheme-tertiary: #FFFFEF;             --scheme-on-tertiary: #212936;
+    --scheme-error: #EB1414;                --scheme-on-error: #F2E9E9;
+    --scheme-error-container: #931616;      --scheme-on-error-container: #ECCBCB;
+    --scheme-background: #F1F0FF;           --scheme-on-background: #131927;
+    --scheme-surface: #F3F4F6;              --scheme-on-surface: #000000;
+    --scheme-surface-variant: #E5E7EA;      --scheme-on-surface-variant: #212936;
+    --scheme-outline: #4D5461;              --scheme-outline-variant: #6D717F;
+    --scheme-surface-container-lowest: #FFFFFF;
+    --scheme-surface-container: #F3F4F6;
+    --scheme-surface-container-highest: #ECFDFD;
+
+    /* Functional status: text/accent uses primitive steps >700, backgrounds
+       use steps <300 -- core-color-primitives' own WCAG guardrail ("use step
+       indicators below step 300 for backgrounds, above step 700 for type"). */
+    --ok: #208846;      --ok-bg: #E9F1EC;   /* Colors/Success/Green-700 / -100 */
+    --warn: #986610;    --warn-bg: #F2EEDF; /* Colors/Warning-700 / -100 */
+    --err: #931616;     --err-bg: #F2E9E9;  /* Colors/Error-700 / -100 (== Schemes/Error Container / On Error) */
+
+    --accent: var(--scheme-primary);
+    --card-bg: var(--scheme-surface-container-lowest);
+    --stripe-bg: var(--scheme-surface-variant);
+
+    /* Dual-track assignment per the typography skill's own rule: Exo for
+       consumer-facing/dashboard-shell screens, Gabarito for technical side
+       panes, data grids, tabular layouts, and operational metrics lists. */
+    --font-exo: "Exo", -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-gabarito: "Gabarito", -apple-system, "Segoe UI", Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; display: flex; min-height: 100vh; background: #80808008; }
-  aside { width: 260px; flex: none; padding: 1.25rem; border-right: 1px solid #8883; }
+  body { font-family: var(--font-exo); font-weight: 500; margin: 0; display: flex; min-height: 100vh;
+    background: var(--scheme-background); color: var(--scheme-on-background); }
+  aside { width: 260px; flex: none; padding: 1.25rem; border-right: 1px solid var(--scheme-outline-variant); }
   main { flex: 1; padding: 1.5rem 2rem; min-width: 0; }
   #tab-content { max-width: 900px; }
-  h1 { font-size: 1.2rem; margin: 0 0 1.25rem; letter-spacing: -0.01em; }
-  h2 { font-size: 0.95rem; margin: 1.75rem 0 0.6rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.65; font-weight: 700; }
+  /* Title Large (Exo, 24px/36px/700) -- app-shell-level header, not data. */
+  h1 { font-size: 1.5rem; line-height: 2.25rem; font-weight: 700; margin: 0 0 1.25rem; letter-spacing: 0; }
+  /* Label Large (Exo, 14px/20px/600) uppercased -- section/category labels. */
+  h2 { font-size: 0.875rem; line-height: 1.25rem; margin: 1.75rem 0 0.6rem; text-transform: uppercase;
+    letter-spacing: 0.03em; opacity: 0.7; font-weight: 600; }
   h2:first-of-type { margin-top: 0.25rem; }
-  .card { border: 1px solid #8883; border-radius: 10px; padding: 0.8rem 0.9rem; margin-bottom: 0.75rem; background: var(--card-bg); }
+  .card { border: 1px solid var(--scheme-outline-variant); border-radius: 10px; padding: 0.8rem 0.9rem;
+    margin-bottom: 0.75rem; background: var(--card-bg); }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
 
-  .tabs { display: flex; gap: 0.25rem; margin-bottom: 1.25rem; border-bottom: 1px solid #8883; }
-  .tabs button { padding: 0.6rem 1.1rem; border: none; background: none; cursor: pointer; font-size: 0.88rem;
+  /* Title Medium (Exo, 16px/28px/500) -- "navigation menu selections" is
+     this variant's own documented usage. */
+  .tabs { display: flex; gap: 0.25rem; margin-bottom: 1.25rem; border-bottom: 1px solid var(--scheme-outline-variant); }
+  .tabs button { padding: 0.6rem 1.1rem; border: none; background: none; cursor: pointer;
+    font-family: var(--font-exo); font-size: 1rem; line-height: 1.75rem; font-weight: 500;
     border-bottom: 2px solid transparent; opacity: 0.6; transition: opacity 0.15s; }
   .tabs button:hover { opacity: 1; }
   .tabs button.active { border-bottom-color: var(--accent); color: var(--accent); font-weight: 600; opacity: 1; }
 
-  select { padding: 0.35rem 0.5rem; margin-right: 0.5rem; border-radius: 6px; border: 1px solid #8886; background: var(--card-bg); }
+  select { padding: 0.35rem 0.5rem; margin-right: 0.5rem; border-radius: 6px;
+    border: 1px solid var(--scheme-outline-variant); background: var(--card-bg); font-family: var(--font-gabarito); }
 
   .metric-row { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1rem; }
   /* max-width applies to every tile, not just the long-text ones below --
@@ -39,27 +93,40 @@
      look oversized even when its value is short ("Bucket 2"), so both value
      and label truncate with an ellipsis + tooltip rather than wrapping/
      growing the tile to fit. */
-  .metric { border: 1px solid #8883; border-radius: 10px; padding: 0.75rem 1rem; min-width: 110px; max-width: 220px; background: #80808006; }
-  .metric .value { font-size: 1.35rem; font-weight: 700; }
-  .metric .label { font-size: 0.72rem; opacity: 0.65; margin-top: 0.1rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .metric { border: 1px solid var(--scheme-outline-variant); border-radius: 10px; padding: 0.75rem 1rem;
+    min-width: 110px; max-width: 220px; background: var(--scheme-surface); }
+  /* Title Large (Exo, 24px/700) for the stat itself -- "key performance data
+     point" is this variant's own documented usage -- with line-height tightened
+     from the spec's 36px for a compact tile (a deliberate, scoped exception;
+     the 36px value assumes paragraph-level contexts, not a single-line stat). */
+  .metric .value { font-family: var(--font-exo); font-size: 1.5rem; line-height: 1.2; font-weight: 700; }
+  /* Label Medium (Gabarito, 12px/16px/500, 0.5px tracking) -- "metadata
+     categories" is this variant's own documented usage. */
+  .metric .label { font-family: var(--font-gabarito); font-size: 0.75rem; line-height: 1rem; font-weight: 500;
+    letter-spacing: 0.03125rem; opacity: 0.65; margin-top: 0.1rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Text-content tiles (branch names, CVE ids, component names) don't get
-     the big bold numeric-stat treatment -- at 1.35rem bold, a value like
+     the big bold numeric-stat treatment -- at 24px bold, a value like
      "fix/org-springframework-spring-core-c09e05ff" dwarfs neighboring tiles
-     showing a single number. Smaller monospace-ish size + truncate with a
-     tooltip for the full value instead of growing the tile to fit. */
+     showing a single number. Title Small (Gabarito, 14px/400) instead --
+     "inner component subtitles" -- truncated with a tooltip for the full value. */
   .metric-text { max-width: 220px; }
-  .metric-text .value { font-size: 0.82rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .metric-text .value { font-family: var(--font-gabarito); font-size: 0.875rem; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .bar-row { display: flex; align-items: center; gap: 0.6rem; margin: 0.3rem 0; font-size: 0.8rem; }
+  /* Label Medium (Gabarito) -- chart axis/legend text is this variant's own
+     documented usage. */
+  .bar-row { display: flex; align-items: center; gap: 0.6rem; margin: 0.3rem 0;
+    font-family: var(--font-gabarito); font-size: 0.75rem; }
   .bar-label { width: 150px; flex: none; text-align: right; opacity: 0.75; }
-  .bar-track { flex: 1; background: #8882; border-radius: 4px; height: 14px; overflow: hidden; }
+  .bar-track { flex: 1; background: var(--scheme-surface-variant); border-radius: 4px; height: 14px; overflow: hidden; }
   .bar-fill { background: var(--accent); height: 100%; border-radius: 4px; }
   .bar-value { width: 70px; flex: none; opacity: 0.75; font-variant-numeric: tabular-nums; }
 
   /* Expandable record cards (Run History, Retry Lineage) -- status-colored
      left accent + alternating background so a long list stays scannable. */
   .record-list { display: flex; flex-direction: column; gap: 0.6rem; margin-top: 0.75rem; }
-  details { border: 1px solid #8883; border-left: 3px solid #8886; border-radius: 8px; padding: 0.55rem 0.85rem; background: var(--card-bg); }
+  details { border: 1px solid var(--scheme-outline-variant); border-left: 3px solid var(--scheme-outline-variant);
+    border-radius: 8px; padding: 0.55rem 0.85rem; background: var(--card-bg); }
   .record-card:nth-child(even) { background: var(--stripe-bg); }
   details.status-ok { border-left-color: var(--ok); }
   details.status-warn { border-left-color: var(--warn); }
@@ -71,8 +138,9 @@
   /* One run-group per (repo, scan-trigger minute) -- see _group_by_run in
      app.py. Visually distinct from the individual record cards nested
      inside it (no status color, since a group spans multiple statuses). */
-  .run-group { border-left-color: #8886; background: #80808008; padding: 0.6rem 0.85rem; }
-  .run-group-summary { display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap; font-size: 0.85rem; }
+  .run-group { border-left-color: var(--scheme-outline-variant); background: var(--scheme-surface); padding: 0.6rem 0.85rem; }
+  .run-group-summary { display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap;
+    font-family: var(--font-exo); font-size: 0.85rem; }
   .run-group-repo { font-weight: 700; }
   .run-group-label { opacity: 0.7; }
   .run-group-count { opacity: 0.7; font-size: 0.8rem; }
@@ -80,13 +148,16 @@
   .run-group-records { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.7rem; }
   /* Fixed grid columns -- NOT flex -- so a long value in one column (e.g.
      component name) truncates in place instead of pushing every column
-     after it out of alignment across rows. */
+     after it out of alignment across rows. Gabarito: this row is a data-grid
+     line (component/version/status/PR), the typography skill's own use case
+     for the technical track. */
   .record-card summary {
     display: grid;
     grid-template-columns: minmax(0, 1.4fr) 130px minmax(0, 1.9fr) 96px;
     align-items: center;
     gap: 0.75rem;
-    font-size: 0.85rem;
+    font-family: var(--font-gabarito);
+    font-size: 0.875rem;
   }
   .record-card summary > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .record-card summary .col-component { font-weight: 600; }
@@ -111,31 +182,37 @@
     padding: 0.2rem 0.65rem; border-radius: 999px;
     font-size: 0.72rem; font-weight: 600; text-decoration: none;
   }
+  /* Deliberately NOT remapped to Neurealm scheme colors -- these mimic
+     GitHub's own real Open/Merged/Closed badge colors on purpose, so a PR's
+     state reads instantly to anyone who's used GitHub. */
   .pr-badge.open   { background: #1a7f37; color: #fff; }
   .pr-badge.merged { background: #8250df; color: #fff; }
   .pr-badge.closed { background: #cf222e; color: #fff; }
   .pr-badge.unknown { background: #6e7781; color: #fff; }
-  .pr-badge.none { background: transparent; color: inherit; opacity: 0.55; border: 1px dashed #8888; font-weight: 500; }
+  .pr-badge.none { background: transparent; color: inherit; opacity: 0.55; border: 1px dashed var(--scheme-outline-variant); font-weight: 500; }
   .pr-badge.open:hover, .pr-badge.merged:hover, .pr-badge.closed:hover, .pr-badge.unknown:hover { filter: brightness(1.1); }
   details[open] { border-left-width: 4px; }
   details > *:not(summary) { margin-top: 0.6rem; }
 
-  code, pre { background: #8881; border-radius: 4px; padding: 0.1rem 0.3rem; }
+  code, pre { font-family: var(--font-gabarito); background: var(--scheme-surface-variant); border-radius: 4px; padding: 0.1rem 0.3rem; }
   pre { padding: 0.5rem; overflow-x: auto; white-space: pre-wrap; }
   .pattern { display: flex; gap: 0.5rem; }
   .pattern code { flex: 1; }
 
   /* Knowledge Base table -- fixed column widths (table-layout: fixed, not
      content-driven) so a long component name or version string can't push
-     other columns out of alignment, same reasoning as the record-card grid. */
-  .kb-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 0.85rem; margin-top: 0.75rem; }
+     other columns out of alignment, same reasoning as the record-card grid.
+     Gabarito throughout: this is the canonical "data grid, tabular layout"
+     case the typography skill's dual-track rule calls out by name. */
+  .kb-table { width: 100%; border-collapse: collapse; table-layout: fixed;
+    font-family: var(--font-gabarito); font-size: 0.875rem; margin-top: 0.75rem; }
   .kb-table col.col-source     { width: 130px; }
   .kb-table col.col-component  { width: 26%; }
   .kb-table col.col-version    { width: 190px; }
   .kb-table col.col-confidence { width: 100px; }
   .kb-table col.col-details    { width: auto; }
-  .kb-table th, .kb-table td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid #8883; vertical-align: top; }
-  .kb-table th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; opacity: 0.65; font-weight: 700; }
+  .kb-table th, .kb-table td { text-align: left; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--scheme-outline-variant); vertical-align: top; }
+  .kb-table th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.03125rem; opacity: 0.7; font-weight: 600; }
   .kb-table tbody tr:nth-child(even) { background: var(--stripe-bg); }
   .kb-table td.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .kb-table .muted { opacity: 0.4; }
