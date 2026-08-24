@@ -2,8 +2,11 @@
   <h2>Knowledge Base</h2>
 
   <div class="card">
-    {% with progress = kb_import_progress, just_triggered = False %}
-      {% include "partials/kb_import_progress.html" %}
+    {% with job = kb_import_progress, just_triggered = False, show_bar = True, poll_interval = "1.5s",
+            target_id = "kb-import-progress", trigger_url = "/actions/import-kb", poll_url = "/partials/kb-import-progress",
+            button_label = "Trigger KB Import",
+            button_title = "Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding." %}
+      {% include "partials/job_progress.html" %}
     {% endwith %}
   </div>
 

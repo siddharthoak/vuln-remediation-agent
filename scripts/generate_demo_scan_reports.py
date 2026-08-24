@@ -98,8 +98,12 @@ def build_grype_report() -> dict:
     }
 
 
-def main() -> None:
-    out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("scan-reports")
+def write_demo_reports(out_dir: Path) -> list:
+    """Writes trivy-report.json/grype-report.json into out_dir and returns
+    the list of CVE ids written -- factored out of main() so fixer-server's
+    POST /scan/demo handler can call this directly (no subprocess, no CLI
+    round-trip) instead of only being reachable from the command line.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     trivy_path = out_dir / "trivy-report.json"
@@ -108,8 +112,14 @@ def main() -> None:
     trivy_path.write_text(json.dumps(build_trivy_report(), indent=2), encoding="utf-8")
     grype_path.write_text(json.dumps(build_grype_report(), indent=2), encoding="utf-8")
 
-    print(f"Wrote {trivy_path} and {grype_path}")
-    print(f"{len(DEMO_FINDINGS)} findings: {', '.join(f['cve'] for f in DEMO_FINDINGS)}")
+    return [f["cve"] for f in DEMO_FINDINGS]
+
+
+def main() -> None:
+    out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("scan-reports")
+    cves = write_demo_reports(out_dir)
+    print(f"Wrote {out_dir / 'trivy-report.json'} and {out_dir / 'grype-report.json'}")
+    print(f"{len(cves)} findings: {', '.join(cves)}")
 
 
 if __name__ == "__main__":

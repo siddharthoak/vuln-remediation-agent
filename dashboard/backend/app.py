@@ -51,6 +51,9 @@ SCAN_DIR = Path(os.environ.get("SCAN_REPORT_PATH", "./scan-reports"))
 # KnowledgeAgent hydration -- the dashboard stays credential-free and just
 # proxies the trigger/status calls over the podman-compose network.
 FIXER_SERVER_URL = os.environ.get("FIXER_SERVER_URL", "http://fixer-server:8080")
+# Same credential-free proxy relationship as FIXER_SERVER_URL above, for the
+# Watcher's "check now" trigger.
+WATCHER_URL = os.environ.get("WATCHER_URL", "http://watcher:8090")
 
 REPORT_FILES = {
     "Trivy": SCAN_DIR / "trivy-report.json",
@@ -391,6 +394,12 @@ def _sidebar_status() -> dict:
         "fixer_active": _fixer_active(),
         "scan_finding_count": _scan_finding_count(),
         "tracking_path": str(TRACKING_PATH),
+        # Seeds the Demo Controls card's initial render (page load / the
+        # sidebar's own 30s self-poll) so each button already reflects
+        # whether a job is mid-run, without waiting for its own first poll.
+        "scan_live": _scan_live_status(),
+        "fix": _fix_status(),
+        "watcher_check": _watcher_check_status(),
     }
 
 
@@ -668,17 +677,63 @@ def _bars(items: list) -> list:
     return [{"label": str(label), "value": value, "pct": round(value / max_val * 100, 1)} for label, value in items]
 
 
-def _kb_import_status() -> dict:
-    """Proxies fixer-server's GET /import-kb/status. Fails soft -- an
-    unreachable fixer-server (not started, wrong URL, etc.) renders as a
-    clear "unreachable" state in the UI rather than a broken dashboard page.
-    """
+# ── Generic job-proxy helpers ───────────────────────────────────────────────
+# Every trigger below (KB import, demo/live scan, fixer trigger, watcher
+# check-now) follows the same shape: dashboard has no credentials, it only
+# tells fixer-server/watcher (which already have what they need mounted) to
+# start, then polls a status endpoint. Fails soft everywhere -- an
+# unreachable backend renders as a clear "unreachable" state, not a broken
+# dashboard page.
+
+def _proxy_get(base_url: str, path: str, default: dict, timeout: int = 5) -> dict:
     try:
-        with urllib.request.urlopen(f"{FIXER_SERVER_URL}/import-kb/status", timeout=5) as resp:
+        with urllib.request.urlopen(f"{base_url}{path}", timeout=timeout) as resp:
             return json.loads(resp.read())
     except Exception as exc:
-        logger.warning("Could not reach fixer-server for KB import status: %s", exc)
-        return {"status": "unreachable", "current": 0, "total": 0, "message": str(exc)}
+        logger.warning("Could not reach %s%s: %s", base_url, path, exc)
+        return default
+
+
+def _proxy_post(base_url: str, path: str, default: dict, timeout: int = 5) -> dict:
+    """Like _proxy_get, but POSTs first -- used where the backend returns a
+    JSON body directly from the POST itself (e.g. /scan/demo is synchronous
+    and has no separate status endpoint to poll).
+    """
+    try:
+        req = urllib.request.Request(f"{base_url}{path}", method="POST", data=b"")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        logger.warning("Could not trigger %s%s: %s", base_url, path, exc)
+        return default
+
+
+def _proxy_post_fire_and_forget(base_url: str, path: str, timeout: int = 5) -> None:
+    """Used where the backend's POST returns no body (202, empty) -- the
+    trigger and the status live on separate endpoints (scan/live, fix/trigger,
+    watcher check-now all work this way, mirroring /import-kb).
+    """
+    try:
+        req = urllib.request.Request(f"{base_url}{path}", method="POST", data=b"")
+        urllib.request.urlopen(req, timeout=timeout)
+    except Exception as exc:
+        logger.warning("Could not trigger %s%s: %s", base_url, path, exc)
+
+
+def _kb_import_status() -> dict:
+    return _proxy_get(FIXER_SERVER_URL, "/import-kb/status", {"status": "unreachable", "current": 0, "total": 0, "message": "fixer-server unreachable"})
+
+
+def _scan_live_status() -> dict:
+    return _proxy_get(FIXER_SERVER_URL, "/scan/live/status", {"status": "unreachable", "message": "fixer-server unreachable"})
+
+
+def _fix_status() -> dict:
+    return _proxy_get(FIXER_SERVER_URL, "/fix/status", {"status": "unreachable", "current": 0, "total": 0, "message": "fixer-server unreachable"})
+
+
+def _watcher_check_status() -> dict:
+    return _proxy_get(WATCHER_URL, "/check-now/status", {"status": "unreachable", "message": "watcher unreachable"})
 
 
 @app.post("/actions/import-kb")
@@ -687,24 +742,126 @@ def trigger_kb_import(request: Request):
     touches GCP/GitHub credentials or runs the LLM call; it only tells
     fixer-server (which already has those credentials mounted) to start.
     """
-    try:
-        req = urllib.request.Request(f"{FIXER_SERVER_URL}/import-kb", method="POST", data=b"")
-        urllib.request.urlopen(req, timeout=5)
-    except Exception as exc:
-        logger.warning("Could not trigger KB import on fixer-server: %s", exc)
+    _proxy_post_fire_and_forget(FIXER_SERVER_URL, "/import-kb")
     # just_triggered=True: the background thread on fixer-server may not have
     # flipped status to "running" yet by the time we check -- without this,
     # that race would render the "idle" branch (no polling attached) and the
     # UI would silently never refresh again despite a job actually running.
-    return templates.TemplateResponse(request, "partials/kb_import_progress.html", {
-        "progress": _kb_import_status(),
-        "just_triggered": True,
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _kb_import_status(), "just_triggered": True, "show_bar": True, "poll_interval": "1.5s",
+        "target_id": "kb-import-progress", "trigger_url": "/actions/import-kb", "poll_url": "/partials/kb-import-progress",
+        "button_label": "Trigger KB Import",
+        "button_title": "Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding.",
     })
 
 
 @app.get("/partials/kb-import-progress")
 def kb_import_progress(request: Request):
-    return templates.TemplateResponse(request, "partials/kb_import_progress.html", {"progress": _kb_import_status()})
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _kb_import_status(), "just_triggered": False, "show_bar": True, "poll_interval": "1.5s",
+        "target_id": "kb-import-progress", "trigger_url": "/actions/import-kb", "poll_url": "/partials/kb-import-progress",
+        "button_label": "Trigger KB Import",
+        "button_title": "Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding.",
+    })
+
+
+@app.post("/actions/scan-demo")
+def trigger_scan_demo(request: Request):
+    """Synchronous -- writing two small curated JSON files takes
+    milliseconds, so unlike the other triggers below this doesn't need a
+    background job/poll cycle at all; the result is already known by the
+    time this handler returns.
+    """
+    result = _proxy_post(FIXER_SERVER_URL, "/scan/demo", {"status": "error", "message": "fixer-server unreachable"}, timeout=15)
+    if result.get("status") == "done":
+        cves = result.get("cve_ids", [])
+        job = {"status": "done", "message": f"Loaded {len(cves)} demo finding(s): {', '.join(cves)}"}
+    else:
+        job = {"status": "error", "message": result.get("message", "Unknown error")}
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": job, "just_triggered": False, "show_bar": False,
+        "target_id": "scan-demo-progress", "trigger_url": "/actions/scan-demo", "poll_url": "",
+        "button_label": "Load Demo Scan Reports",
+        "button_title": "Writes a curated demo trivy/grype report set (3 findings spanning buckets 2/3/4) -- no GitHub Actions run, for timing-controlled demos.",
+    })
+
+
+@app.post("/actions/scan-live")
+def trigger_scan_live(request: Request):
+    _proxy_post_fire_and_forget(FIXER_SERVER_URL, "/scan/live")
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _scan_live_status(), "just_triggered": True, "show_bar": False, "poll_interval": "5s",
+        "target_id": "scan-live-progress", "trigger_url": "/actions/scan-live", "poll_url": "/partials/scan-live-progress",
+        "button_label": "Run Live Scan",
+        "button_title": "Dispatches the real security-scan.yml GitHub Actions workflow and waits for it -- can take up to ~20 minutes.",
+    })
+
+
+@app.get("/partials/scan-live-progress")
+def scan_live_progress(request: Request):
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _scan_live_status(), "just_triggered": False, "show_bar": False, "poll_interval": "5s",
+        "target_id": "scan-live-progress", "trigger_url": "/actions/scan-live", "poll_url": "/partials/scan-live-progress",
+        "button_label": "Run Live Scan",
+        "button_title": "Dispatches the real security-scan.yml GitHub Actions workflow and waits for it -- can take up to ~20 minutes.",
+    })
+
+
+@app.post("/actions/trigger-fix")
+def trigger_fix(request: Request):
+    _proxy_post_fire_and_forget(FIXER_SERVER_URL, "/fix/trigger")
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _fix_status(), "just_triggered": True, "show_bar": True, "poll_interval": "2s",
+        "target_id": "fix-progress", "trigger_url": "/actions/trigger-fix", "poll_url": "/partials/fix-progress",
+        "button_label": "Trigger Fixer",
+        "button_title": "Runs the fresh-fix pipeline against whatever's currently in scan-reports/ -- classify, fix, open PRs.",
+    })
+
+
+@app.get("/partials/fix-progress")
+def fix_progress(request: Request):
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _fix_status(), "just_triggered": False, "show_bar": True, "poll_interval": "2s",
+        "target_id": "fix-progress", "trigger_url": "/actions/trigger-fix", "poll_url": "/partials/fix-progress",
+        "button_label": "Trigger Fixer",
+        "button_title": "Runs the fresh-fix pipeline against whatever's currently in scan-reports/ -- classify, fix, open PRs.",
+    })
+
+
+@app.post("/actions/watcher-check")
+def trigger_watcher_check(request: Request):
+    _proxy_post_fire_and_forget(WATCHER_URL, "/check-now")
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _watcher_check_status(), "just_triggered": True, "show_bar": False, "poll_interval": "2s",
+        "target_id": "watcher-check-progress", "trigger_url": "/actions/watcher-check", "poll_url": "/partials/watcher-check-progress",
+        "button_label": "Watcher: Check Now",
+        "button_title": "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer.",
+    })
+
+
+@app.get("/partials/watcher-check-progress")
+def watcher_check_progress(request: Request):
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _watcher_check_status(), "just_triggered": False, "show_bar": False, "poll_interval": "2s",
+        "target_id": "watcher-check-progress", "trigger_url": "/actions/watcher-check", "poll_url": "/partials/watcher-check-progress",
+        "button_label": "Watcher: Check Now",
+        "button_title": "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer.",
+    })
+
+
+@app.get("/partials/findings")
+def partial_findings(request: Request):
+    """Proxies fixer-server's GET /findings -- a read-only preview (scan
+    reports + classifier, no KB hydration, no fix) so bucket-1/4 findings
+    (which never get a TrackingRecord -- see BUCKET_DEFINITIONS) are visible
+    somewhere in the dashboard, not just as a GitHub Issue.
+    """
+    result = _proxy_get(FIXER_SERVER_URL, "/findings", {"findings": [], "error": "fixer-server unreachable"})
+    return templates.TemplateResponse(request, "partials/findings.html", {
+        "findings": result.get("findings", []),
+        "error": result.get("error"),
+        "bucket_definitions": BUCKET_DEFINITIONS,
+    })
 
 
 @app.get("/partials/kb")

@@ -42,6 +42,9 @@ services:
   #   - Polls CI status for each
   #   - On CI pass → marks tracking record resolved
   #   - On CI fail → invokes the fixer-server /retry endpoint
+  # Also runs an HTTP server on :8090 (POST /check-now, GET /check-now/status)
+  # so a cycle can be forced on demand instead of waiting for the timer --
+  # the dashboard's "Watcher: Check Now" button proxies to this.
   watcher:
     build:
       context: .
@@ -53,6 +56,13 @@ services:
       FIXER_RETRY_URL: http://fixer-server:8080/retry
       WATCHER_DAEMON: "1"
       WATCHER_SLEEP_SECONDS: "900"  # 15 minutes
+      WATCHER_PORT: "8090"
+    ports:
+      # Host port 8091 (not 8090) -- 8090 is already taken by an unrelated
+      # project on this machine. Container-internal port stays 8090;
+      # dashboard's WATCHER_URL talks to it over the compose network, which
+      # isn't affected by this host-side remap.
+      - "8091:8090"
     volumes:
       - ./data:/data
     depends_on:
@@ -81,6 +91,7 @@ services:
       KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
       FIXER_SERVER_URL: http://fixer-server:8080
+      WATCHER_URL: http://watcher:8090
     ports:
       - "8501:8000"
     depends_on:

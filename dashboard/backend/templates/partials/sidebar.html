@@ -23,5 +23,45 @@
     {% if sidebar.scan_finding_count %}<small>{{ sidebar.scan_finding_count }} finding(s) in latest scan</small>{% endif %}
   </div>
 
+  <div class="card demo-controls">
+    <strong>Demo Controls</strong>
+
+    <div class="demo-control">
+      {% with job = {"status": "idle", "message": ""}, just_triggered = False, show_bar = False,
+              target_id = "scan-demo-progress", trigger_url = "/actions/scan-demo", poll_url = "",
+              button_label = "Load Demo Scan Reports",
+              button_title = "Writes a curated demo trivy/grype report set (3 findings spanning buckets 2/3/4) -- no GitHub Actions run, for timing-controlled demos." %}
+        {% include "partials/job_progress.html" %}
+      {% endwith %}
+    </div>
+
+    <div class="demo-control">
+      {% with job = sidebar.scan_live, just_triggered = False, show_bar = False, poll_interval = "5s",
+              target_id = "scan-live-progress", trigger_url = "/actions/scan-live", poll_url = "/partials/scan-live-progress",
+              button_label = "Run Live Scan",
+              button_title = "Dispatches the real security-scan.yml GitHub Actions workflow and waits for it -- can take up to ~20 minutes." %}
+        {% include "partials/job_progress.html" %}
+      {% endwith %}
+    </div>
+
+    <div class="demo-control">
+      {% with job = sidebar.fix, just_triggered = False, show_bar = True, poll_interval = "2s",
+              target_id = "fix-progress", trigger_url = "/actions/trigger-fix", poll_url = "/partials/fix-progress",
+              button_label = "Trigger Fixer",
+              button_title = "Runs the fresh-fix pipeline against whatever's currently in scan-reports/ -- classify, fix, open PRs." %}
+        {% include "partials/job_progress.html" %}
+      {% endwith %}
+    </div>
+
+    <div class="demo-control">
+      {% with job = sidebar.watcher_check, just_triggered = False, show_bar = False, poll_interval = "2s",
+              target_id = "watcher-check-progress", trigger_url = "/actions/watcher-check", poll_url = "/partials/watcher-check-progress",
+              button_label = "Watcher: Check Now",
+              button_title = "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer." %}
+        {% include "partials/job_progress.html" %}
+      {% endwith %}
+    </div>
+  </div>
+
   <small>Reading: <code>{{ sidebar.tracking_path }}</code></small>
 </div>
