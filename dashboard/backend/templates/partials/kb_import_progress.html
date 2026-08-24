@@ -1,19 +1,32 @@
-<div id="kb-import-progress">
-  {% if progress.status == "running" or (just_triggered and progress.status == "idle") %}
-    <div hx-get="/partials/kb-import-progress" hx-trigger="every 1.5s" hx-target="#kb-import-progress" hx-swap="outerHTML">
-      <div class="bar-row">
-        <div class="bar-track"><div class="bar-fill" style="width: {{ (progress.current / progress.total * 100) if progress.total else 0 }}%"></div></div>
-        <div class="bar-value">{{ progress.current }}/{{ progress.total }}</div>
+{% set importing = progress.status == "running" or (just_triggered and progress.status == "idle") %}
+<div id="kb-import-progress" class="kb-import-row">
+  <button class="btn btn-primary" hx-post="/actions/import-kb" hx-target="#kb-import-progress" hx-swap="outerHTML"
+          {% if importing %}disabled{% endif %}
+          title="Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding.">
+    {% if importing %}
+      <span class="spinner" aria-hidden="true"></span> Importing&hellip;
+    {% else %}
+      <span class="icon" aria-hidden="true">&#8635;</span> Trigger KB Import
+    {% endif %}
+  </button>
+
+  <div class="kb-import-status">
+    {% if importing %}
+      <div hx-get="/partials/kb-import-progress" hx-trigger="every 1.5s" hx-target="#kb-import-progress" hx-swap="outerHTML">
+        <div class="bar-row">
+          <div class="bar-track"><div class="bar-fill" style="width: {{ (progress.current / progress.total * 100) if progress.total else 0 }}%"></div></div>
+          <div class="bar-value">{{ progress.current }}/{{ progress.total }}</div>
+        </div>
+        <p><small>{{ progress.message or "Starting..." }}</small></p>
       </div>
-      <p><small>{{ progress.message or "Starting..." }}</small></p>
-    </div>
-  {% elif progress.status == "done" %}
-    <p class="ok">&#10003; {{ progress.message }}</p>
-  {% elif progress.status == "error" %}
-    <p class="err">&#10007; KB import failed: {{ progress.message }}</p>
-  {% elif progress.status == "unreachable" %}
-    <p class="err">Could not reach fixer-server ({{ progress.message }}) -- is it running?</p>
-  {% else %}
-    <p><small>Idle.</small></p>
-  {% endif %}
+    {% elif progress.status == "done" %}
+      <p class="ok">&#10003; {{ progress.message }}</p>
+    {% elif progress.status == "error" %}
+      <p class="err">&#10007; KB import failed: {{ progress.message }}</p>
+    {% elif progress.status == "unreachable" %}
+      <p class="err">Could not reach fixer-server ({{ progress.message }}) -- is it running?</p>
+    {% else %}
+      <p><small>Idle.</small></p>
+    {% endif %}
+  </div>
 </div>

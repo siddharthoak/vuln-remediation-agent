@@ -624,4 +624,5 @@ def partial_kb(request: Request, source: str = ""):
         "selected_source": source,
         "sources": sorted({e.source for e in entries}),
         "confidence_help": KB_CONFIDENCE_HELP,
+        "kb_import_progress": _kb_import_status(),
     })

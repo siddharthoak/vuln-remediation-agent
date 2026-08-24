@@ -2,11 +2,9 @@
   <h2>Knowledge Base</h2>
 
   <div class="card">
-    <button hx-post="/actions/import-kb" hx-target="#kb-import-progress" hx-swap="outerHTML"
-            title="Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding.">
-      Trigger KB Import
-    </button>
-    <div id="kb-import-progress"><p><small>Idle.</small></p></div>
+    {% with progress = kb_import_progress, just_triggered = False %}
+      {% include "partials/kb_import_progress.html" %}
+    {% endwith %}
   </div>
 
   {% if not has_entries %}

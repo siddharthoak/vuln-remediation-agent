@@ -75,6 +75,31 @@
     margin-bottom: 0.75rem; background: var(--card-bg); }
   .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
 
+  /* Primary action button (Trigger KB Import, etc.) -- Label Large (Exo,
+     14px/600) is this variant's own documented "button triggers" usage.
+     Primary-900/-800 background steps come straight from the color
+     primitives skill's own scale, not invented values. */
+  .btn { display: inline-flex; align-items: center; gap: 0.45rem; white-space: nowrap;
+    font-family: var(--font-exo); font-size: 0.875rem; font-weight: 600; line-height: 1.25rem;
+    padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid transparent; cursor: pointer;
+    transition: background 0.15s, filter 0.1s, opacity 0.15s; }
+  .btn-primary { background: var(--scheme-primary); color: var(--scheme-on-primary); }
+  .btn-primary:hover:not(:disabled) { background: #202B81; } /* Colors/Primary/Primary-800 */
+  .btn-primary:active:not(:disabled) { filter: brightness(0.88); }
+  .btn:disabled { cursor: not-allowed; opacity: 0.55; }
+  .btn:focus-visible { outline: 2px solid var(--scheme-secondary); outline-offset: 2px; }
+  .btn .icon { font-size: 0.95em; line-height: 1; }
+  .btn .spinner { width: 0.8em; height: 0.8em; border-radius: 50%; flex: none;
+    border: 2px solid rgba(255, 255, 255, 0.35); border-top-color: currentColor;
+    animation: btn-spin 0.7s linear infinite; }
+  @media (prefers-reduced-motion: reduce) { .btn .spinner { animation: none; } }
+  @keyframes btn-spin { to { transform: rotate(360deg); } }
+
+  .kb-import-row { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+  .kb-import-status { flex: 1; min-width: 200px; }
+  .kb-import-status p { margin: 0; }
+  .kb-import-status .bar-row { margin-bottom: 0.3rem; }
+
   /* Title Medium (Exo, 16px/28px/500) -- "navigation menu selections" is
      this variant's own documented usage. */
   .tabs { display: flex; gap: 0.25rem; margin-bottom: 1.25rem; border-bottom: 1px solid var(--scheme-outline-variant); }
