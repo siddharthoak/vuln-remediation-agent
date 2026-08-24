@@ -289,6 +289,7 @@ class CodeFixer:
             target_version=record.new_version,
             cve_ids=[record.vulnerability_id] if record.vulnerability_id else [],
             failure_log_excerpt=record.failure_log_excerpt,
+            is_retry=True,
         )
         record.token_usage = {
             "prompt_tokens": summary.prompt_tokens,
@@ -344,19 +345,24 @@ class CodeFixer:
         cve_ids: list,
         failure_log_excerpt: Optional[str],
         kb_entry=None,
+        is_retry: bool = False,
     ) -> ChangeSummary:
         try:
             self._ecosystem.bump_direct_dependency(
                 self._repo_path, component_name, current_version, target_version
             )
         except PomXMLError:
-            return self._execute_transitive_fix(
-                component_name=component_name,
-                current_version=current_version,
-                target_version=target_version,
-                introduced_by="dependency tree resolution",
-                cve_ids=cve_ids,
-            )
+            if not is_retry:
+                return self._execute_transitive_fix(
+                    component_name=component_name,
+                    current_version=current_version,
+                    target_version=target_version,
+                    introduced_by="dependency tree resolution",
+                    cve_ids=cve_ids,
+                )
+            # A retry runs on a branch where the original manifest change is
+            # already present. Do not mistake the missing old version for a
+            # transitive finding; send the CI failure to the repair engine.
         file_listing = self._build_file_listing()
         prompt = self._build_prompt(
             component_name=component_name,

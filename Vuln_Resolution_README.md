@@ -288,33 +288,20 @@ would already exist.
 
 ---
 
-## 7. How does this handle transitive dependencies? (Known gap — read carefully)
+## 7. How does this handle transitive dependencies?
 
-This is the sharpest edge in the current system, and you should understand it before you
-trust a "why did this fail" report from someone using it.
+The Fixer resolves Maven's dependency tree before classifying findings, so direct and
+transitive dependencies follow separate remediation paths.
 
 **The scanners see the whole resolved dependency graph, including transitive dependencies.**
 Trivy/Grype/OWASP-DC all report on whatever `mvn dependency:tree` would show — a CVE in
 `xstream`, which nobody imported directly but which `some-parent-library` pulls in
 transitively, shows up as a finding exactly like a direct dependency would.
 
-**The Fixer's version-bump logic does not.** `_bump_pom_version()`
-(`agents/fixer/code_fixer.py:349`) walks `.//dependency` elements that are **literally
-written in this repo's `pom.xml`** — it does not resolve the effective POM or walk the
-dependency graph. If `xstream` is never declared directly, the loop in `_bump_pom_version`
-finds nothing matching, `found` stays `False`, and it raises:
-
-```python
-raise PomXMLError(
-    f"Dependency {component_name}@{current_version} not found in pom.xml."
-)
-```
-
-Look at `main.py:270` — that exception is caught in `_fix_one()`'s broad `except Exception`,
-logged, and the finding is **silently dropped** (`return None` — no PR, no triage issue, the
-tracking record just never advances past `CREATED`). That's worth flagging as a follow-up in
-its own right: today a transitive-dependency finding fails *silently* rather than being
-routed to a bucket-1-style triage issue the way an unfixable finding correctly is.
+Direct findings are bumped in their declared dependency entry. One-hop transitive findings
+are pinned through a project-level `<dependencyManagement>` override; deeper or higher-risk
+chains are routed to a triage issue. If resolution or XML processing fails, the finding is
+also surfaced as triage rather than being silently left in `CREATED`.
 
 **How transitive vulnerabilities are actually meant to be fixed in Maven** — pick whichever
 applies:
@@ -329,20 +316,9 @@ applies:
 3. **Exclude + re-add**, for cases where the parent dependency can't be forced cleanly (rare,
    more invasive).
 
-**What to do about it right now:** there's no fix in the codebase for this yet — treat any
-finding whose `component_name` doesn't literally appear as a `<dependency>` in the target
-repo's `pom.xml` as **not currently handled**, and don't be surprised if it silently vanishes
-from tracking rather than erroring loudly. If you pick this up as a task, the shape of a fix
-is roughly:
-- Classifier or Fixer needs a "is this finding a direct or transitive dependency" check
-  (parse `pom.xml` directly-declared artifact IDs, or shell out to
-  `mvn dependency:tree -Dincludes=<groupId>:<artifactId>` to find the parent path).
-- Transitive findings should get their own `_bump_pom_version` strategy —
-  `<dependencyManagement>` override is the simplest correct default — rather than falling
-  through to the current "not found → exception → dropped" path.
-- The silent-drop bug (finding stuck at `CREATED` forever) should be fixed regardless of which
-  fix strategy is chosen — at minimum it should fall through to `open_triage_issue()` like
-  bucket 1/4 findings do, so a human sees it instead of it vanishing.
+On a CI retry, the existing manifest change is not applied again. The CI failure is passed to
+the repair engine, including for transitive fixes, so a successful local compile cannot mask
+an unresolved CI failure.
 
 ---
 
