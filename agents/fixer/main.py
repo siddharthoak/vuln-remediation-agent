@@ -231,6 +231,8 @@ def _make_retry_server(port: int) -> HTTPServer:
                 self._handle_scan_live()
             elif self.path == "/fix/trigger":
                 self._handle_fix_trigger()
+            elif self.path == "/reset":
+                self._handle_reset()
             else:
                 self.send_error(404)
 
@@ -350,6 +352,61 @@ def _make_retry_server(port: int) -> HTTPServer:
             self.end_headers()
             threading.Thread(target=_run, daemon=True, name="fix-trigger").start()
             logger.info("Fresh-fix run accepted.")
+
+        def _handle_reset(self):
+            """Clears local demo state -- tracking.json, kb.json, the scan
+            poll checkpoint, and current scan reports -- so a demo can start
+            clean. Deliberately does NOT touch GitHub: it doesn't close PRs
+            or delete branches. That's a human decision, not something a
+            reset button silently automates (see the "how does this handle
+            an already-used-up target repo" discussion this was built for).
+            Refuses (409) while a fixer run or live scan is in flight, reusing
+            the same non-blocking acquire/release check-then-act pattern the
+            other handlers above use, so a reset can't delete files out from
+            under an active job.
+            """
+            if not _fresh_scan_lock.acquire(blocking=False):
+                self._send_json(409, {"status": "error", "message": "A fixer run is in progress -- wait for it to finish before resetting."})
+                return
+            _fresh_scan_lock.release()
+            if not _scan_lock.acquire(blocking=False):
+                self._send_json(409, {"status": "error", "message": "A live scan is in progress -- wait for it to finish before resetting."})
+                return
+            _scan_lock.release()
+
+            report_dir      = Path(os.environ.get("SCAN_REPORT_PATH", "/reports"))
+            tracking_path   = Path(os.environ.get("TRACKING_STORE_PATH", "/data/tracking.json"))
+            kb_path         = Path(os.environ.get("KB_STORE_PATH", "/data/kb.json"))
+            checkpoint_path = tracking_path.parent / "scan_poll_checkpoint.json"
+
+            to_clear = [
+                tracking_path, kb_path, checkpoint_path,
+                report_dir / "trivy-report.json",
+                report_dir / "grype-report.json",
+                report_dir / "dependency-check-report" / "dependency-check-report.json",
+            ]
+            cleared = []
+            try:
+                for path in to_clear:
+                    if path.exists():
+                        path.unlink()
+                        cleared.append(str(path))
+            except Exception as exc:
+                logger.exception("Reset failed")
+                self._send_json(500, {"status": "error", "message": str(exc)})
+                return
+
+            # Mutated in place rather than reassigned -- avoids needing a
+            # `global` declaration for three names in this nested method.
+            _kb_import_state.clear()
+            _kb_import_state.update({"status": "idle", "current": 0, "total": 0, "message": ""})
+            _scan_state.clear()
+            _scan_state.update({"status": "idle", "message": ""})
+            _fix_state.clear()
+            _fix_state.update({"status": "idle", "current": 0, "total": 0, "message": ""})
+
+            logger.info("Demo reset: cleared %d file(s): %s", len(cleared), cleared)
+            self._send_json(200, {"status": "done", "cleared": cleared})
 
         def log_message(self, fmt, *args):  # suppress default access log noise
             logger.debug("HTTP %s", fmt % args)
