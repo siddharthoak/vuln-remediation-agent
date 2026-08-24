@@ -21,6 +21,7 @@ services:
       FIXER_SERVER_MODE: "1"
       SCAN_POLL_INTERVAL: "60"      # seconds between GitHub Actions polls
       KB_HYDRATION: "1"             # set to "0" to skip Knowledge Agent (faster local testing)
+      RUN_TESTS: "0"                # set to "1" to give the Fixer a run_maven_test tool (adk engine only, slower)
     ports:
       - "8080:8080"
     volumes:
@@ -117,6 +118,7 @@ services:
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
       SCAN_REPORT_PATH: /reports
+      RUN_TESTS: "0"                # set to "1" to give the Fixer a run_maven_test tool (adk engine only, slower)
     volumes:
       - ./scan-reports:/reports
       - ./data:/data

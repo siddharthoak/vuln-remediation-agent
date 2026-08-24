@@ -466,6 +466,10 @@ def _how_it_works_context() -> dict:
         "max_retry_attempts": os.environ.get("MAX_RETRY_ATTEMPTS", "3"),
         "watcher_sleep_minutes": int(os.environ.get("WATCHER_SLEEP_SECONDS", "900")) // 60,
         "max_parallel_fixes": os.environ.get("MAX_PARALLEL_FIXES", "5"),
+        # Same "read the same default the real service reads" pattern as the
+        # three above -- reflects agents/fixer/engines/adk_vertex.py's own
+        # RUN_TESTS check, not a dashboard-local flag.
+        "run_tests_enabled": os.environ.get("RUN_TESTS", "0") == "1",
     }
 
 

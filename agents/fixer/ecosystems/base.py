@@ -72,3 +72,12 @@ class PackageEcosystem(Protocol):
         the FixEngine fallback), not an exceptional one.
         """
         ...
+
+    def run_tests(self, repo_path: Path) -> Tuple[bool, str]:
+        """Runs the ecosystem's full test suite. Same contract as
+        verify_build() -- never raises, always returns (success, message).
+        Only invoked when RUN_TESTS=1 and the active FixEngine advertises
+        supports_tests (see engines/base.py) -- CodeFixer is what decides
+        whether to call this at all, not this Protocol.
+        """
+        ...

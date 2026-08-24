@@ -113,6 +113,13 @@ def _parse_rationale(stdout: str) -> str:
 
 
 class GeminiCliEngine:
+    # Deliberately False, not just absent-therefore-falsy -- see this
+    # module's docstring on why compile verification (and by the same
+    # reasoning, test running) stays out of this engine entirely. Setting
+    # RUN_TESTS=1 with FIX_ENGINE=gemini_cli is a silent no-op, not an
+    # error, consistent with how compile verification is already handled.
+    supports_tests = False
+
     def __init__(self, max_turns: int = DEFAULT_MAX_TURNS) -> None:
         self._max_turns = max_turns
         self._api_key = os.environ.get("GEMINI_API_KEY", "")

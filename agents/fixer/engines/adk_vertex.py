@@ -23,12 +23,13 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
-from ecosystems.maven import compile_repo
+from ecosystems.maven import compile_repo, test_repo
 from engines.base import FixResult
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 10  # Passed to ADK Runner as max_llm_calls to guard runaway loops
+RUN_TESTS = os.environ.get("RUN_TESTS", "0") == "1"  # Opt-in -- see run_maven_test below
 
 
 class CodeFixerError(Exception):
@@ -38,8 +39,10 @@ class CodeFixerError(Exception):
 class AdkVertexEngine:
     """Runs a fix prompt through an ADK Agent on Vertex AI (Gemini), giving
     it four local FunctionTools (read/grep/apply_change/compile) to edit the
-    cloned repo in place.
+    cloned repo in place -- plus a fifth (run_maven_test) when RUN_TESTS=1.
     """
+
+    supports_tests = True  # see engines/base.py's FixEngine.supports_tests
 
     def __init__(self, model_name: Optional[str] = None):
         self._model_name = model_name or os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
@@ -81,6 +84,14 @@ class AdkVertexEngine:
             FunctionTool(func=apply_file_change),
             FunctionTool(func=run_maven_compile),
         ]
+
+        if RUN_TESTS:
+            def run_maven_test() -> str:
+                """Run the full test suite with 'mvn test -q'. Only call this after
+                run_maven_compile has already succeeded."""
+                return self._tool_run_maven_test()
+
+            tools.append(FunctionTool(func=run_maven_test))
 
         agent = Agent(
             name="code_fixer",
@@ -227,4 +238,9 @@ class AdkVertexEngine:
     def _tool_run_maven_compile(self) -> str:
         """Compile the repository with 'mvn compile -q'. No tests are executed."""
         _, message = compile_repo(self._repo_path)
+        return message
+
+    def _tool_run_maven_test(self) -> str:
+        """Run the full test suite with 'mvn test -q'. Only wired up when RUN_TESTS=1."""
+        _, message = test_repo(self._repo_path)
         return message

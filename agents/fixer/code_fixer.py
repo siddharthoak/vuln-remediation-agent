@@ -78,7 +78,7 @@ changes required to upgrade a specific dependency from one version to another.
 - `read_file(relative_path)` — read a file's full content.
 - `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
 - `run_maven_compile()` — run 'mvn compile -q'. No tests. Returns compiler error output on failure.
-
+{test_tool_line}
 ## Your workflow
 1. Call grep_files with the import/package pattern for {component_name}
    (e.g. for "org.apache.logging.log4j:log4j-core", search "org\\.apache\\.logging\\.log4j").
@@ -90,7 +90,7 @@ changes required to upgrade a specific dependency from one version to another.
    Do NOT edit pom.xml — the version bump is already applied.
 5. Call run_maven_compile to verify the changes compile cleanly.
 6. If compilation fails: read the error, inspect the affected files, apply corrections, compile again.
-7. When compilation succeeds (or if no source changes are needed), return end_turn with JSON.
+{test_workflow_step}7. When compilation succeeds (or if no source changes are needed), return end_turn with JSON.
 
 ## CRITICAL CONSTRAINTS
 - Only apply changes strictly required by the version upgrade.
@@ -126,7 +126,7 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 - `read_file(relative_path)` — read a file's full content.
 - `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
 - `run_maven_compile()` — run 'mvn compile -q'. No tests. Returns compiler error output on failure.
-
+{test_tool_line}
 ## Your workflow
 1. Analyse the CI failure log to identify the ROOT CAUSE.
 2. Use grep_files and read_file to inspect the files mentioned in the failure log.
@@ -134,7 +134,7 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
    Do NOT repeat the same change from the previous attempt unless the log shows it was incomplete.
 4. Call run_maven_compile to verify the fix compiles cleanly.
 5. If compilation fails: read the error, inspect affected files, apply corrections, compile again.
-6. When compilation succeeds, return end_turn with JSON.
+{test_workflow_step}6. When compilation succeeds, return end_turn with JSON.
 
 ## CRITICAL CONSTRAINTS
 - Fix only what the CI failure log tells you is broken.
@@ -185,6 +185,32 @@ def _render_kb_context(kb_entry) -> str:
     return "\n".join(lines)
 
 
+def _render_test_tool_line(run_tests_enabled: bool) -> str:
+    """Empty when tests are disabled/unsupported -- same shape as
+    _render_kb_context. Trailing newline so it fits cleanly between the
+    tool list and the blank line already preceding "## Your workflow".
+    """
+    if not run_tests_enabled:
+        return ""
+    return "- `run_maven_test()` — run 'mvn test -q'. Runs the full test suite. Returns failure output on failure.\n"
+
+
+def _render_test_workflow_step(step_label: str, run_tests_enabled: bool) -> str:
+    """Empty when tests are disabled/unsupported. step_label lets
+    FRESH_FIX_PROMPT ("6a") and RETRY_FIX_PROMPT ("5a") each insert this
+    right after their own compile-and-fix-until-clean step, without
+    renumbering the statically-numbered final step that follows it.
+    """
+    if not run_tests_enabled:
+        return ""
+    return (
+        f"{step_label}. Once compilation succeeds, call run_maven_test to run the full test suite. "
+        "If tests fail, read the failure output, inspect the affected code, and apply corrections -- "
+        "write or update a test if the failure reveals a genuine behavioral gap the upgrade introduced, "
+        "not merely to force a red test green artificially. Repeat compile+test until both pass.\n"
+    )
+
+
 class InvalidRetryError(Exception):
     """
     Raised when run_retry_fix() is called with a tracking_id that fails validation.
@@ -215,6 +241,14 @@ class CodeFixer:
         self._max_attempts = int(os.environ.get("MAX_RETRY_ATTEMPTS", "3"))
         self._engine = get_engine(model_deployment_name=model_deployment_name)
         self._ecosystem = get_ecosystem(self._repo_path)
+        # Opt-in (RUN_TESTS) AND the active engine has to actually support it
+        # (engines.base.FixEngine.supports_tests) -- e.g. gemini_cli never
+        # does, by its own documented security posture. Computed once here,
+        # not re-checked per prompt build, so it can't disagree with itself
+        # mid-run.
+        self._run_tests_enabled = (
+            os.environ.get("RUN_TESTS", "0") == "1" and getattr(self._engine, "supports_tests", False)
+        )
 
     # ── Public entry points (UNCHANGED) ──────────────────────────────────────
 
@@ -452,7 +486,9 @@ class CodeFixer:
     ) -> str:
         """Selects and formats FRESH_FIX_PROMPT or RETRY_FIX_PROMPT. The result is
         handed to whichever FixEngine is configured -- prompt content doesn't
-        change based on which engine will run it.
+        change based on which engine will run it, only on self._run_tests_enabled
+        (a capability the engine itself already reported, not an engine-name
+        branch here -- see __init__).
         """
         if failure_log_excerpt:
             return RETRY_FIX_PROMPT.format(
@@ -461,6 +497,8 @@ class CodeFixer:
                 target_version=target_version,
                 failure_log_excerpt=failure_log_excerpt[:6000],
                 file_listing=file_listing,
+                test_tool_line=_render_test_tool_line(self._run_tests_enabled),
+                test_workflow_step=_render_test_workflow_step("5a", self._run_tests_enabled),
             )
         return FRESH_FIX_PROMPT.format(
             component_name=component_name,
@@ -468,6 +506,8 @@ class CodeFixer:
             target_version=target_version,
             file_listing=file_listing,
             kb_context=_render_kb_context(kb_entry),
+            test_tool_line=_render_test_tool_line(self._run_tests_enabled),
+            test_workflow_step=_render_test_workflow_step("6a", self._run_tests_enabled),
         )
 
     # ── File listing (UNCHANGED) ──────────────────────────────────────────────

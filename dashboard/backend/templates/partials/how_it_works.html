@@ -132,8 +132,19 @@
        exact-match edit (the <code>find</code> string must be verbatim text the model already read -- the main
        guardrail against hallucinated edits), and compile. It loops on compiler errors up to 10 rounds (a fixed
        constant in <code>code_fixer.py</code>, not env-configurable).</p>
-    <p class="pipeline-caption">Compilation success is the only automated gate before a PR opens -- there's no test
-       run, no lint, no review pass. Up to {{ max_parallel_fixes }} findings run through this loop in parallel via a
+    {% if run_tests_enabled %}
+    <p class="pipeline-caption"><strong>Test running is turned on</strong> (<code>RUN_TESTS=1</code>) -- a fifth
+       tool, <code>run_maven_test</code>, is available once compilation succeeds. The model runs the suite, and on
+       failure diagnoses and corrects it -- writing or updating a test when the failure reveals a genuine
+       behavioral gap the upgrade introduced, not just to force a red test green. This is still prompt-instructed,
+       the same enforcement level compilation itself already has -- nothing mechanically blocks a PR if the model
+       doesn't get there.</p>
+    {% else %}
+    <p class="pipeline-caption">Compilation success is the only automated gate before a PR opens today -- there's
+       no test run, no lint, no review pass. An opt-in test-run tool exists (<code>RUN_TESTS=1</code>, only for the
+       default <code>adk</code> engine) but isn't enabled on this deployment.</p>
+    {% endif %}
+    <p class="pipeline-caption">Up to {{ max_parallel_fixes }} findings run through this loop in parallel via a
        thread pool, each against its own local clone.</p>
   </div>
 
