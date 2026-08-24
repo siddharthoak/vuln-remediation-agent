@@ -61,8 +61,11 @@ services:
 
   # ── Dashboard (always-on) ─────────────────────────────────────────────────
   # Starts automatically with: docker compose up -d
-  # Observability UI — read-only, reads tracking/KB state from the same
-  # bind-mounted ./data volume the fixer-server and watcher write to.
+  # Observability UI -- reads tracking/KB state from the same bind-mounted
+  # ./data volume the fixer-server and watcher write to. The one action it
+  # exposes (Trigger KB Import) is just a proxy to fixer-server's own
+  # /import-kb endpoint -- the dashboard itself never touches GCP/GitHub
+  # credentials or calls an LLM directly.
   # View at: http://localhost:8501
   dashboard:
     build:
@@ -77,8 +80,11 @@ services:
       TRACKING_STORE_PATH: /data/tracking.json
       KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
+      FIXER_SERVER_URL: http://fixer-server:8080
     ports:
       - "8501:8000"
+    depends_on:
+      - fixer-server
     volumes:
       - ./data:/data:ro
       - ./scan-reports:/reports:ro

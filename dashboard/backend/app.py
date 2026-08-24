@@ -47,6 +47,11 @@ DATA_DIR = TRACKING_PATH.parent
 CHECKPOINT_PATH = DATA_DIR / "scan_poll_checkpoint.json"
 SCAN_DIR = Path(os.environ.get("SCAN_REPORT_PATH", "./scan-reports"))
 
+# fixer-server already has GCP/GitHub credentials mounted and runs the actual
+# KnowledgeAgent hydration -- the dashboard stays credential-free and just
+# proxies the trigger/status calls over the podman-compose network.
+FIXER_SERVER_URL = os.environ.get("FIXER_SERVER_URL", "http://fixer-server:8080")
+
 REPORT_FILES = {
     "Trivy": SCAN_DIR / "trivy-report.json",
     "Grype": SCAN_DIR / "grype-report.json",
@@ -555,6 +560,45 @@ def _bars(items: list) -> list:
         return []
     max_val = max(v for _, v in items) or 1
     return [{"label": str(label), "value": value, "pct": round(value / max_val * 100, 1)} for label, value in items]
+
+
+def _kb_import_status() -> dict:
+    """Proxies fixer-server's GET /import-kb/status. Fails soft -- an
+    unreachable fixer-server (not started, wrong URL, etc.) renders as a
+    clear "unreachable" state in the UI rather than a broken dashboard page.
+    """
+    try:
+        with urllib.request.urlopen(f"{FIXER_SERVER_URL}/import-kb/status", timeout=5) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        logger.warning("Could not reach fixer-server for KB import status: %s", exc)
+        return {"status": "unreachable", "current": 0, "total": 0, "message": str(exc)}
+
+
+@app.post("/actions/import-kb")
+def trigger_kb_import(request: Request):
+    """Proxies fixer-server's POST /import-kb -- the dashboard itself never
+    touches GCP/GitHub credentials or runs the LLM call; it only tells
+    fixer-server (which already has those credentials mounted) to start.
+    """
+    try:
+        req = urllib.request.Request(f"{FIXER_SERVER_URL}/import-kb", method="POST", data=b"")
+        urllib.request.urlopen(req, timeout=5)
+    except Exception as exc:
+        logger.warning("Could not trigger KB import on fixer-server: %s", exc)
+    # just_triggered=True: the background thread on fixer-server may not have
+    # flipped status to "running" yet by the time we check -- without this,
+    # that race would render the "idle" branch (no polling attached) and the
+    # UI would silently never refresh again despite a job actually running.
+    return templates.TemplateResponse(request, "partials/kb_import_progress.html", {
+        "progress": _kb_import_status(),
+        "just_triggered": True,
+    })
+
+
+@app.get("/partials/kb-import-progress")
+def kb_import_progress(request: Request):
+    return templates.TemplateResponse(request, "partials/kb_import_progress.html", {"progress": _kb_import_status()})
 
 
 @app.get("/partials/kb")

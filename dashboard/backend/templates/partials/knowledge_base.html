@@ -1,6 +1,14 @@
 <div id="kb-root" hx-get="/partials/kb?source={{ selected_source | urlencode }}" hx-trigger="every 60s" hx-target="this" hx-swap="outerHTML">
   <h2>Knowledge Base</h2>
 
+  <div class="card">
+    <button hx-post="/actions/import-kb" hx-target="#kb-import-progress" hx-swap="outerHTML"
+            title="Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding.">
+      Trigger KB Import
+    </button>
+    <div id="kb-import-progress"><p><small>Idle.</small></p></div>
+  </div>
+
   {% if not has_entries %}
     <p>No KB entries yet. Tier 2 playbook entries load from <code>playbooks/*.yaml</code> at fixer startup;
        Knowledge Agent entries are added during each fresh scan; Tier 1 learned entries are added by the

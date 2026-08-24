@@ -49,6 +49,13 @@ AUTO_FETCH_SCAN    = os.environ.get("AUTO_FETCH_SCAN", "0") == "1"
 # Prevents concurrent fresh-scan runs if the poller fires while one is in progress.
 _fresh_scan_lock = threading.Lock()
 
+# ── KB import job state (POST /import-kb, GET /import-kb/status) ──────────────
+# In-memory only -- one fixer-server process, no need for a persisted job
+# store. Guarded by _kb_import_lock so a second trigger while one is already
+# running gets told so (409) instead of racing the same KnowledgeAgent/store.
+_kb_import_lock = threading.Lock()
+_kb_import_state = {"status": "idle", "current": 0, "total": 0, "message": ""}
+
 
 def main():
     retry_tracking_id = os.environ.get("RETRY_TRACKING_ID")
@@ -99,12 +106,63 @@ def _run_server():
         logger.info("Fixer server shutting down.")
 
 
+def _run_kb_import():
+    """Runs KnowledgeAgent.hydrate() against the current scan reports on
+    disk, reporting progress into _kb_import_state as it goes. Deliberately
+    skips locality resolution and classification entirely -- KB import is
+    about researching each finding's upgrade, not deciding whether/how to
+    fix it, so it only needs the raw findings list.
+    """
+    global _kb_import_state
+    try:
+        report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
+        scanner = ScanReportClient(report_dir=report_dir)
+        findings = scanner.get_vulnerability_report()
+
+        if not findings:
+            _kb_import_state = {"status": "done", "current": 0, "total": 0, "message": "No findings in scan reports."}
+            return
+
+        _kb_import_state = {"status": "running", "current": 0, "total": len(findings), "message": "Starting..."}
+
+        def on_progress(current, total, message):
+            _kb_import_state["current"] = current
+            _kb_import_state["total"] = total
+            _kb_import_state["message"] = message
+
+        kb_store = make_knowledge_store()
+        agent = KnowledgeAgent(github_pat=os.environ.get("GITHUB_PAT"))
+        agent.hydrate(findings, kb_store, on_progress=on_progress)
+
+        _kb_import_state["status"] = "done"
+        _kb_import_state["message"] = f"Done -- {_kb_import_state['total']} unique finding(s) processed."
+    except Exception as exc:
+        logger.exception("KB import failed")
+        _kb_import_state = {"status": "error", "current": 0, "total": 0, "message": str(exc)}
+
+
 def _make_retry_server(port: int) -> HTTPServer:
     class RetryHandler(BaseHTTPRequestHandler):
         def do_POST(self):
-            if self.path != "/retry":
+            if self.path == "/retry":
+                self._handle_retry()
+            elif self.path == "/import-kb":
+                self._handle_import_kb()
+            else:
                 self.send_error(404)
-                return
+
+        def do_GET(self):
+            if self.path == "/import-kb/status":
+                body = _json.dumps(_kb_import_state).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_error(404)
+
+        def _handle_retry(self):
             length = int(self.headers.get("Content-Length", 0))
             body   = self.rfile.read(length)
             try:
@@ -124,6 +182,25 @@ def _make_retry_server(port: int) -> HTTPServer:
                 name=f"retry-{tracking_id[:8]}",
             ).start()
             logger.info("Retry accepted for tracking_id=%s", tracking_id[:8])
+
+        def _handle_import_kb(self):
+            if not _kb_import_lock.acquire(blocking=False):
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(_json.dumps(_kb_import_state).encode("utf-8"))
+                return
+
+            def _run():
+                try:
+                    _run_kb_import()
+                finally:
+                    _kb_import_lock.release()
+
+            self.send_response(202)
+            self.end_headers()
+            threading.Thread(target=_run, daemon=True, name="kb-import").start()
+            logger.info("KB import accepted.")
 
         def log_message(self, fmt, *args):  # suppress default access log noise
             logger.debug("HTTP %s", fmt % args)

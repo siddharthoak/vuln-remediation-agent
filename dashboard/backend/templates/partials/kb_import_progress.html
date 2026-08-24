@@ -1,0 +1,19 @@
+<div id="kb-import-progress">
+  {% if progress.status == "running" or (just_triggered and progress.status == "idle") %}
+    <div hx-get="/partials/kb-import-progress" hx-trigger="every 1.5s" hx-target="#kb-import-progress" hx-swap="outerHTML">
+      <div class="bar-row">
+        <div class="bar-track"><div class="bar-fill" style="width: {{ (progress.current / progress.total * 100) if progress.total else 0 }}%"></div></div>
+        <div class="bar-value">{{ progress.current }}/{{ progress.total }}</div>
+      </div>
+      <p><small>{{ progress.message or "Starting..." }}</small></p>
+    </div>
+  {% elif progress.status == "done" %}
+    <p class="ok">&#10003; {{ progress.message }}</p>
+  {% elif progress.status == "error" %}
+    <p class="err">&#10007; KB import failed: {{ progress.message }}</p>
+  {% elif progress.status == "unreachable" %}
+    <p class="err">Could not reach fixer-server ({{ progress.message }}) -- is it running?</p>
+  {% else %}
+    <p><small>Idle.</small></p>
+  {% endif %}
+</div>
