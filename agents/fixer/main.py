@@ -26,6 +26,7 @@ from pr_client import PRClient
 from engines.base import EngineExecutionError
 from ecosystems.factory import get_ecosystem
 from ecosystems.base import EcosystemError
+from ecosystems.maven import PomXMLError
 
 from common.tracking_store import (
     make_tracking_store,
@@ -335,6 +336,22 @@ def _do_fresh_scan():
                         cve_ids=finding.cve_ids,
                         kb_entry=kb_entry,
                     )
+            except PomXMLError as exc:
+                logger.warning(
+                    "Could not process dependency %s in pom.xml; opening triage issue: %s",
+                    finding.component_name,
+                    exc,
+                )
+                pr_client.open_triage_issue(
+                    finding=finding,
+                    bucket=2,
+                    rationale=str(exc),
+                    kb_entry=kb_entry,
+                )
+                current = tracking_store.get(record.tracking_id)
+                current.status = "TRIAGE_OPENED"
+                tracking_store.update(current)
+                return None
             except Exception as exc:
                 logger.error("Fix failed for %s: %s", finding.component_name, exc)
                 return None
@@ -348,7 +365,6 @@ def _do_fresh_scan():
             repo.push_branch(branch_name)
 
         return (finding, branch_name, record, summary)
-
     try:
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_FIXES) as executor:
             futures = {executor.submit(_fix_one, t): t for t in tasks}

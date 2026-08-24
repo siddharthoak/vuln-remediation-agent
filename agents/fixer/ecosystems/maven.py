@@ -165,7 +165,10 @@ class MavenEcosystem:
         if not pom_path.exists():
             raise PomXMLError(f"pom.xml not found at {pom_path}")
 
-        tree = ET.parse(str(pom_path))
+        try:
+            tree = ET.parse(str(pom_path))
+        except ET.ParseError as exc:
+            raise PomXMLError(f"Could not parse pom.xml at {pom_path}: {exc}") from exc
         root = tree.getroot()
         ns, tag, subtag, prop_xpath, dep_xpath, ns_uri = _pom_namespace_helpers(root)
         ET.register_namespace("", ns_uri)
@@ -215,16 +218,15 @@ class MavenEcosystem:
         tree.write(str(pom_path), xml_declaration=True, encoding="utf-8")
 
     def add_transitive_override(self, repo_path: Path, component_name: str, target_version: str) -> None:
-        """POC scope: single-module only. Appends <dependencyManagement> as a
-        direct child of <project> if it doesn't already exist -- Maven's
-        parser doesn't enforce strict element ordering, so this is valid even
-        though it isn't in the IDE-conventional position.
-        """
+        """Add or update a project-level dependencyManagement override."""
         pom_path = repo_path / "pom.xml"
         if not pom_path.exists():
             raise PomXMLError(f"pom.xml not found at {pom_path}")
 
-        tree = ET.parse(str(pom_path))
+        try:
+            tree = ET.parse(str(pom_path))
+        except ET.ParseError as exc:
+            raise PomXMLError(f"Could not parse pom.xml at {pom_path}: {exc}") from exc
         root = tree.getroot()
         ns, tag, subtag, _prop_xpath, _dep_xpath, ns_uri = _pom_namespace_helpers(root)
         ET.register_namespace("", ns_uri)
@@ -238,7 +240,26 @@ class MavenEcosystem:
 
         dm = root.find(tag("dependencyManagement"), ns)
         if dm is None:
-            dm = ET.SubElement(root, subtag("dependencyManagement"))
+            dm = ET.Element(subtag("dependencyManagement"))
+            # Keep Maven's conventional top-level model order so generated POMs
+            # remain consumable by strict Maven/XML tooling.
+            insert_before = {
+                "dependencies",
+                "repositories",
+                "pluginRepositories",
+                "build",
+                "reporting",
+                "profiles",
+            }
+            insert_at = next(
+                (
+                    index
+                    for index, child in enumerate(root)
+                    if child.tag.rsplit("}", 1)[-1] in insert_before
+                ),
+                len(root),
+            )
+            root.insert(insert_at, dm)
 
         dm_deps = dm.find(tag("dependencies"), ns)
         if dm_deps is None:

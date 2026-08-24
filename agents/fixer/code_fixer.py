@@ -35,6 +35,7 @@ from typing import Optional
 
 from common.tracking_store import TrackingStatus
 from ecosystems.factory import get_ecosystem
+from ecosystems.maven import PomXMLError
 from engines.factory import get_engine
 
 logger = logging.getLogger(__name__)
@@ -344,9 +345,18 @@ class CodeFixer:
         failure_log_excerpt: Optional[str],
         kb_entry=None,
     ) -> ChangeSummary:
-        self._ecosystem.bump_direct_dependency(
-            self._repo_path, component_name, current_version, target_version
-        )
+        try:
+            self._ecosystem.bump_direct_dependency(
+                self._repo_path, component_name, current_version, target_version
+            )
+        except PomXMLError:
+            return self._execute_transitive_fix(
+                component_name=component_name,
+                current_version=current_version,
+                target_version=target_version,
+                introduced_by="dependency tree resolution",
+                cve_ids=cve_ids,
+            )
         file_listing = self._build_file_listing()
         prompt = self._build_prompt(
             component_name=component_name,

@@ -6,7 +6,7 @@ services:
   # Runs two background workers:
   #   1. ScanPoller — polls GitHub every SCAN_POLL_INTERVAL seconds. When the
   #      security-scan.yml workflow you triggered manually completes, it
-  #      downloads the artifact and kicks off the fix flow automatically.
+  #      downloads the artifacat and kicks off the fix flow automatically.
   #   2. HTTP server on :8080 — accepts POST /retry from the Watcher when
   #      a remediation PR fails CI and needs another fix attempt.
   fixer-server:
