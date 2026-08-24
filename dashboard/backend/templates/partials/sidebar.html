@@ -26,25 +26,50 @@
   <div class="card demo-controls">
     <strong>Demo Controls</strong>
 
-    <div class="demo-control">
-      {% with job = {"status": "idle", "message": ""}, just_triggered = False, show_bar = False,
-              target_id = "scan-demo-progress", trigger_url = "/actions/scan-demo", poll_url = "",
-              button_label = "Load Demo Scan Reports",
-              button_title = "Writes a curated demo trivy/grype report set (3 findings spanning buckets 2/3/4) -- no GitHub Actions run, for timing-controlled demos." %}
-        {% include "partials/job_progress.html" %}
-      {% endwith %}
+    <div class="demo-hint">&#128073; {{ sidebar.demo_next_hint }}</div>
+
+    <button class="btn btn-outline" hx-post="/actions/reset" hx-target="#reset-result" hx-swap="outerHTML"
+            hx-confirm="This clears local tracking, KB entries, and scan reports so the demo starts clean. It does NOT touch GitHub -- any existing PRs/branches stay as-is. Continue?">
+      Reset Demo
+    </button>
+    <div id="reset-result"></div>
+    <p class="demo-reset-note"><small>Clears local state only &mdash; GitHub PRs/branches aren't touched.</small></p>
+
+    <div class="demo-step">
+      <div class="demo-step-head"><span class="step-badge">1</span> Get scan data</div>
+      <p class="demo-step-caption">Pick one source, then run it &mdash; these are alternatives, not separate steps.</p>
+
+      {% set live_active = sidebar.scan_live.status == "running" %}
+      <div class="scan-mode-toggle">
+        <label><input type="radio" name="scan-mode" value="demo" {% if not live_active %}checked{% endif %} onchange="toggleScanMode('demo')"> Demo data <small>(instant)</small></label>
+        <label><input type="radio" name="scan-mode" value="live" {% if live_active %}checked{% endif %} onchange="toggleScanMode('live')"> Live GitHub scan <small>(~20 min)</small></label>
+      </div>
+
+      {# Which panel starts visible is server-driven by whether a live scan is
+         actually running, not hardcoded -- sidebar self-polls every 30s and
+         fully re-renders, so a hardcoded default would silently hide an
+         in-progress live scan's status the next time that poll fires. #}
+      <div id="scan-demo-wrap" class="scan-mode-panel" {% if live_active %}style="display:none"{% endif %}>
+        {% with job = {"status": "idle", "message": ""}, just_triggered = False, show_bar = False,
+                target_id = "scan-demo-progress", trigger_url = "/actions/scan-demo", poll_url = "",
+                button_label = "Run Demo Scan",
+                button_title = "Writes a curated demo trivy/grype report set (3 findings spanning buckets 2/3/4) -- no GitHub Actions run, for timing-controlled demos." %}
+          {% include "partials/job_progress.html" %}
+        {% endwith %}
+      </div>
+      <div id="scan-live-wrap" class="scan-mode-panel" {% if not live_active %}style="display:none"{% endif %}>
+        {% with job = sidebar.scan_live, just_triggered = False, show_bar = False, poll_interval = "5s",
+                target_id = "scan-live-progress", trigger_url = "/actions/scan-live", poll_url = "/partials/scan-live-progress",
+                button_label = "Run Live Scan",
+                button_title = "Dispatches the real security-scan.yml GitHub Actions workflow and waits for it -- can take up to ~20 minutes." %}
+          {% include "partials/job_progress.html" %}
+        {% endwith %}
+      </div>
     </div>
 
-    <div class="demo-control">
-      {% with job = sidebar.scan_live, just_triggered = False, show_bar = False, poll_interval = "5s",
-              target_id = "scan-live-progress", trigger_url = "/actions/scan-live", poll_url = "/partials/scan-live-progress",
-              button_label = "Run Live Scan",
-              button_title = "Dispatches the real security-scan.yml GitHub Actions workflow and waits for it -- can take up to ~20 minutes." %}
-        {% include "partials/job_progress.html" %}
-      {% endwith %}
-    </div>
-
-    <div class="demo-control">
+    <div class="demo-step">
+      <div class="demo-step-head"><span class="step-badge">2</span> Fix findings</div>
+      <p class="demo-step-caption">Classifies + fixes whatever's currently in scan-reports/, opens PRs.</p>
       {% with job = sidebar.fix, just_triggered = False, show_bar = True, poll_interval = "2s",
               target_id = "fix-progress", trigger_url = "/actions/trigger-fix", poll_url = "/partials/fix-progress",
               button_label = "Trigger Fixer",
@@ -53,11 +78,14 @@
       {% endwith %}
     </div>
 
-    <div class="demo-control">
+    <div class="demo-utility">
+      <div class="demo-step-head demo-utility-head">&#9193; Skip the Wait <span class="optional-tag">optional</span></div>
+      <p class="demo-step-caption">The Watcher already polls CI and retries failures on its own every 15 min --
+         nothing here requires a click. This just skips that wait for the demo.</p>
       {% with job = sidebar.watcher_check, just_triggered = False, show_bar = False, poll_interval = "2s",
               target_id = "watcher-check-progress", trigger_url = "/actions/watcher-check", poll_url = "/partials/watcher-check-progress",
-              button_label = "Watcher: Check Now",
-              button_title = "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer." %}
+              button_label = "Skip the Wait",
+              button_title = "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer -- purely a demo-pacing shortcut, not something the real system needs." %}
         {% include "partials/job_progress.html" %}
       {% endwith %}
     </div>
