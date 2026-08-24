@@ -100,6 +100,17 @@ STATUS_DESCRIPTIONS = {
 # treating the status column as redundant with the PR badge.
 _ACTIVE_PR_STATUSES = {TrackingStatus.PR_OPENED.value, TrackingStatus.CI_PENDING.value}
 
+# Drives the Demo Controls "Next:" hint -- any record still moving through
+# the pipeline, not just the PR_OPENED/CI_PENDING subset _ACTIVE_PR_STATUSES
+# covers (a CI_FAILED/RETRY_REQUESTED record is also mid-flight, just
+# between Watcher cycles rather than waiting on GitHub).
+_ACTIVE_TRACKING_STATUSES = {
+    TrackingStatus.PR_OPENED.value,
+    TrackingStatus.CI_PENDING.value,
+    TrackingStatus.CI_FAILED.value,
+    TrackingStatus.RETRY_REQUESTED.value,
+}
+
 # General bucket-taxonomy definitions, matching agents/classifier/classifier.py's
 # own docstring. A TrackingRecord only ever exists for bucket 2 or 3 -- bucket
 # 1/4 findings get a GitHub triage issue instead and never reach the fixer, so
@@ -366,6 +377,24 @@ def _percentile(sorted_values: list, pct: float) -> float:
     return sorted_values[idx]
 
 
+def _demo_next_hint(scan_finding_count: int, records: list) -> str:
+    """One-line "what to click next" for the Demo Controls card -- purely a
+    read of state that's already computed elsewhere (scan finding count,
+    tracking records), not a new source of truth.
+    """
+    if not scan_finding_count:
+        return "Next: Step 1 -- run a scan to load findings."
+    if not records:
+        return "Next: Step 2 -- Trigger Fixer to classify and fix these findings."
+    if any(r["status"] in _ACTIVE_TRACKING_STATUSES for r in records):
+        # Deliberately not phrased as "Step 3" -- the Watcher already polls
+        # CI and retries failures on its own timer with no user action
+        # required; "Skip the Wait" is an optional demo-pacing shortcut,
+        # not a step in the flow (see sidebar.html's .demo-utility section).
+        return 'CI is running -- the Watcher will pick this up automatically within 15 min (or use "Skip the Wait" below).'
+    return "Demo complete for this data -- Reset Demo to run through again."
+
+
 def _sidebar_status() -> dict:
     checkpoint = None
     if CHECKPOINT_PATH.exists():
@@ -388,11 +417,14 @@ def _sidebar_status() -> dict:
         else:
             reports[label] = {"present": False, "age_minutes": None}
 
+    scan_finding_count = _scan_finding_count()
+    records = _records_as_dicts()
+
     return {
         "checkpoint": checkpoint,
         "reports": reports,
         "fixer_active": _fixer_active(),
-        "scan_finding_count": _scan_finding_count(),
+        "scan_finding_count": scan_finding_count,
         "tracking_path": str(TRACKING_PATH),
         # Seeds the Demo Controls card's initial render (page load / the
         # sidebar's own 30s self-poll) so each button already reflects
@@ -400,6 +432,7 @@ def _sidebar_status() -> dict:
         "scan_live": _scan_live_status(),
         "fix": _fix_status(),
         "watcher_check": _watcher_check_status(),
+        "demo_next_hint": _demo_next_hint(scan_finding_count, records),
     }
 
 
@@ -413,6 +446,7 @@ def index(request: Request):
         "has_records": bool(records),
         "sidebar": _sidebar_status(),
         **_run_history_context(records),
+        **_how_it_works_context(),
     })
 
 
@@ -421,6 +455,31 @@ def index(request: Request):
 @app.get("/partials/sidebar")
 def partial_sidebar(request: Request):
     return templates.TemplateResponse(request, "partials/sidebar.html", {"sidebar": _sidebar_status()})
+
+
+def _how_it_works_context() -> dict:
+    """Shared by the index route's default tab and /partials/how-it-works
+    directly -- both need the exact same context, so index() can't just
+    {% include %} the template without also passing this.
+    """
+    return {
+        "max_retry_attempts": os.environ.get("MAX_RETRY_ATTEMPTS", "3"),
+        "watcher_sleep_minutes": int(os.environ.get("WATCHER_SLEEP_SECONDS", "900")) // 60,
+        "max_parallel_fixes": os.environ.get("MAX_PARALLEL_FIXES", "5"),
+    }
+
+
+@app.get("/partials/how-it-works")
+def partial_how_it_works(request: Request):
+    """Static, doesn't self-poll -- unlike every other tab this isn't a view
+    over live data, it's a narrated explainer for a demo. The numbers it
+    quotes (retry limit, tool-loop rounds, watcher interval) are read from
+    the same env vars fixer-server/watcher default to, so a POC deployment
+    that customizes them stays accurate here without a second place to edit
+    -- MAX_TOOL_ROUNDS is the one exception (hardcoded in code_fixer.py, not
+    env-configurable), called out as such in the template.
+    """
+    return templates.TemplateResponse(request, "partials/how_it_works.html", _how_it_works_context())
 
 
 def _group_by_run(view: list) -> list:
@@ -834,8 +893,8 @@ def trigger_watcher_check(request: Request):
     return templates.TemplateResponse(request, "partials/job_progress.html", {
         "job": _watcher_check_status(), "just_triggered": True, "show_bar": False, "poll_interval": "2s",
         "target_id": "watcher-check-progress", "trigger_url": "/actions/watcher-check", "poll_url": "/partials/watcher-check-progress",
-        "button_label": "Watcher: Check Now",
-        "button_title": "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer.",
+        "button_label": "Skip the Wait",
+        "button_title": "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer -- purely a demo-pacing shortcut, not something the real system needs.",
     })
 
 
@@ -844,8 +903,22 @@ def watcher_check_progress(request: Request):
     return templates.TemplateResponse(request, "partials/job_progress.html", {
         "job": _watcher_check_status(), "just_triggered": False, "show_bar": False, "poll_interval": "2s",
         "target_id": "watcher-check-progress", "trigger_url": "/actions/watcher-check", "poll_url": "/partials/watcher-check-progress",
-        "button_label": "Watcher: Check Now",
-        "button_title": "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer.",
+        "button_label": "Skip the Wait",
+        "button_title": "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer -- purely a demo-pacing shortcut, not something the real system needs.",
+    })
+
+
+@app.post("/actions/reset")
+def trigger_reset(request: Request):
+    """Proxies fixer-server's POST /reset. Synchronous -- deleting a handful
+    of small local files is fast, no job/poll cycle needed. The button that
+    hits this carries hx-confirm in the template, not a server-side
+    confirmation step -- see sidebar.html.
+    """
+    result = _proxy_post(FIXER_SERVER_URL, "/reset", {"status": "error", "message": "fixer-server unreachable"}, timeout=15)
+    return templates.TemplateResponse(request, "partials/reset_result.html", {
+        "error": None if result.get("status") == "done" else result.get("message", "Unknown error"),
+        "cleared": result.get("cleared", []),
     })
 
 

@@ -1,0 +1,178 @@
+<div id="how-it-works-root">
+  <style>
+    /* Decorative, looping summary of the pipeline -- purely for a demo's
+       opening beat. Pure CSS (no JS): a shared cycle applied to every
+       node/caption with an increasing positive animation-delay staggers
+       them into a self-running sequence. aria-hidden since it's purely
+       visual rhythm -- the real, accurate stepper is the one right below
+       it, built from the same stages listed in each numbered section. */
+    .journey { background: var(--card-bg); border: 1px solid var(--scheme-outline-variant);
+      border-radius: 14px; padding: 1.75rem 1.5rem 1.4rem; margin: 0.75rem 0 1.5rem; overflow: hidden; }
+    .journey-track { position: relative; height: 4px; background: var(--scheme-outline-variant);
+      border-radius: 999px; margin: 0 14px; }
+    .journey-fill { position: absolute; inset: 0; width: 0%;
+      background: linear-gradient(90deg, var(--scheme-secondary), var(--accent));
+      border-radius: 999px; animation: journey-fill 12s linear infinite; }
+    .journey-nodes { position: absolute; inset: 0; display: flex; justify-content: space-between; align-items: center; }
+    .journey-node { width: 12px; height: 12px; border-radius: 50%; background: var(--card-bg);
+      border: 2px solid var(--scheme-outline-variant); flex-shrink: 0; animation: journey-node-pulse 12s ease infinite; }
+    .journey-captions { position: relative; height: 2.4rem; margin-top: 1.5rem; text-align: center; }
+    .journey-caption { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      font-family: var(--font-exo); font-size: 1rem; font-weight: 600; opacity: 0;
+      animation: journey-caption-fade 12s ease infinite; padding: 0 0.5rem; }
+    @keyframes journey-fill { from { width: 0%; } to { width: 100%; } }
+    @keyframes journey-node-pulse {
+      0%, 100% { border-color: var(--scheme-outline-variant); background: var(--card-bg); box-shadow: none; transform: scale(1); }
+      1.6%, 14.6% { border-color: var(--accent); background: var(--accent); box-shadow: 0 0 0 5px rgba(8, 17, 96, 0.2); transform: scale(1.3); }
+      16.6% { border-color: var(--scheme-outline-variant); background: var(--card-bg); box-shadow: none; transform: scale(1); }
+    }
+    @keyframes journey-caption-fade {
+      0%, 100% { opacity: 0; transform: translateY(6px); }
+      1.6%, 14.6% { opacity: 1; transform: translateY(0); }
+      16.6% { opacity: 0; transform: translateY(-6px); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .journey-fill, .journey-node, .journey-caption { animation: none !important; }
+      .journey-fill { width: 16.6%; }
+      .journey-node:first-of-type { border-color: var(--accent); background: var(--accent); }
+      .journey-caption:first-of-type { opacity: 1; }
+    }
+    .hiw-section { margin-bottom: 0.75rem; }
+    .hiw-section-head { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.4rem; }
+    .hiw-section-head .step-badge { width: 1.5rem; height: 1.5rem; font-size: 0.8rem; }
+    .hiw-section p { line-height: 1.55; margin: 0 0 0.6rem; }
+    .hiw-section p:last-child { margin-bottom: 0; }
+    .hiw-cta { text-align: center; margin: 1.5rem 0 0.5rem; }
+  </style>
+
+  <h2>How It Works</h2>
+  <p>A walkthrough of the pipeline, end to end -- from a raw scanner finding to a merge-ready pull request.
+     Built for narrating live in a demo: read it top to bottom, or jump straight to the
+     <a class="link" href="#" onclick="document.querySelector('.tabs button[hx-get=\'/partials/pipeline\']').click(); return false;">Pipeline</a>
+     tab to see it running against live data.</p>
+
+  <div class="journey" aria-hidden="true">
+    <div class="journey-track">
+      <div class="journey-fill"></div>
+      <div class="journey-nodes">
+        {% for i in range(6) %}<div class="journey-node" style="animation-delay: {{ i * 2 }}s;"></div>{% endfor %}
+      </div>
+    </div>
+    <div class="journey-captions">
+      <span class="journey-caption" style="animation-delay: 0s;">Trivy/Grype scan a Java repo for known CVEs.</span>
+      <span class="journey-caption" style="animation-delay: 2s;">Each finding is classified into one of four risk buckets.</span>
+      <span class="journey-caption" style="animation-delay: 4s;">An LLM agent bumps the dependency and fixes what breaks.</span>
+      <span class="journey-caption" style="animation-delay: 6s;">A pull request opens -- deterministic branch, no duplicates.</span>
+      <span class="journey-caption" style="animation-delay: 8s;">The Watcher polls CI and retries automatically on failure.</span>
+      <span class="journey-caption" style="animation-delay: 10s;">CI passes. A human reviews and merges -- nothing merges itself.</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>The pipeline at a glance</strong>
+    <p class="pipeline-caption" style="margin: 0.3rem 0 0;">Two independent processes, not one: the <strong>Fixer</strong>
+       writes the code and opens the PR, then gets out of the way. The <strong>Watcher</strong> -- a separate,
+       always-on process that never touches code -- takes over from there: it's the one polling CI and deciding
+       whether to retry.</p>
+    <div class="pipeline-diagram" style="margin-top: 0.75rem;">
+      <div class="pnode"><div class="pnode-label">Scan</div></div>
+      <div class="pconnector" aria-hidden="true">&#8594;</div>
+      <div class="pnode"><div class="pnode-label">Classify</div></div>
+      <div class="pconnector" aria-hidden="true">&#8594;</div>
+      <div class="pnode"><div class="pnode-label">Fix</div></div>
+      <div class="pconnector" aria-hidden="true">&#8594;</div>
+      <div class="pnode"><div class="pnode-label">PR</div></div>
+      <div class="pconnector" aria-hidden="true">&#8594;</div>
+      <div class="pnode"><div class="pnode-label">Watch</div></div>
+      <div class="pconnector" aria-hidden="true">&#8594;</div>
+      <div class="pnode pnode-ok"><div class="pnode-label">Done</div></div>
+    </div>
+    <div class="pipeline-branches">
+      <div class="pbranch">
+        <span class="pbranch-arrow" aria-hidden="true">&#8630;</span>
+        <span class="pbranch-label">Retry</span>
+        <span class="pbranch-note">Watcher sends it back to Fix, bounded</span>
+      </div>
+      <div class="pbranch pbranch-err">
+        <span class="pbranch-arrow" aria-hidden="true">&#8631;</span>
+        <span class="pbranch-label">Escalated</span>
+        <span class="pbranch-note">Watcher hands off to a human</span>
+      </div>
+    </div>
+    <p class="pipeline-caption" style="margin-top: 0.75rem;">This is the exact sequence a real finding goes through --
+       the <a class="link" href="#" onclick="document.querySelector('.tabs button[hx-get=\'/partials/pipeline\']').click(); return false;">Pipeline</a>
+       tab is a live, counted snapshot of this same diagram.</p>
+  </div>
+
+  <div class="card hiw-section">
+    <div class="hiw-section-head"><span class="step-badge">1</span><strong>Scan ingested</strong></div>
+    <p>Trivy, Grype, and OWASP Dependency-Check reports (whichever are present in <code>scan-reports/</code>) get parsed
+       and deduplicated into findings -- component, current version, recommended version, severity, CVE ids -- keyed on
+       <code>(component, current_version)</code>. Trivy's fix version wins over Grype's over OWASP DC's, since OWASP DC
+       frequently can't compute a safe version at all.</p>
+  </div>
+
+  <div class="card hiw-section">
+    <div class="hiw-section-head"><span class="step-badge">2</span><strong>Classified into a bucket</strong></div>
+    <p>A pure-Python classifier -- no LLM, no network call -- buckets every finding. <strong>Bucket 1</strong>: no safe
+       version known, straight to a GitHub triage issue, the Fixer never runs. <strong>Bucket 2</strong>: a patch/minor
+       bump, or a major bump on a component not flagged complex -- the Fixer runs directly. <strong>Bucket 3</strong>:
+       a major bump where a Knowledge Base entry already exists -- runs with that migration knowledge injected into the
+       prompt. <strong>Bucket 4</strong>: a major bump to a hardcoded "complex framework" (Spring Boot, Hibernate,
+       Struts, JSF...) with no KB entry -- also a triage issue, since the risk of a wrong auto-fix is judged too high
+       without ground truth.</p>
+    <p class="pipeline-caption">This is a cost and risk control, not just a routing table -- every Bucket 2/3 finding
+       costs a real LLM tool-use loop.</p>
+  </div>
+
+  <div class="card hiw-section">
+    <div class="hiw-section-head"><span class="step-badge">3</span><strong>Fixer -- an LLM tool-use loop</strong></div>
+    <p>The version bump itself is deterministic XML parsing -- the LLM never touches <code>pom.xml</code> directly.
+       Everything else goes to a Gemini tool-use loop with four tools: grep the codebase, read a file, apply an
+       exact-match edit (the <code>find</code> string must be verbatim text the model already read -- the main
+       guardrail against hallucinated edits), and compile. It loops on compiler errors up to 10 rounds (a fixed
+       constant in <code>code_fixer.py</code>, not env-configurable).</p>
+    <p class="pipeline-caption">Compilation success is the only automated gate before a PR opens -- there's no test
+       run, no lint, no review pass. Up to {{ max_parallel_fixes }} findings run through this loop in parallel via a
+       thread pool, each against its own local clone.</p>
+  </div>
+
+  <div class="card hiw-section">
+    <div class="hiw-section-head"><span class="step-badge">4</span><strong>Pull request opens</strong></div>
+    <p>Branch names are deterministic -- hashed from <code>component@version</code> -- so re-running the pipeline for
+       the same vulnerability always produces the same branch and never opens a duplicate PR; if one's already open
+       (or even closed), the Fixer re-attaches to it instead. Every finding gets a tracking record that moves
+       <code>CREATED &rarr; PR_OPENED &rarr; CI_PENDING</code> -- the single audit trail every tab in this dashboard
+       reads from.</p>
+  </div>
+
+  <div class="card hiw-section">
+    <div class="hiw-section-head"><span class="step-badge">5</span><strong>Watcher takes over -- fully on its own</strong></div>
+    <p>The Fixer's job ends the moment the PR opens. From here a separate, always-on process -- the Watcher, which
+       never touches code, never clones a repo, never calls the LLM that writes fixes -- runs on its own timer,
+       polling every open <code>fix/*</code> PR every {{ watcher_sleep_minutes }} minutes by default. No one has to
+       trigger this; it's the same background loop whether or not anyone's watching the dashboard.</p>
+    <p class="pipeline-caption">CI pass marks the record <code>CI_PASSED</code> and mines the diff for the exact
+       patterns used, so the next time this exact upgrade comes up, the system uses a confirmed pattern instead of
+       guessing again. CI failure hands off to the retry gate below -- still entirely the Watcher's call, not the
+       Fixer's.</p>
+  </div>
+
+  <div class="card hiw-section">
+    <div class="hiw-section-head"><span class="step-badge">6</span><strong>Retry gate, then a human</strong></div>
+    <p>On CI failure, the retry gate -- the only place in the whole system that decides retry-vs-give-up -- checks how
+       many attempts this PR has already had. Under the limit ({{ max_retry_attempts }} by default), it writes a
+       <code>RETRY_REQUESTED</code> record with the CI failure log attached and calls the Fixer's retry endpoint,
+       which puts that log at the very top of the prompt so the model diagnoses root cause instead of repeating the
+       first attempt. At the limit, it marks <code>FAILED_MAX_RETRIES</code> and posts an escalation comment --
+       automation stops, a human takes over.</p>
+    <p class="pipeline-caption">Nothing in this system merges a PR itself, ever -- <code>CI_PASSED</code> is the final
+       automated state. A human reviews and merges like any other PR.</p>
+  </div>
+
+  <p class="hiw-cta">
+    <button class="btn btn-primary" onclick="document.querySelector('.tabs button[hx-get=\'/partials/pipeline\']').click();">
+      See it running live &rarr;
+    </button>
+  </p>
+</div>
