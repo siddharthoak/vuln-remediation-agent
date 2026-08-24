@@ -273,6 +273,55 @@
     color: var(--scheme-on-background);
   }
   .kb-detail-close:hover { opacity: 1; }
+
+  /* Pipeline tab -- aggregate node-and-arrow diagram + per-record dot
+     stepper, hand-built CSS/HTML like the Metrics tab's bars (no charting
+     library anywhere in this app, by existing convention). */
+  .pipeline-diagram { display: flex; align-items: stretch; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.75rem; }
+  .pnode { border: 1px solid var(--scheme-outline-variant); border-radius: 10px; padding: 0.7rem 1rem;
+    min-width: 110px; text-align: center; background: var(--scheme-surface); transition: border-color 0.2s, background 0.2s; }
+  .pnode-count { font-family: var(--font-exo); font-size: 1.5rem; line-height: 1.2; font-weight: 700; }
+  .pnode-label { font-family: var(--font-gabarito); font-size: 0.75rem; text-transform: uppercase;
+    letter-spacing: 0.03125rem; opacity: 0.65; margin-top: 0.15rem; }
+  .pnode-sub { font-family: var(--font-gabarito); font-size: 0.68rem; opacity: 0.5; margin-top: 0.2rem; }
+  .pnode-active { border-color: var(--accent); background: rgba(8, 17, 96, 0.06); }
+  .pnode-active .pnode-count { animation: pipeline-pulse-accent 1.8s ease-in-out infinite; }
+  .pnode-ok.pnode-active { border-color: var(--ok); background: var(--ok-bg); }
+  .pnode-ok.pnode-active .pnode-count { animation: pipeline-pulse-ok 1.8s ease-in-out infinite; color: var(--ok); }
+  .pconnector { align-self: center; font-size: 1.3rem; color: var(--scheme-outline-variant); flex: none; }
+  @keyframes pipeline-pulse-accent { 0%, 100% { text-shadow: 0 0 0 rgba(8, 17, 96, 0); } 50% { text-shadow: 0 0 10px rgba(8, 17, 96, 0.35); } }
+  @keyframes pipeline-pulse-ok { 0%, 100% { text-shadow: 0 0 0 rgba(32, 136, 70, 0); } 50% { text-shadow: 0 0 10px rgba(32, 136, 70, 0.4); } }
+  @media (prefers-reduced-motion: reduce) { .pnode-active .pnode-count, .pnode-ok.pnode-active .pnode-count { animation: none; } }
+
+  .pipeline-branches { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.75rem; }
+  .pbranch { display: inline-flex; align-items: center; gap: 0.4rem; border: 1px dashed var(--scheme-outline-variant);
+    border-radius: 999px; padding: 0.35rem 0.8rem; font-family: var(--font-gabarito); font-size: 0.78rem; opacity: 0.55; }
+  .pbranch-count { font-weight: 700; }
+  .pbranch-note { opacity: 0.75; }
+  .pbranch.pnode-active { opacity: 1; border-style: solid; border-color: var(--warn); background: var(--warn-bg); }
+  .pbranch-err.pnode-active { border-color: var(--err); background: var(--err-bg); }
+
+  .pipeline-caption { margin-top: 0.6rem; opacity: 0.6; }
+
+  .pipeline-list { margin-top: 0.6rem; }
+  .pipeline-row { display: grid; grid-template-columns: auto auto minmax(0, 1.3fr) minmax(0, 1.5fr) 90px 46px;
+    align-items: center; gap: 0.7rem; padding: 0.5rem 0.75rem; border: 1px solid var(--scheme-outline-variant);
+    border-radius: 8px; background: var(--card-bg); font-family: var(--font-gabarito); font-size: 0.85rem; margin-bottom: 0.4rem; }
+  .pipeline-row.status-ok { border-left: 3px solid var(--ok); }
+  .pipeline-row.status-warn { border-left: 3px solid var(--warn); }
+  .pipeline-row.status-err { border-left: 3px solid var(--err); }
+  .pipeline-component, .pipeline-version { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pipeline-component { font-weight: 600; }
+  .pipeline-version { opacity: 0.75; font-size: 0.8rem; }
+  .pipeline-stage-label { font-size: 0.75rem; opacity: 0.7; }
+  .pipeline-elapsed { font-size: 0.75rem; opacity: 0.55; text-align: right; font-variant-numeric: tabular-nums; }
+
+  .pipeline-stepper { display: flex; gap: 0.25rem; }
+  .pdot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--scheme-outline-variant); flex: none; }
+  .pdot-done { background: var(--ok); }
+  .pdot-current { background: var(--accent); animation: pipeline-dot-pulse 1.4s ease-in-out infinite; }
+  @keyframes pipeline-dot-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(8, 17, 96, 0.4); } 50% { box-shadow: 0 0 0 4px rgba(8, 17, 96, 0); } }
+  @media (prefers-reduced-motion: reduce) { .pdot-current { animation: none; } }
 </style>
 </head>
 <body>
@@ -299,6 +348,10 @@
     <button hx-get="/partials/kb" hx-target="#tab-content" hx-swap="innerHTML"
             onclick="document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('active'));this.classList.add('active')">
       Knowledge Base
+    </button>
+    <button hx-get="/partials/pipeline" hx-target="#tab-content" hx-swap="innerHTML"
+            onclick="document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('active'));this.classList.add('active')">
+      Pipeline
     </button>
   </div>
 

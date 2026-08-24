@@ -140,6 +140,31 @@ _ESCALATED_STATUSES = {
 _OK_STATUSES = {TrackingStatus.CI_PASSED.value}
 _ERR_DISPLAY_STATUSES = _ESCALATED_STATUSES | {TrackingStatus.CI_FAILED.value}
 
+# Pipeline tab: collapses the 9 raw TrackingStatus values into the 4 stages
+# a finding visibly moves through, plus a side "escalated" bucket. There's no
+# per-finding "Scan"/"Classify" stage here on purpose -- a TrackingRecord
+# only ever exists for bucket 2/3 findings (see BUCKET_DEFINITIONS above);
+# bucket 1/4 findings go straight to a GitHub triage issue and never reach
+# this store at all, so classification isn't observable per-finding. The
+# Pipeline tab's "Intake" node is an aggregate count instead (see
+# _pipeline_context below), not a 5th stage in this mapping.
+_PIPELINE_STAGE = {
+    TrackingStatus.CREATED.value:            "fix",
+    TrackingStatus.PR_OPENED.value:          "pr_ci",
+    TrackingStatus.CI_PENDING.value:         "pr_ci",
+    TrackingStatus.CI_FAILED.value:          "retry",
+    TrackingStatus.RETRY_REQUESTED.value:    "retry",
+    TrackingStatus.CI_PASSED.value:          "done",
+    TrackingStatus.FAILED_MAX_RETRIES.value: "escalated",
+    TrackingStatus.ESCALATED.value:          "escalated",
+    TrackingStatus.ENGINE_ERROR.value:       "escalated",
+}
+_PIPELINE_STAGE_LABELS = {"fix": "Fix", "pr_ci": "PR / CI", "retry": "Retry", "done": "Done", "escalated": "Escalated"}
+# Linear order for the per-record dot stepper -- "escalated" is a side
+# branch off PR/CI, not a step on this line, so it's excluded here and shown
+# as its own "Needs Attention" list instead (see _pipeline_context).
+_STEPPER_STAGES = ["fix", "pr_ci", "retry", "done"]
+
 
 def _status_class(status: str) -> str:
     if status in _OK_STATUSES:
@@ -454,6 +479,82 @@ def _run_history_context(records: list, status: str = "", component: str = "", r
     }
 
 
+def _format_elapsed(updated_at: str, now: datetime) -> str:
+    try:
+        updated = datetime.fromisoformat(updated_at)
+    except (TypeError, ValueError):
+        return ""
+    seconds = max(0, int((now - updated).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h"
+
+
+def _dot_states(stage: str) -> list:
+    """Per-record state ("done"/"current"/"pending") for each dot in the
+    4-step stepper -- computed here rather than in the template so the
+    template just renders, it doesn't do index arithmetic.
+    """
+    if stage not in _STEPPER_STAGES:
+        return ["pending"] * len(_STEPPER_STAGES)
+    pos = _STEPPER_STAGES.index(stage)
+    return ["done" if i < pos else "current" if i == pos else "pending" for i in range(len(_STEPPER_STAGES))]
+
+
+def _pipeline_context() -> dict:
+    records = _records_as_dicts()
+
+    # A retry writes a NEW TrackingRecord per attempt (same pr_number, higher
+    # attempt_number) -- only the latest attempt reflects where that PR
+    # actually is right now, same "collapse to latest per pr_number" logic
+    # partial_metrics already uses above. A record with no pr_number yet
+    # (status=CREATED) has nothing to collapse -- it stands on its own.
+    latest_by_pr: dict = {}
+    standalone: list = []
+    for r in records:
+        pr = r.get("pr_number")
+        if pr is None:
+            standalone.append(r)
+            continue
+        prev = latest_by_pr.get(pr)
+        if prev is None or (r.get("attempt_number") or 0) >= (prev.get("attempt_number") or 0):
+            latest_by_pr[pr] = r
+    current = standalone + list(latest_by_pr.values())
+
+    now = datetime.now(tz=timezone.utc)
+    counts = {key: 0 for key in _PIPELINE_STAGE_LABELS}
+    in_flight: list = []
+    needs_attention: list = []
+    for r in current:
+        stage = _PIPELINE_STAGE.get(r["status"])
+        if stage is None:
+            continue
+        counts[stage] += 1
+        row = dict(r)
+        row["pipeline_stage"] = stage
+        row["elapsed"] = _format_elapsed(r.get("updated_at"), now)
+        row["dot_states"] = _dot_states(stage)
+        if stage in ("fix", "pr_ci", "retry"):
+            in_flight.append(row)
+        elif stage == "escalated":
+            needs_attention.append(row)
+
+    in_flight.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+    needs_attention.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+
+    return {
+        "counts": counts,
+        "stage_labels": _PIPELINE_STAGE_LABELS,
+        "stepper_stages": _STEPPER_STAGES,
+        "in_flight": in_flight,
+        "needs_attention": needs_attention,
+        "intake": {"count": _scan_finding_count(), "fixer_active": _fixer_active()},
+    }
+
+
 @app.get("/partials/run-history")
 def partial_run_history(request: Request, status: str = "", component: str = "", repo: str = ""):
     records = _records_as_dicts()
@@ -479,6 +580,11 @@ def partial_retry_lineage(request: Request, pr_number: str = ""):
         "selected_pr": selected_pr,
         "lineage": lineage,
     })
+
+
+@app.get("/partials/pipeline")
+def partial_pipeline(request: Request):
+    return templates.TemplateResponse(request, "partials/pipeline.html", _pipeline_context())
 
 
 @app.get("/partials/metrics")
