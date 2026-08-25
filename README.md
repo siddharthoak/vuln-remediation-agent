@@ -143,9 +143,10 @@ The workflow runs three scanners — OWASP Dependency-Check (~4 min), Trivy (~1 
 | Clone | Local hardlink clone of `GITHUB_REPO_TARGET` into a temp directory |
 | Bump pom.xml | XML-parser rewrite of the dependency version — never string-replace |
 | KB context | If a KB entry exists (tier1_learned / tier2_playbook / knowledge_agent), it is rendered into `FRESH_FIX_PROMPT` — breaking changes, migration steps, and find/replace patterns become ground truth for Gemini |
-| Gemini tool-use loop | ADK `Agent` runs `FRESH_FIX_PROMPT` with four tools: `grep_files` → `read_file` → `apply_file_change` → `run_maven_compile` |
-| Self-correction | If `run_maven_compile` returns `FAILURE`, Gemini reads stderr and calls `apply_file_change` again. Repeats until compile passes or model ends the turn. |
-| Commit + push | Branch `fix/<component>-<safe-version>` pushed. Only after compile gate passes. |
+| Gemini tool-use loop | ADK `Agent` runs `FRESH_FIX_PROMPT` with five tools: `grep_files` → `read_file` → `apply_file_change` → `run_maven_compile` / `run_maven_test` |
+| Self-correction | If `run_maven_compile` returns `FAILURE`, Gemini reads stderr and calls `apply_file_change` again; after compilation it can run `run_maven_test`. |
+| Fast path / safety gate | A successful post-bump compile skips the LLM and records a pom.xml-only change. Before commit/push, a deterministic diff review rejects unexpected changes and verifies the requested version. |
+| Commit + push | Branch `fix/<component>-<safe-version>` pushed only after compile and diff gates pass. |
 | Open PR | Idempotent: skips if a PR from that branch already exists. |
 | Update record | `PR_OPENED` → `CI_PENDING` with `pr_number`, `branch_name`, `kb_bucket`, token usage. |
 
@@ -252,7 +253,7 @@ Set `MAX_RETRY_ATTEMPTS=1` in `config/.env` to reach `FAILED_MAX_RETRIES` quickl
 | **Retry exhaustion** | `MAX_RETRY_ATTEMPTS=1`; force CI failure | Record reaches `FAILED_MAX_RETRIES` after one retry; PR gets escalation comment |
 | **New CVE mid-run** | Add a new vulnerable dep; trigger scan again | ScanPoller detects the new completed run; only the new finding gets a fresh PR |
 | **Single scanner** | Remove `grype-report.json` from `scan-reports/` | Fixer logs a warning; continues with Trivy + OWASP DC only |
-| **Compile error recovery** | Upgrade a library with a known API removal | First `run_maven_compile` fails; Gemini reads stderr, calls `apply_file_change` again; second compile passes |
+| **Compile error recovery** | Upgrade a library with a known API removal | First `run_maven_compile` fails; Gemini reads stderr, calls `apply_file_change` again; second compile passes and tests can run |
 | **Idempotent PR** | Scan poller fires twice for the same run | Checkpoint prevents re-download; already-open PRs are skipped |
 | **B1 triage issue** | Scan report contains `UNKNOWN` as safe version | Classifier assigns Bucket 1; GitHub Issue opened; no PR created; no Gemini call |
 | **B4 framework triage** | Spring Boot 3→4 with no KB entry | Bucket 4; GitHub Issue with `oss-remediation-triage` label; Fixer not invoked |

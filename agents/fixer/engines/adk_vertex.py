@@ -23,7 +23,7 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
-from ecosystems.maven import compile_repo
+from ecosystems.maven import compile_repo, test_repo
 from engines.base import FixResult
 
 logger = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ class CodeFixerError(Exception):
 
 class AdkVertexEngine:
     """Runs a fix prompt through an ADK Agent on Vertex AI (Gemini), giving
-    it four local FunctionTools (read/grep/apply_change/compile) to edit the
+    it five local FunctionTools (read/grep/apply_change/compile/test) to edit the
     cloned repo in place.
     """
 
@@ -75,11 +75,16 @@ class AdkVertexEngine:
             """Compile the repository with 'mvn compile -q'. No tests are executed."""
             return self._tool_run_maven_compile()
 
+        def run_maven_test() -> str:
+            """Run the repository tests with 'mvn -B test -q'."""
+            return self._tool_run_maven_test()
+
         tools = [
             FunctionTool(func=read_file),
             FunctionTool(func=grep_files),
             FunctionTool(func=apply_file_change),
             FunctionTool(func=run_maven_compile),
+            FunctionTool(func=run_maven_test),
         ]
 
         agent = Agent(
@@ -227,4 +232,9 @@ class AdkVertexEngine:
     def _tool_run_maven_compile(self) -> str:
         """Compile the repository with 'mvn compile -q'. No tests are executed."""
         _, message = compile_repo(self._repo_path)
+        return message
+
+    def _tool_run_maven_test(self) -> str:
+        """Run the repository tests with 'mvn -B test -q'."""
+        _, message = test_repo(self._repo_path)
         return message

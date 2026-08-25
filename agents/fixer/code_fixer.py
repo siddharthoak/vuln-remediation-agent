@@ -16,10 +16,10 @@ logic; they only moved where that logic lives.
 
 What is UNCHANGED (verbatim from nexus-remediation-agent):
   - ChangeSummary dataclass
-  - FRESH_FIX_PROMPT and RETRY_FIX_PROMPT strings
+  - FRESH_FIX_PROMPT and RETRY_FIX_PROMPT structure
   - pom.xml editing semantics (now in ecosystems/maven.py, not this class)
   - run_fresh_fix() and run_retry_fix() public entry points
-  - _execute_fix() structure
+  - _execute_fix() routing and retry semantics
   - InvalidRetryError
 
 CodeFixerError (ADK's model-response parsing) lives in engines.adk_vertex.
@@ -60,7 +60,7 @@ class ChangeSummary:
     completion_tokens: Optional[int] = None
 
 
-# ── Prompt templates (UNCHANGED from nexus-remediation-agent) ─────────────────
+# ── Prompt templates ─────────────────────────────────────────────────────────
 
 FRESH_FIX_PROMPT = """\
 You are a Java/Maven dependency upgrade specialist. Apply the MINIMAL set of code
@@ -79,6 +79,10 @@ changes required to upgrade a specific dependency from one version to another.
 - `read_file(relative_path)` — read a file's full content.
 - `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
 - `run_maven_compile()` — run 'mvn compile -q'. No tests. Returns compiler error output on failure.
+- `run_maven_test()` — run 'mvn -B test -q' with a bounded timeout. Returns test failure output.
+The ADK engine provides both verification tools. Engines without local function-tool
+support (currently Gemini CLI, whose shell tool is disabled for safety) cannot run
+these commands; the CI test gate remains authoritative for those runs.
 
 ## Your workflow
 1. Call grep_files with the import/package pattern for {component_name}
@@ -91,7 +95,8 @@ changes required to upgrade a specific dependency from one version to another.
    Do NOT edit pom.xml — the version bump is already applied.
 5. Call run_maven_compile to verify the changes compile cleanly.
 6. If compilation fails: read the error, inspect the affected files, apply corrections, compile again.
-7. When compilation succeeds (or if no source changes are needed), return end_turn with JSON.
+7. Call run_maven_test when compilation succeeds to catch runtime/test regressions.
+8. When compilation and tests succeed (or if no source changes are needed), return end_turn with JSON.
 
 ## CRITICAL CONSTRAINTS
 - Only apply changes strictly required by the version upgrade.
@@ -127,6 +132,10 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 - `read_file(relative_path)` — read a file's full content.
 - `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
 - `run_maven_compile()` — run 'mvn compile -q'. No tests. Returns compiler error output on failure.
+- `run_maven_test()` — run 'mvn -B test -q' with a bounded timeout. Returns test failure output.
+The ADK engine provides both verification tools. Engines without local function-tool
+support (currently Gemini CLI, whose shell tool is disabled for safety) cannot run
+these commands; the CI test gate remains authoritative for those runs.
 
 ## Your workflow
 1. Analyse the CI failure log to identify the ROOT CAUSE.
@@ -135,7 +144,8 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
    Do NOT repeat the same change from the previous attempt unless the log shows it was incomplete.
 4. Call run_maven_compile to verify the fix compiles cleanly.
 5. If compilation fails: read the error, inspect affected files, apply corrections, compile again.
-6. When compilation succeeds, return end_turn with JSON.
+6. Call run_maven_test when compilation succeeds to catch runtime/test regressions.
+7. When compilation and tests succeed, return end_turn with JSON.
 
 ## CRITICAL CONSTRAINTS
 - Fix only what the CI failure log tells you is broken.
@@ -347,10 +357,13 @@ class CodeFixer:
         kb_entry=None,
         is_retry: bool = False,
     ) -> ChangeSummary:
+        bumped = False
+        compile_failure = None
         try:
             self._ecosystem.bump_direct_dependency(
                 self._repo_path, component_name, current_version, target_version
             )
+            bumped = True
         except PomXMLError:
             if not is_retry:
                 return self._execute_transitive_fix(
@@ -363,13 +376,39 @@ class CodeFixer:
             # A retry runs on a branch where the original manifest change is
             # already present. Do not mistake the missing old version for a
             # transitive finding; send the CI failure to the repair engine.
+        if bumped:
+            compiled, compile_message = self._ecosystem.verify_build(self._repo_path)
+            if compiled:
+                return ChangeSummary(
+                    component_name=component_name,
+                    old_version=current_version,
+                    new_version=target_version,
+                    files_changed=["pom.xml"],
+                    rationale=(
+                        f"Dependency upgraded from {current_version} to {target_version} "
+                        "in pom.xml; the repository compiled successfully without source changes."
+                    ),
+                    cve_ids=cve_ids,
+                )
+            compile_failure = compile_message
+            logger.warning(
+                "%s: direct dependency bump did not compile cleanly; "
+                "falling back to FixEngine. %s",
+                component_name,
+                compile_message[:200],
+            )
+        prompt_failure = failure_log_excerpt
+        if compile_failure:
+            prompt_failure = (
+                f"{failure_log_excerpt}\n\n" if failure_log_excerpt else ""
+            ) + "Compile verification after the pom.xml bump failed:\n" + compile_failure
         file_listing = self._build_file_listing()
         prompt = self._build_prompt(
             component_name=component_name,
             current_version=current_version,
             target_version=target_version,
             file_listing=file_listing,
-            failure_log_excerpt=failure_log_excerpt,
+            failure_log_excerpt=prompt_failure,
             kb_entry=kb_entry,
         )
         result = self._engine.run_fix(self._repo_path, prompt)

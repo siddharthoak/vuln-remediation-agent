@@ -137,21 +137,25 @@ This is orchestrated by `_do_fresh_scan()` in `agents/fixer/main.py:143`, up to
    reference (`${some.version}`, rewrites the property), and a BOM-managed dependency with
    no explicit `<version>` (adds one). If the dependency element isn't found in `pom.xml` at
    all, this raises `PomXMLError` — see §6, this is the transitive-dependency gap.
+   A direct bump is compiled immediately; when compilation succeeds, the fixer skips the
+   LLM and records a pom.xml-only change with no token usage.
 4. **Gemini tool-use loop.** `CodeFixer._call_model()` builds either `FRESH_FIX_PROMPT` or
    `RETRY_FIX_PROMPT` (`code_fixer.py:68` / `:111`) and hands it to a Google ADK `Agent` with
-   four tools:
+   five tools:
    - `grep_files(pattern, extensions?)`
    - `read_file(relative_path)`
    - `apply_file_change(relative_path, find, replace, ...)` — the `find` string must be an
      **exact verbatim substring** the model already saw via `read_file`; this is the main
      guardrail against hallucinated edits.
-   - `run_maven_compile()` — runs `mvn compile -q`, no tests.
+   - `run_maven_compile()` — runs `mvn compile -q`.
+   - `run_maven_test()` — runs `mvn -B test -q` with a bounded timeout.
    The model is expected to grep for usages, read the affected files, apply the minimal edit,
    and compile. If compile fails, it reads the stderr and tries again — up to `MAX_TOOL_ROUNDS
-   = 10` LLM turns (`code_fixer.py:48`). **Compilation success is the only automated gate
-   before a PR is opened** — there's no test run, no lint, no review pass. Keep that in mind
-   for §5 and §7.
-5. **Commit + push.** Only after the tool loop returns cleanly.
+   = 10` LLM turns (`code_fixer.py:48`). The ADK engine can then run the test suite; the
+   Gemini CLI engine cannot expose local function tools while shell execution is disabled,
+   so CI remains its authoritative test gate.
+5. **Diff review, commit + push.** A deterministic read-only review derives the actual git
+   diff, rejects unexpected files, and verifies the requested pom.xml version before commit.
 6. **Open PR.** `PRClient.open_remediation_pr()` — idempotent, returns the existing PR if one
    is already open for that branch.
 7. **Tracking record.** Every finding gets a `TrackingRecord`
@@ -223,32 +227,18 @@ isn't worth it without either a known safe version or migration ground truth.
 
 ## 5. Can we reuse the existing `/code-review` skill here?
 
-Worth understanding what's *not* currently in the loop: nothing reviews the LLM's diff for
-quality or correctness before the PR goes up. The only automated gate is
-`mvn compile -q` — no tests, no lint, no "does this edit still make semantic sense" check.
+The fixer now performs a deterministic, read-only diff review before commit. It derives the
+actual git diff, rejects unexpected files or untracked changes, and verifies that the
+requested dependency resolves to the target version in `pom.xml`. This is intentionally
+narrower than a generic semantic code review.
 `FRESH_FIX_PROMPT` even tells the model to self-report via a JSON rationale block, but nobody
 reads that rationale critically before opening the PR.
 
-Claude Code's built-in `code-review` skill (what `/code-review` invokes) is designed to scan
-a diff for correctness bugs and reuse/simplification issues — that's a reasonable fit for
-*exactly* the gap above. A plausible integration point: after step 4.4 (compile succeeds,
-before step 4.5 commit+push) or as a required CI check on `fix/*` PRs, run a review pass over
-the diff and either block the PR / auto-retry on findings, or surface them as a PR comment
-for the human reviewer to triage faster.
+The review runs after the fix summary and before commit/push/PR creation. A failure is
+persisted as `ESCALATED` and opens a triage issue; no commit or PR is created.
 
-Two things to work out before proposing this as a real change:
-- **Where it runs.** Inline inside `code_fixer.py` (another tool-use round, another Gemini or
-  Claude call, delays the PR) vs. as a separate CI/GitHub Action step on the opened PR
-  (async, doesn't block PR creation, but means bad PRs are visible before they're caught).
-- **What "finding" means for a machine-generated dependency-bump diff.** The skill is tuned
-  for human-authored diffs; a diff whose entire mandate is "only change what's strictly
-  required by the version bump" has a much narrower correctness surface (wrong import,
-  incomplete find/replace, unrelated refactor the model wasn't supposed to make) — those are
-  worth checking for, but generic "is this good code" review may be noisy here.
-
-This is a genuinely open question, not a decided plan — raise it with the team before
-building it. Read the `code-review` skill definition to see what signal it actually produces
-before committing to an integration shape.
+This review does not replace human review or CI; it is a pre-commit safety gate for the
+machine-generated dependency bump.
 
 ---
 
@@ -260,16 +250,13 @@ any dependency, any language construct, without anyone having to hand-write a mi
 every possible library. That generality is also its weakness. Things worth knowing about, and
 raising if you see them bite in practice:
 
-- **No test gate.** `run_maven_compile()` only compiles; it never runs the target repo's test
-  suite. A fix can compile and still be behaviorally wrong. Adding an opt-in
-  `run_maven_test()` tool (with a timeout, since test suites can be slow) is a fairly direct
-  improvement, at the cost of slower fix cycles and possible false failures from flaky tests.
+- **Runtime verification.** The ADK engine exposes `run_maven_test()` (`mvn -B test -q`) with
+  a bounded timeout after compilation. The Gemini CLI engine cannot expose local function
+  tools while shell execution is disabled; CI remains its authoritative test gate.
 - **Buckets 2/3 could sometimes skip the LLM entirely.** A same-major/patch-level bump
   (bucket 2, patch case) very often needs *only* the `pom.xml` version bump — no source
-  changes at all. Right now every bucket-2/3 finding still pays for a full tool-use loop even
-  when `apply_file_change` is never called. A cheap pre-check (does `mvn compile` already
-  succeed right after the version bump, before invoking the model at all?) could skip the LLM
-  round trip for the common case and only escalate to the agent on compile failure.
+  changes at all. The fixer now compiles immediately after a direct bump and returns a
+  pom.xml-only summary without an LLM call when that succeeds.
 - **Tier-2 playbooks are structurally similar to [OpenRewrite](https://docs.openrewrite.org/)
   recipes** (well-known Java refactoring/migration tool with existing recipes for Log4j,
   Spring Boot, etc.). For the handful of well-known frameworks in `COMPLEX_FRAMEWORKS`, a

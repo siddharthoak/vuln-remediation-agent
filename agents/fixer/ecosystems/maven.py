@@ -3,7 +3,7 @@
 The only ecosystem this POC actually supports. Everything Maven/pom.xml-
 specific lives here: dependency-tree resolution (locality), the two pom.xml
 edit paths (direct-dependency bump, dependencyManagement override), and
-build verification (`mvn compile`). CodeFixer and main.py never touch pom.xml
+build/test verification (`mvn compile` and `mvn -B test -q`). CodeFixer and main.py never touch pom.xml
 or shell out to `mvn` directly -- they only call through this class via the
 PackageEcosystem protocol (ecosystems/base.py).
 
@@ -293,6 +293,9 @@ class MavenEcosystem:
     def verify_build(self, repo_path: Path) -> Tuple[bool, str]:
         return compile_repo(repo_path)
 
+    def verify_tests(self, repo_path: Path) -> Tuple[bool, str]:
+        return test_repo(repo_path)
+
 
 def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str]:
     """Runs `mvn compile -q --batch-mode` in repo_path. Returns (success, message).
@@ -319,6 +322,33 @@ def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str
 
     output = (
         f"mvn compile: FAILED (exit code {result.returncode})\n\n"
+        f"STDERR:\n{result.stderr[:10_000]}"
+    )
+    if result.stdout.strip():
+        output += f"\n\nSTDOUT:\n{result.stdout[:5_000]}"
+    return False, output
+
+
+def test_repo(repo_path: Path, timeout_seconds: int = 600) -> Tuple[bool, str]:
+    """Runs the Maven test suite with a bounded timeout."""
+    try:
+        result = subprocess.run(
+            ["mvn", "-B", "test", "-q"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError:
+        return False, "ERROR: mvn not found — Maven must be installed in the container image."
+    except subprocess.TimeoutExpired:
+        return False, f"ERROR: mvn test timed out after {timeout_seconds} seconds."
+
+    if result.returncode == 0:
+        return True, "mvn test: SUCCESS — all tests passed."
+
+    output = (
+        f"mvn test: FAILED (exit code {result.returncode})\n\n"
         f"STDERR:\n{result.stderr[:10_000]}"
     )
     if result.stdout.strip():

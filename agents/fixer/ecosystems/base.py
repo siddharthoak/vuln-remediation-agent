@@ -72,3 +72,9 @@ class PackageEcosystem(Protocol):
         the FixEngine fallback), not an exceptional one.
         """
         ...
+
+    def verify_tests(self, repo_path: Path) -> Tuple[bool, str]:
+        """Runs the ecosystem's runtime test suite. Never raises -- returns
+        (success, message), including for missing tooling and timeouts.
+        """
+        ...

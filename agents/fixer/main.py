@@ -15,12 +15,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json as _json
+from types import SimpleNamespace
 
 from github import Github
 from scan_report_client import ScanReportClient, ScanReportError
 from scan_fetcher import ScanFetcher, ScanFetchError
 from scan_poller import ScanPoller
-from repo_ops import RepoOps
+from repo_ops import DiffReviewResult, RepoOps
 from code_fixer import CodeFixer, InvalidRetryError
 from pr_client import PRClient
 from engines.base import EngineExecutionError
@@ -393,6 +394,63 @@ def _do_fresh_scan():
                     )
                 return None
 
+            tests_passed, test_message = ecosystem.verify_tests(repo._local_path)
+            if not tests_passed:
+                message = (
+                    f"Runtime verification failed for {finding.component_name}: "
+                    f"{test_message[:3500]}"
+                )
+                logger.error("%s", message)
+                current = tracking_store.get(record.tracking_id)
+                if current is not None:
+                    current.status = TrackingStatus.ESCALATED.value
+                    current.failure_log_excerpt = message[:4000]
+                    tracking_store.update(current)
+                try:
+                    pr_client.open_triage_issue(
+                        finding=finding,
+                        bucket=2,
+                        rationale=message,
+                        kb_entry=kb_entry,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not open triage issue after runtime verification "
+                        "failure for %s.",
+                        finding.component_name,
+                    )
+                return None
+
+            try:
+                review = repo.review_dependency_diff(
+                    component_name=finding.component_name,
+                    target_version=finding.recommended_version,
+                    expected_files=summary.files_changed,
+                )
+            except Exception as exc:
+                review = DiffReviewResult(False, f"Diff review could not run: {exc}")
+            if not review.passed:
+                message = f"Automated diff review failed: {review.message}"
+                logger.error("%s", message)
+                current = tracking_store.get(record.tracking_id)
+                if current is not None:
+                    current.status = TrackingStatus.ESCALATED.value
+                    current.failure_log_excerpt = message[:4000]
+                    tracking_store.update(current)
+                try:
+                    pr_client.open_triage_issue(
+                        finding=finding,
+                        bucket=2,
+                        rationale=message,
+                        kb_entry=kb_entry,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not open triage issue after diff review failure for %s.",
+                        finding.component_name,
+                    )
+                return None
+
             fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"
             commit_msg = (
                 f"fix: upgrade {finding.component_name} to {finding.recommended_version} ({fix_kind})"
@@ -502,6 +560,41 @@ def _run_retry(tracking_id: str):
                     record.pr_number, comment_exc,
                 )
             sys.exit(1)
+
+        try:
+            review = repo.review_dependency_diff(
+                component_name=record.component_name,
+                target_version=record.new_version,
+                expected_files=summary.files_changed,
+                allow_manifest_already_applied=True,
+            )
+        except Exception as exc:
+            review = DiffReviewResult(False, f"Diff review could not run: {exc}")
+        if not review.passed:
+            message = f"Automated diff review failed: {review.message}"
+            logger.error("%s", message)
+            record.status = TrackingStatus.ESCALATED.value
+            record.failure_log_excerpt = message[:4000]
+            tracking_store.update(record)
+            triage_finding = SimpleNamespace(
+                component_name=record.component_name,
+                current_version=record.old_version,
+                recommended_version=record.new_version,
+                severity="unknown",
+                cve_ids=[record.vulnerability_id] if record.vulnerability_id else [],
+            )
+            try:
+                PRClient(repo_full_name=github_repo, github_pat=github_pat).open_triage_issue(
+                    finding=triage_finding,
+                    bucket=2,
+                    rationale=message,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not open triage issue after retry diff review failure for %s.",
+                    record.component_name,
+                )
+            return
 
         commit_msg = (
             f"fix(retry): attempt {record.attempt_number} — "

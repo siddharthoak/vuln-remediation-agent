@@ -8,7 +8,11 @@ the operations testable without a real git binary and avoids PAT leakage in shel
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -19,6 +23,133 @@ logger = logging.getLogger(__name__)
 
 class RepoBranchExistsError(Exception):
     """Raised when the deterministic branch name already exists remotely."""
+
+
+@dataclass
+class DiffReviewResult:
+    passed: bool
+    message: str = ""
+    changed_files: tuple = ()
+
+
+def review_dependency_diff(
+    repo_path: str | Path,
+    component_name: str,
+    target_version: str,
+    expected_files: list,
+    allow_manifest_already_applied: bool = False,
+) -> DiffReviewResult:
+    """Read-only, deterministic review of the working-tree remediation diff."""
+    path = Path(repo_path)
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=str(path), capture_output=True, text=True, timeout=30,
+        )
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=str(path), capture_output=True, text=True, timeout=30,
+        )
+        pom_diff = subprocess.run(
+            ["git", "diff", "HEAD", "--", "pom.xml"],
+            cwd=str(path), capture_output=True, text=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return DiffReviewResult(False, f"Could not inspect git diff: {exc}")
+    if status.returncode != 0 or diff.returncode != 0 or pom_diff.returncode != 0:
+        return DiffReviewResult(
+            False,
+            "Could not inspect git diff: "
+            f"{(status.stderr or diff.stderr or pom_diff.stderr).strip()[:1000]}",
+        )
+
+    changed = set()
+    untracked = []
+    for line in status.stdout.splitlines():
+        if len(line) < 3:
+            continue
+        name = line[3:]
+        if " -> " in name:
+            return DiffReviewResult(False, f"Renamed files are not allowed: {name}")
+        if line.startswith("??"):
+            untracked.append(name)
+        else:
+            changed.add(name)
+    changed.update(name for name in diff.stdout.splitlines() if name)
+    if untracked:
+        return DiffReviewResult(
+            False, f"Unexpected untracked files in remediation diff: {', '.join(untracked)}",
+            tuple(sorted(changed | set(untracked))),
+        )
+
+    expected = {str(name).replace("\\", "/") for name in expected_files if name}
+    expected.add("pom.xml")
+    changed_normalized = {name.replace("\\", "/") for name in changed}
+    # The manifest is already committed on a retry branch, so it need not be
+    # present in the working-tree diff; every source edit must be accounted for.
+    unexpected = changed_normalized - expected
+    missing_source = (expected - {"pom.xml"}) - changed_normalized
+    if unexpected or missing_source:
+        details = []
+        if unexpected:
+            details.append(f"unexpected files: {', '.join(sorted(unexpected))}")
+        if missing_source:
+            details.append(f"reported files absent from diff: {', '.join(sorted(missing_source))}")
+        return DiffReviewResult(False, "Diff review failed — " + "; ".join(details), tuple(sorted(changed_normalized)))
+    if "pom.xml" not in changed_normalized and not allow_manifest_already_applied:
+        return DiffReviewResult(
+            False,
+            "Diff review failed — pom.xml is not part of the working-tree diff.",
+            tuple(sorted(changed_normalized)),
+        )
+    if "pom.xml" in changed_normalized and target_version not in pom_diff.stdout:
+        return DiffReviewResult(
+            False,
+            f"Diff review failed — pom.xml diff does not contain requested version {target_version}.",
+            tuple(sorted(changed_normalized)),
+        )
+
+    pom_path = path / "pom.xml"
+    if not pom_path.exists():
+        return DiffReviewResult(False, "Diff review failed — pom.xml is missing.", tuple(sorted(changed_normalized)))
+    try:
+        root = ET.parse(str(pom_path)).getroot()
+    except ET.ParseError as exc:
+        return DiffReviewResult(False, f"Diff review failed — pom.xml is invalid: {exc}", tuple(sorted(changed_normalized)))
+
+    parts = component_name.split(":")
+    group_id = parts[0] if len(parts) > 1 else None
+    artifact_id = parts[-1]
+    def local(tag):
+        return tag.rsplit("}", 1)[-1]
+
+    properties = {
+        local(child.tag): (child.text or "").strip()
+        for parent in root.iter()
+        if local(parent.tag) == "properties"
+        for child in parent
+    }
+    matches = []
+    for dependency in root.iter():
+        if local(dependency.tag) != "dependency":
+            continue
+        values = {local(child.tag): (child.text or "").strip() for child in dependency}
+        if values.get("artifactId") != artifact_id:
+            continue
+        if group_id is not None and values.get("groupId") != group_id:
+            continue
+        version = values.get("version", "")
+        if version.startswith("${") and version.endswith("}"):
+            version = properties.get(version[2:-1], version)
+        matches.append(version)
+    if target_version not in matches:
+        return DiffReviewResult(
+            False,
+            f"Diff review failed — {component_name} does not resolve to requested version "
+            f"{target_version} in pom.xml.",
+            tuple(sorted(changed_normalized)),
+        )
+    return DiffReviewResult(True, "Diff review passed.", tuple(sorted(changed_normalized)))
 
 
 class RepoOps:
@@ -159,6 +290,17 @@ class RepoOps:
         origin = self._repo.remotes.origin
         origin.push(refspec=f"{branch_name}:{branch_name}")
         logger.info("Pushed branch %s to origin", branch_name)
+
+    def review_dependency_diff(
+        self, component_name: str, target_version: str, expected_files: list,
+        allow_manifest_already_applied: bool = False,
+    ) -> DiffReviewResult:
+        """Review the current working tree before it can be committed."""
+        self._require_repo()
+        return review_dependency_diff(
+            self._local_path, component_name, target_version, expected_files,
+            allow_manifest_already_applied=allow_manifest_already_applied,
+        )
 
     def cleanup(self) -> None:
         """Remove the local clone directory. Safe to call multiple times."""
