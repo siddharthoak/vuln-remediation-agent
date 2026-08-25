@@ -298,10 +298,14 @@ Trivy/Grype/OWASP-DC all report on whatever `mvn dependency:tree` would show —
 `xstream`, which nobody imported directly but which `some-parent-library` pulls in
 transitively, shows up as a finding exactly like a direct dependency would.
 
-Direct findings are bumped in their declared dependency entry. One-hop transitive findings
-are pinned through a project-level `<dependencyManagement>` override; deeper or higher-risk
-chains are routed to a triage issue. If resolution or XML processing fails, the finding is
-also surfaced as triage rather than being silently left in `CREATED`.
+Direct findings are bumped in their declared dependency entry. A transitive finding at
+dependency-tree depth 2 (one hop below a direct dependency) is pinned through a
+project-level `<dependencyManagement>` override. Deeper chains (depth 3 or greater) and
+transitive findings introduced by a complex framework are routed to a triage issue rather
+than automatically changed. If locality resolution or XML processing fails, the finding is
+also surfaced as triage rather than being silently left in `CREATED`; unexpected fix
+failures are persisted as `ESCALATED` with an error excerpt and likewise receive a triage
+issue.
 
 **How transitive vulnerabilities are actually meant to be fixed in Maven** — pick whichever
 applies:

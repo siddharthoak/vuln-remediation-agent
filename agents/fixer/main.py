@@ -35,7 +35,7 @@ from common.tracking_store import (
 )
 from common.knowledge_store import make_knowledge_store
 from knowledge.main import KnowledgeAgent
-from classifier.classifier import Classifier
+from classifier.classifier import Classifier, ClassifierResult
 
 logging.basicConfig(
     level=logging.INFO,
@@ -202,18 +202,24 @@ def _do_fresh_scan():
     # ── Locality resolution (direct vs. transitive) ───────────────────────────
     # Ecosystem-pluggable (see ecosystems/) -- Maven-only, single-module POC
     # scope today. A finding whose locality can't be determined defaults to
-    # is_transitive=False, i.e. falls back to today's pre-existing behavior
-    # (attempt a direct manifest bump) rather than blocking the whole batch
-    # on one lookup failure.
+    # A locality-tool failure is routed to triage; a clean lookup that does not
+    # contain the finding is treated as a stale report and keeps the legacy
+    # direct-dependency fallback.
     ecosystem = get_ecosystem(source_path)
+    locality_failures = {}
     for finding in findings:
         try:
             locality = ecosystem.resolve_locality(source_path, finding.component_name)
         except EcosystemError as exc:
-            logger.warning(
-                "Locality resolution failed for %s: %s -- treating as direct.",
+            rationale = (
+                f"Could not resolve dependency locality for {finding.component_name}: "
+                f"{str(exc)[:1000]}. Manual triage required."
+            )
+            logger.error(
+                "Locality resolution failed for %s -- opening triage issue: %s",
                 finding.component_name, exc,
             )
+            locality_failures[finding.component_name] = rationale
             continue
         if not locality.found:
             logger.warning(
@@ -242,7 +248,13 @@ def _do_fresh_scan():
     # Classify all findings; bucket 1/4 get triage issues and are skipped from fixing
     classification = {}  # finding.component_name → ClassifierResult
     for finding in findings:
-        result = classifier.classify(finding)
+        if finding.component_name in locality_failures:
+            result = ClassifierResult(
+                bucket=4,
+                rationale=locality_failures[finding.component_name],
+            )
+        else:
+            result = classifier.classify(finding)
         classification[finding.component_name] = result
         logger.info(
             "Classifier: %s → bucket %d (%s)",
@@ -353,7 +365,32 @@ def _do_fresh_scan():
                 tracking_store.update(current)
                 return None
             except Exception as exc:
-                logger.error("Fix failed for %s: %s", finding.component_name, exc)
+                logger.exception("Fix failed for %s", finding.component_name)
+                current = tracking_store.get(record.tracking_id)
+                if current is not None:
+                    current.status = TrackingStatus.ESCALATED.value
+                    current.failure_log_excerpt = str(exc)[:4000]
+                    tracking_store.update(current)
+                else:
+                    logger.error(
+                        "Could not update tracking record %s after fix failure.",
+                        record.tracking_id[:8],
+                    )
+                try:
+                    pr_client.open_triage_issue(
+                        finding=finding,
+                        bucket=2,
+                        rationale=(
+                            "Automatic remediation failed unexpectedly and requires "
+                            f"manual investigation: {str(exc)[:1000]}"
+                        ),
+                        kb_entry=kb_entry,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not open triage issue for failed fix %s.",
+                        finding.component_name,
+                    )
                 return None
 
             fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"

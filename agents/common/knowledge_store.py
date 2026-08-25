@@ -6,7 +6,7 @@ Three tiers, all stored in the same backend:
   knowledge_agent   — written by the Knowledge Agent from web-fetched release notes
   tier1_learned     — written by the Watcher after a CI_PASSED fix is confirmed
 
-Lookup priority: tier1_learned > tier2_playbook > knowledge_agent hi
+Lookup priority: tier1_learned > tier2_playbook > knowledge_agent
 
 Backends:
   FileKnowledgeStore   — ./data/kb.json (local Docker / dev)

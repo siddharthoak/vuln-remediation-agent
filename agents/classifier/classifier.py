@@ -103,7 +103,7 @@ class Classifier:
                 reason = (
                     f"introduced by complex framework {finding.introduced_by}"
                     if introduced_by_complex
-                    else f"chain depth {finding.transitive_depth} (>2 hops from a direct dependency)"
+                    else f"chain depth {finding.transitive_depth} (more than one hop from a direct dependency)"
                 )
                 return ClassifierResult(
                     bucket=4,
