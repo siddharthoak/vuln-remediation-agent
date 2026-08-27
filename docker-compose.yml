@@ -10,9 +10,10 @@ services:
   #   2. HTTP server on :8080 — accepts POST /retry from the Watcher when
   #      a remediation PR fails CI and needs another fix attempt.
   fixer-server:
+    image: vuln-remediation-agent_fixer-server
     build:
       context: .
-      dockerfile: agents/fixer/Dockerfile
+      dockerfile: ./agents/fixer/Dockerfile
     env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
@@ -43,9 +44,10 @@ services:
   #   - On CI pass → marks tracking record resolved
   #   - On CI fail → invokes the fixer-server /retry endpoint
   watcher:
+    image: vuln-remediation-agent_watcher
     build:
       context: .
-      dockerfile: agents/watcher/Dockerfile
+      dockerfile: ./agents/watcher/Dockerfile
     env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
@@ -65,9 +67,10 @@ services:
   # bind-mounted ./data volume the fixer-server and watcher write to.
   # View at: http://localhost:8501
   dashboard:
+    image: vuln-remediation-agent_dashboard
     build:
       context: .
-      dockerfile: dashboard/Dockerfile
+      dockerfile: ./dashboard/Dockerfile
     # GITHUB_PAT (from config/.env, same as the other services) is optional
     # here -- only used for higher-rate-limit PR-state lookups (open/closed/
     # merged icons). Falls back to unauthenticated GitHub API calls if unset
@@ -93,6 +96,7 @@ services:
   #   Retry a specific tracking ID:
   #     docker compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
   fixer:
+    image: vuln-remediation-agent_fixer
     build:
       context: .
       dockerfile: agents/fixer/Dockerfile
