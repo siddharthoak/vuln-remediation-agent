@@ -8,7 +8,7 @@ Migrated from `nexus-remediation-agent`. Same Fixer + Watcher architecture, swap
 | Vulnerability source | Nexus IQ Server API | OWASP DC / Trivy / Grype JSON reports |
 | Tracking store | Azure Cosmos DB | JSON file (local) / Firestore (GCP) |
 | Fixer invocation | Azure AI Foundry SDK | HTTP POST (local) / Cloud Run Job (GCP) |
-| Scheduling | AAF hosted agent schedule | `docker compose up -d` (local) / Cloud Scheduler (GCP) |
+| Scheduling | AAF hosted agent schedule | `podman compose up -d` (local) / Cloud Scheduler (GCP) |
 
 **What is identical:** `RetryGate`, `PRClient`, `RepoOps`, `CIStatusWatcher`, `TrackingRecord`, the four tool handler methods, `FRESH_FIX_PROMPT`, `RETRY_FIX_PROMPT`, retry bound logic.
 
@@ -22,18 +22,18 @@ Full end-to-end walkthrough — from triggering a scan on the target repo to rem
 
 ```
 [1 Start agents] → [2 Trigger scan] → [3 Auto-fetch] → [4 KB hydrate + classify] → [5 Fixer (Gemini)] → [6 CI runs] → [7 Watcher + retry] → [CI_PASSED]
-  docker compose     GitHub Actions      ScanPoller       Knowledge Agent               fixer-server       GH Actions     watcher daemon          ↓
+  podman compose     GitHub Actions      ScanPoller       Knowledge Agent               fixer-server       GH Actions     watcher daemon          ↓
   up -d              (manual dispatch)   (60s poll)       + Classifier                  (B2/B3 only)                                          [Dashboard]
-                                                          B1/B4 → GitHub Issues                                                     http://localhost:8501
+                                                          B1/B4 → GitHub Issues                                                     http://172.31.144.52:8501
 ```
 
-`fixer-server`, `watcher`, and `dashboard` all run as long-lived services started by `docker compose up -d`. You only need to trigger the GitHub Action — the agents do everything else. The dashboard (server-rendered FastAPI + HTMX, containerized alongside the agents) gives you live visibility into every step.
+`fixer-server`, `watcher`, and `dashboard` all run as long-lived services started by `podman compose up -d`. You only need to trigger the GitHub Action — the agents do everything else. The dashboard (server-rendered FastAPI + HTMX, containerized alongside the agents) gives you live visibility into every step.
 
 ---
 
 ### Prerequisites
 
-- Docker ≥ 24 and Docker Compose ≥ 2.20
+- Podman ≥ 4 and podman-compose ≥ 1.0 (Docker Compose is also supported)
 - A GCP project with **Vertex AI API** enabled and billing active
 - `gcloud` CLI installed; run `gcloud auth application-default login` before starting
 - GitHub PAT with `repo`, `pull_request`, and `actions:read` scopes
@@ -64,8 +64,12 @@ Edit `config/.env` — the required values:
 Place your GCP Service Account JSON at `config/my-google-service-account.json`. `docker-compose.yml` mounts it into every container at `/gcp/adc.json`. The SA account needs the `roles/aiplatform.user` role on the GCP project.
 
 ```bash
-# Build all images (fixer-server, watcher, dashboard)
-docker compose build
+# Build all images (fixer-server, watcher, dashboard).
+# Direct builds avoid a podman-compose 1.6 Windows issue that drops the
+# per-service Dockerfile argument.
+podman build -f agents/fixer/Dockerfile -t vuln-remediation-agent_fixer-server .
+podman build -f agents/watcher/Dockerfile -t vuln-remediation-agent_watcher .
+podman build -f dashboard/Dockerfile -t vuln-remediation-agent_dashboard .
 ```
 
 ---
@@ -73,7 +77,7 @@ docker compose build
 ### Phase 1 — Start the agents
 
 ```bash
-docker compose up -d
+podman compose up -d --no-build
 ```
 
 This starts two always-on services:
@@ -86,7 +90,7 @@ This starts two always-on services:
 Tail logs while you work:
 
 ```bash
-docker compose logs -f fixer-server watcher
+podman compose logs -f fixer-server watcher
 ```
 
 ---
@@ -123,7 +127,7 @@ git push origin test/trigger-scan
 
 The workflow runs three scanners — OWASP Dependency-Check (~4 min), Trivy (~1 min), Grype (~1 min). All three run even if one fails (`if: always()` on each step). Total runtime: 5–10 minutes.
 
-**You don't need to do anything else.** The `fixer-server`'s ScanPoller detects the completed run within `SCAN_POLL_INTERVAL` seconds, downloads the `vulnerability-reports` artifact into `./scan-reports/`, and immediately starts the fix flow. Watch `docker compose logs -f fixer-server` to see it happen.
+**You don't need to do anything else.** The `fixer-server`'s ScanPoller detects the completed run within `SCAN_POLL_INTERVAL` seconds, downloads the `vulnerability-reports` artifact into `./scan-reports/`, and immediately starts the fix flow. Watch `podman compose logs -f fixer-server` to see it happen.
 
 ---
 
@@ -180,9 +184,9 @@ For each open `fix/` PR:
 
 ### Phase 3 — Observe with the dashboard
 
-The dashboard is its own container (`dashboard/`, server-rendered Jinja2 + HTMX pages served by FastAPI -- no JS build step) and starts automatically with `docker compose up -d` alongside `fixer-server` and `watcher` — no separate host-side install step.
+The dashboard is its own container (`dashboard/`, server-rendered Jinja2 + HTMX pages served by FastAPI -- no JS build step) and starts automatically with `podman compose up -d` alongside `fixer-server` and `watcher` — no separate host-side install step.
 
-Open [http://localhost:8501](http://localhost:8501). It reads `./data/tracking.json` and `./data/kb.json` from the same bind mount the fixer-server and watcher write to (read-only), and polls its own backend every 30 seconds.
+Open [http://172.31.144.52:8501](http://172.31.144.52:8501). It reads `./data/tracking.json` and `./data/kb.json` from the same bind mount the fixer-server and watcher write to (read-only), and polls its own backend every 30 seconds.
 
 **Sidebar** shows live agent health:
 - **Fixer-server** — time since the last ScanPoller checkpoint write (goes yellow if the server is idle or unreachable)
@@ -208,17 +212,17 @@ CREATED → PR_OPENED → CI_PENDING → CI_PASSED              (human review)
 
 ### Ad-hoc / manual operations
 
-The one-shot `fixer` service is available for manual use (it's excluded from `docker compose up -d` via a Docker profile):
+The one-shot `fixer` service is available for manual use (it's excluded from `podman compose up -d` via a Compose profile):
 
 ```bash
 # Fresh scan using reports already in ./scan-reports/
-docker compose run --rm --profile manual fixer
+podman compose run --rm --profile manual fixer
 
 # Fresh scan + trigger + download (AUTO_FETCH_SCAN)
-docker compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
+podman compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
 
 # Manual retry for a specific tracking ID
-docker compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
+podman compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
 ```
 
 To force a CI failure for testing, temporarily add a Maven Enforcer rule:
@@ -242,13 +246,41 @@ To force a CI failure for testing, temporarily add a Maven Enforcer rule:
 
 Set `MAX_RETRY_ATTEMPTS=1` in `config/.env` to reach `FAILED_MAX_RETRIES` quickly.
 
+### Testing a transitive dependency fix
+
+Use a scanner report that names a dependency pulled by another Maven dependency
+(for example `org.yaml:snakeyaml`). Then:
+
+```bash
+# Confirm the vulnerable component is in the resolved graph.
+# Run this from a local checkout of the target Maven repository.
+podman run --rm -v "${TARGET_REPO}:/workspace:Z" -w /workspace \
+  maven:3.9-eclipse-temurin-17 mvn -B dependency:tree \
+  -Dincludes=org.yaml:snakeyaml
+
+# Run the remediation using the reports already in ./scan-reports/
+podman compose run --rm --profile manual fixer
+
+# Follow the locality decision and remediation result
+podman compose logs --tail 200 fixer-server
+```
+
+Expected behavior: a one-hop transitive dependency is pinned through the
+project-level `<dependencyManagement>` section without adding a direct
+dependency; the image then runs `mvn compile`. Deeper chains or dependencies
+introduced by complex frameworks are escalated to a GitHub triage issue.
+Confirm the resulting `pom.xml`, resolved version, and CI scan before declaring
+the CVE fixed. A `401 Bad credentials` message means `GITHUB_PAT` in
+`config/.env` must be replaced before the fixer or watcher can fetch a scan,
+clone the target repository, or open a PR.
+
 ---
 
 ### Test scenario matrix
 
 | Scenario | How to trigger | What to observe |
 |---|---|---|
-| **Happy path** | `docker compose up -d`; trigger scan | `fix/` PRs opened automatically; dashboard at `:8501` shows records progressing to `CI_PASSED` |
+| **Happy path** | `podman compose up -d`; trigger scan | `fix/` PRs opened automatically; dashboard at `:8501` shows records progressing to `CI_PASSED` |
 | **Informed retry** | Force CI failure via Enforcer rule | `RETRY_REQUESTED` record has `failure_log_excerpt`; fixer-server pushes a corrective commit |
 | **Retry exhaustion** | `MAX_RETRY_ATTEMPTS=1`; force CI failure | Record reaches `FAILED_MAX_RETRIES` after one retry; PR gets escalation comment |
 | **New CVE mid-run** | Add a new vulnerable dep; trigger scan again | ScanPoller detects the new completed run; only the new finding gets a fresh PR |

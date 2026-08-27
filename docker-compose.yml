@@ -1,7 +1,7 @@
 services:
 
   # ── Fixer server (always-on) ──────────────────────────────────────────────
-  # Start with: docker compose up -d
+  # Start with: podman compose up -d
   #
   # Runs two background workers:
   #   1. ScanPoller — polls GitHub every SCAN_POLL_INTERVAL seconds. When the
@@ -13,7 +13,7 @@ services:
     image: vuln-remediation-agent_fixer-server
     build:
       context: .
-      dockerfile: ./agents/fixer/Dockerfile
+      dockerfile: agents/fixer/Dockerfile
     env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
@@ -36,7 +36,7 @@ services:
       - "host.docker.internal:host-gateway"
 
   # ── Watcher (always-on) ───────────────────────────────────────────────────
-  # Starts automatically with: docker compose up -d
+  # Starts automatically with: podman compose up -d
   #
   # Runs a cycle every WATCHER_SLEEP_SECONDS (default 15 min):
   #   - Finds open fix/* PRs in the target repo
@@ -47,7 +47,7 @@ services:
     image: vuln-remediation-agent_watcher
     build:
       context: .
-      dockerfile: ./agents/watcher/Dockerfile
+      dockerfile: agents/watcher/Dockerfile
     env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
@@ -62,15 +62,15 @@ services:
     restart: unless-stopped
 
   # ── Dashboard (always-on) ─────────────────────────────────────────────────
-  # Starts automatically with: docker compose up -d
+  # Starts automatically with: podman compose up -d
   # Observability UI — read-only, reads tracking/KB state from the same
   # bind-mounted ./data volume the fixer-server and watcher write to.
-  # View at: http://localhost:8501
+  # View at: http://172.31.144.52:8501
   dashboard:
     image: vuln-remediation-agent_dashboard
     build:
       context: .
-      dockerfile: ./dashboard/Dockerfile
+      dockerfile: dashboard/Dockerfile
     # GITHUB_PAT (from config/.env, same as the other services) is optional
     # here -- only used for higher-rate-limit PR-state lookups (open/closed/
     # merged icons). Falls back to unauthenticated GitHub API calls if unset
@@ -90,11 +90,11 @@ services:
   # ── Fixer one-shot (manual use) ───────────────────────────────────────────
   # For ad-hoc runs outside the always-on flow.
   #   Fresh scan (reports already in ./scan-reports):
-  #     docker compose run --rm --profile manual fixer
+  #     podman compose run --rm --profile manual fixer
   #   Fresh scan + auto-trigger + download:
-  #     docker compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
+  #     podman compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
   #   Retry a specific tracking ID:
-  #     docker compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
+  #     podman compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
   fixer:
     image: vuln-remediation-agent_fixer
     build:
