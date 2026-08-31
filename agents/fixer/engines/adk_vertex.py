@@ -157,7 +157,13 @@ class AdkVertexEngine:
         """Read the full contents of a file in the cloned repository."""
         if not relative_path:
             return "ERROR: relative_path is required."
-        target = self._repo_path / relative_path
+        try:
+            target = (self._repo_path / relative_path).resolve()
+            if not target.is_relative_to(self._repo_path.resolve()):
+                return "ERROR: Path traversal detected."
+        except ValueError:
+            return "ERROR: Invalid path."
+            
         if not target.exists():
             return f"ERROR: File not found: {relative_path}"
         try:
@@ -214,7 +220,13 @@ class AdkVertexEngine:
         """
         if not relative_path or not find:
             return "ERROR: relative_path and find are both required."
-        target = self._repo_path / relative_path
+        try:
+            target = (self._repo_path / relative_path).resolve()
+            if not target.is_relative_to(self._repo_path.resolve()):
+                return "ERROR: Path traversal detected."
+        except ValueError:
+            return "ERROR: Invalid path."
+            
         if not target.exists():
             return f"ERROR: File not found: {relative_path}"
         content = target.read_text(encoding="utf-8")

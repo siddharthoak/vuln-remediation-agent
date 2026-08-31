@@ -266,19 +266,19 @@ class FirestoreTrackingStore:
 
 # ── File-based backend (local Docker / dev) ───────────────────────────────────
 
+from .file_lock import FileLock
+
 class FileTrackingStore:
     """
     JSON file backend for local development and Docker Compose runs.
 
     All records are stored in a single JSON file on a mounted volume so state
-    survives container restarts. Not safe for concurrent writes — use only in
-    single-container local dev, not in production.
-
-    Set TRACKING_STORE_PATH to the file path (e.g. /data/tracking.json).
+    survives container restarts. Safe for concurrent writes using a file lock.
     """
 
     def __init__(self, path: Optional[str] = None):
         self._path = path or os.environ["TRACKING_STORE_PATH"]
+        self._lock_path = self._path + ".lock"
 
     def _load(self) -> dict:
         try:
@@ -289,50 +289,58 @@ class FileTrackingStore:
 
     def _save(self, records: dict) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as f:
+        temp_path = self._path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2)
+        os.replace(temp_path, self._path)
 
     def create(self, record: TrackingRecord) -> None:
-        records = self._load()
-        records[record.tracking_id] = asdict(record)
-        self._save(records)
+        with FileLock(self._lock_path):
+            records = self._load()
+            records[record.tracking_id] = asdict(record)
+            self._save(records)
 
     def get(self, tracking_id: str) -> Optional[TrackingRecord]:
-        records = self._load()
-        data = records.get(tracking_id)
-        return TrackingRecord(**data) if data else None
+        with FileLock(self._lock_path):
+            records = self._load()
+            data = records.get(tracking_id)
+            return TrackingRecord(**data) if data else None
 
     def get_latest_for_pr(self, pr_number: int) -> Optional[TrackingRecord]:
-        matches = [
-            TrackingRecord(**v) for v in self._load().values()
-            if v.get("pr_number") == pr_number
-        ]
-        if not matches:
-            return None
-        return sorted(matches, key=lambda r: r.attempt_number, reverse=True)[0]
+        with FileLock(self._lock_path):
+            matches = [
+                TrackingRecord(**v) for v in self._load().values()
+                if v.get("pr_number") == pr_number
+            ]
+            if not matches:
+                return None
+            return sorted(matches, key=lambda r: r.attempt_number, reverse=True)[0]
 
     def get_lineage(self, pr_number: int) -> list:
-        matches = [
-            TrackingRecord(**v) for v in self._load().values()
-            if v.get("pr_number") == pr_number
-        ]
-        return sorted(matches, key=lambda r: r.attempt_number)
+        with FileLock(self._lock_path):
+            matches = [
+                TrackingRecord(**v) for v in self._load().values()
+                if v.get("pr_number") == pr_number
+            ]
+            return sorted(matches, key=lambda r: r.attempt_number)
 
     def get_all(self) -> list:
-        return [TrackingRecord(**v) for v in self._load().values()]
+        with FileLock(self._lock_path):
+            return [TrackingRecord(**v) for v in self._load().values()]
 
     def count_attempts_for_pr(self, pr_number: int) -> int:
-        # ENGINE_ERROR records don't count -- see TrackingStatus.ENGINE_ERROR.
-        return sum(
-            1 for v in self._load().values()
-            if v.get("pr_number") == pr_number and v.get("status") != TrackingStatus.ENGINE_ERROR.value
-        )
+        with FileLock(self._lock_path):
+            return sum(
+                1 for v in self._load().values()
+                if v.get("pr_number") == pr_number and v.get("status") != TrackingStatus.ENGINE_ERROR.value
+            )
 
     def update(self, record: TrackingRecord) -> None:
         record.updated_at = _now()
-        records = self._load()
-        records[record.tracking_id] = asdict(record)
-        self._save(records)
+        with FileLock(self._lock_path):
+            records = self._load()
+            records[record.tracking_id] = asdict(record)
+            self._save(records)
 
 
 # ── Store factory ─────────────────────────────────────────────────────────────

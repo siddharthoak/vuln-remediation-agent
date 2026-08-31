@@ -103,6 +103,7 @@ def _parse_ga(line: str) -> Optional[str]:
 def _parse_tree(stdout: str, group_id: str, artifact_id: str) -> DependencyLocality:
     target = f"{group_id}:{artifact_id}"
     ancestor_at: Dict[int, str] = {}
+    best_match = None
 
     for raw_line in stdout.splitlines():
         line = _strip_info_prefix(raw_line)
@@ -117,13 +118,17 @@ def _parse_tree(stdout: str, group_id: str, artifact_id: str) -> DependencyLocal
         if ga == target and depth > 0:
             if depth == 1:
                 return DependencyLocality(found=True, is_transitive=False, depth=depth, raw_tree=stdout)
-            return DependencyLocality(
-                found=True,
-                is_transitive=True,
-                depth=depth,
-                introduced_by=ancestor_at.get(depth - 1),
-                raw_tree=stdout,
-            )
+            if best_match is None:
+                best_match = DependencyLocality(
+                    found=True,
+                    is_transitive=True,
+                    depth=depth,
+                    introduced_by=ancestor_at.get(depth - 1),
+                    raw_tree=stdout,
+                )
+
+    if best_match is not None:
+        return best_match
 
     return DependencyLocality(found=False, is_transitive=False, depth=-1, raw_tree=stdout)
 
@@ -304,6 +309,7 @@ def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str
     tool -- extracted without changing its output text, since that text is
     part of the prompt contract the model has been tuned against.
     """
+    safe_env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_PAT", "GOOGLE_APPLICATION_CREDENTIALS")}
     try:
         result = subprocess.run(
             ["mvn", "compile", "-q", "--batch-mode"],
@@ -311,6 +317,7 @@ def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            env=safe_env,
         )
     except FileNotFoundError:
         return False, "ERROR: mvn not found — Maven must be installed in the container image."
@@ -331,6 +338,7 @@ def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str
 
 def test_repo(repo_path: Path, timeout_seconds: int = 600) -> Tuple[bool, str]:
     """Runs the Maven test suite with a bounded timeout."""
+    safe_env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_PAT", "GOOGLE_APPLICATION_CREDENTIALS")}
     try:
         result = subprocess.run(
             ["mvn", "-B", "test", "-q"],
@@ -338,6 +346,7 @@ def test_repo(repo_path: Path, timeout_seconds: int = 600) -> Tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            env=safe_env,
         )
     except FileNotFoundError:
         return False, "ERROR: mvn not found — Maven must be installed in the container image."

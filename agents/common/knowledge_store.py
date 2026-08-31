@@ -141,6 +141,8 @@ class InMemoryKBStore:
 
 # ── File backend ──────────────────────────────────────────────────────────────
 
+from .file_lock import FileLock
+
 class FileKnowledgeStore:
     """
     JSON file backend at KB_STORE_PATH (defaults to ./data/kb.json).
@@ -149,6 +151,7 @@ class FileKnowledgeStore:
 
     def __init__(self, path: Optional[str] = None):
         self._path = Path(path or os.environ.get("KB_STORE_PATH", "./data/kb.json"))
+        self._lock_path = str(self._path) + ".lock"
 
     def _load(self) -> dict:
         try:
@@ -159,10 +162,12 @@ class FileKnowledgeStore:
 
     def _save(self, entries: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
+        temp_path = self._path.with_suffix(".tmp")
+        temp_path.write_text(
             json.dumps({"entries": [asdict(e) for e in entries.values()]}, indent=2),
             encoding="utf-8",
         )
+        os.replace(temp_path, self._path)
 
     def _all_entries(self) -> dict:
         entries = self._load()
@@ -175,29 +180,34 @@ class FileKnowledgeStore:
             entry.entry_id = str(uuid.uuid4())
         if not entry.created_at:
             entry.created_at = _now()
-        entries = self._load()
-        entries[entry.entry_id] = entry
-        self._save(entries)
+        with FileLock(self._lock_path):
+            entries = self._load()
+            entries[entry.entry_id] = entry
+            self._save(entries)
         logger.info("KB: created entry %s (%s)", entry.entry_id[:8], entry.component_name)
 
     def get(self, component_name: str, from_version: str, to_version: str) -> Optional[KnowledgeEntry]:
-        for e in self._all_entries().values():
-            if (e.component_name == component_name
-                    and e.from_version == from_version
-                    and e.to_version == to_version):
-                return e
+        with FileLock(self._lock_path):
+            for e in self._all_entries().values():
+                if (e.component_name == component_name
+                        and e.from_version == from_version
+                        and e.to_version == to_version):
+                    return e
         return None
 
     def find_applicable(self, component_name: str, from_version: str, to_version: str) -> Optional[KnowledgeEntry]:
-        return _find_best(list(self._all_entries().values()), component_name, from_version, to_version)
+        with FileLock(self._lock_path):
+            return _find_best(list(self._all_entries().values()), component_name, from_version, to_version)
 
     def update(self, entry: KnowledgeEntry) -> None:
-        entries = self._load()
-        entries[entry.entry_id] = entry
-        self._save(entries)
+        with FileLock(self._lock_path):
+            entries = self._load()
+            entries[entry.entry_id] = entry
+            self._save(entries)
 
     def get_all(self) -> list:
-        return list(self._all_entries().values())
+        with FileLock(self._lock_path):
+            return list(self._all_entries().values())
 
 
 # ── Firestore backend ─────────────────────────────────────────────────────────
