@@ -216,13 +216,13 @@ The one-shot `fixer` service is available for manual use (it's excluded from `po
 
 ```bash
 # Fresh scan using reports already in ./scan-reports/
-podman compose run --rm --profile manual fixer
+podman compose --profile manual run --rm fixer
 
 # Fresh scan + trigger + download (AUTO_FETCH_SCAN)
-podman compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
+podman compose --profile manual run --rm -e AUTO_FETCH_SCAN=1 fixer
 
 # Manual retry for a specific tracking ID
-podman compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
+podman compose --profile manual run --rm -e RETRY_TRACKING_ID=<id> fixer
 ```
 
 To force a CI failure for testing, temporarily add a Maven Enforcer rule:
@@ -259,7 +259,7 @@ podman run --rm -v "${TARGET_REPO}:/workspace:Z" -w /workspace \
   -Dincludes=org.yaml:snakeyaml
 
 # Run the remediation using the reports already in ./scan-reports/
-podman compose run --rm --profile manual fixer
+podman compose --profile manual run --rm fixer
 
 # Follow the locality decision and remediation result
 podman compose logs --tail 200 fixer-server

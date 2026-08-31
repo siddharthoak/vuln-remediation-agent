@@ -16,6 +16,7 @@ from ecosystems.base import PackageEcosystem
 
 
 def get_ecosystem(repo_path: Path) -> PackageEcosystem:
+    repo_path = Path(repo_path)
     if (repo_path / "pom.xml").exists():
         from ecosystems.maven import MavenEcosystem
         return MavenEcosystem()

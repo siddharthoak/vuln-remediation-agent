@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # real repo (e.g. vulnerable-java-app with jackson-dataformat-yaml added)
 # and confirm it correctly classifies org.yaml:snakeyaml as transitive.
 
-_GAV_RE = re.compile(r"^(?P<groupId>[^:\s]+):(?P<artifactId>[^:\s]+):\S+$")
+_GAV_RE = re.compile(r"^(?P<groupId>[^:\s]+):(?P<artifactId>[^:\s]+):[^\s:]+(?::[^\s:]+)*(?:\s+.*)?$")
 _MARKER_RE = re.compile(r"^((?:\|  |   )*)(\+- |\\- )")
 
 

@@ -118,6 +118,13 @@ class ScanPoller:
             f"?branch={self._branch}&status=completed&per_page=1"
         )
         resp = requests.get(url, headers=self._headers, timeout=30)
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"GitHub workflow {WORKFLOW_FILE!r} was not found for "
+                f"{self._repo}. Verify GITHUB_REPO_TARGET, the PAT's "
+                "repository access, and that .github/workflows/security-scan.yml "
+                "exists on the target repository's default branch."
+            )
         resp.raise_for_status()
         runs = resp.json().get("workflow_runs", [])
         return runs[0] if runs else None

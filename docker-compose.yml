@@ -90,11 +90,11 @@ services:
   # ── Fixer one-shot (manual use) ───────────────────────────────────────────
   # For ad-hoc runs outside the always-on flow.
   #   Fresh scan (reports already in ./scan-reports):
-  #     podman compose run --rm --profile manual fixer
+  #     podman compose --profile manual run --rm fixer
   #   Fresh scan + auto-trigger + download:
-  #     podman compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
+  #     podman compose --profile manual run --rm -e AUTO_FETCH_SCAN=1 fixer
   #   Retry a specific tracking ID:
-  #     podman compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
+  #     podman compose --profile manual run --rm -e RETRY_TRACKING_ID=<id> fixer
   fixer:
     image: vuln-remediation-agent_fixer
     build:
