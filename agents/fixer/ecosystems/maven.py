@@ -16,6 +16,7 @@ fixture text, not a live `mvn` run (no Maven in this dev environment).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import xml.etree.ElementTree as ET

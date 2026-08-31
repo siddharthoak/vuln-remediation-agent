@@ -143,8 +143,9 @@ class ScanReportClient:
             for vuln in result.get("Vulnerabilities") or []:
                 cve_id    = vuln.get("VulnerabilityID", "")
                 severity  = vuln.get("Severity", "UNKNOWN").lower()
-                fixed_ver = vuln.get("FixedVersion", "")
                 installed = vuln.get("InstalledVersion", "unknown")
+                fixed_ver_raw = vuln.get("FixedVersion", "")
+                fixed_ver = self._select_best_fixed_version(fixed_ver_raw, installed)
 
                 # Resolve component name from PURL or PkgName
                 purl = (vuln.get("PkgIdentifier") or {}).get("PURL", "")
@@ -197,13 +198,14 @@ class ScanReportClient:
 
             cve_id    = vuln.get("id", "")
             severity  = vuln.get("severity", "UNKNOWN").lower()
-            fix_info  = vuln.get("fix", {})
-            fix_vers  = fix_info.get("versions", [])
-            fixed_ver = fix_vers[0] if fix_vers else "UNKNOWN — check Grype fix.versions"
-
             purl      = artifact.get("purl", "")
             name      = self._name_from_purl(purl) or artifact.get("name", "unknown")
             installed = artifact.get("version", "unknown")
+
+            fix_info  = vuln.get("fix", {})
+            fix_vers  = fix_info.get("versions", [])
+            fixed_ver_raw = ", ".join(fix_vers) if fix_vers else ""
+            fixed_ver = self._select_best_fixed_version(fixed_ver_raw, installed) if fixed_ver_raw else "UNKNOWN — check Grype fix.versions"
 
             key = (name, installed)
             if key not in findings:
@@ -268,6 +270,31 @@ class ScanReportClient:
         return list(findings.values())
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _select_best_fixed_version(fixed_ver_str: str, installed_ver: str) -> str:
+        if not fixed_ver_str or fixed_ver_str.startswith("UNKNOWN"):
+            return fixed_ver_str
+        candidates = [v.strip() for v in fixed_ver_str.split(",") if v.strip()]
+        if not candidates:
+            return fixed_ver_str
+        if len(candidates) == 1:
+            return candidates[0]
+        inst_clean = installed_ver.strip().lstrip("v")
+        inst_parts = inst_clean.split(".")
+        # 1. Match same major and minor version if possible
+        for cand in candidates:
+            cand_clean = cand.strip().lstrip("v")
+            cand_parts = cand_clean.split(".")
+            if len(inst_parts) >= 2 and len(cand_parts) >= 2 and inst_parts[0] == cand_parts[0] and inst_parts[1] == cand_parts[1]:
+                return cand
+        # 2. Match same major version
+        for cand in candidates:
+            cand_clean = cand.strip().lstrip("v")
+            cand_parts = cand_clean.split(".")
+            if len(inst_parts) >= 1 and len(cand_parts) >= 1 and inst_parts[0] == cand_parts[0]:
+                return cand
+        return candidates[0]
 
     @staticmethod
     def _name_from_purl(purl: str) -> str:

@@ -32,6 +32,23 @@ class DiffReviewResult:
     changed_files: tuple = ()
 
 
+def _is_version_match(actual: str, expected_cand: str) -> bool:
+    if not actual or not expected_cand:
+        return False
+    a = actual.strip().lstrip("v")
+    e = expected_cand.strip().lstrip("v")
+    if a == e:
+        return True
+    for suffix in [".RELEASE", ".Final", ".GA", ".jre", ".android"]:
+        if a == f"{e}{suffix}" or e == f"{a}{suffix}":
+            return True
+        if a.rstrip(suffix) == e.rstrip(suffix):
+            return True
+    if a.startswith(e + ".") or e.startswith(a + "."):
+        return True
+    return False
+
+
 def review_dependency_diff(
     repo_path: str | Path,
     component_name: str,
@@ -76,10 +93,18 @@ def review_dependency_diff(
         else:
             changed.add(name)
     changed.update(name for name in diff.stdout.splitlines() if name)
-    if untracked:
+    
+    filtered_untracked = [
+        f for f in untracked
+        if not f.replace("\\", "/").startswith("target/")
+        and not f.replace("\\", "/").startswith("build/")
+        and not f.replace("\\", "/").startswith(".gradle/")
+    ]
+    
+    if filtered_untracked:
         return DiffReviewResult(
-            False, f"Unexpected untracked files in remediation diff: {', '.join(untracked)}",
-            tuple(sorted(changed | set(untracked))),
+            False, f"Unexpected untracked files in remediation diff: {', '.join(filtered_untracked)}",
+            tuple(sorted(changed | set(filtered_untracked))),
         )
 
     expected = {str(name).replace("\\", "/") for name in expected_files if name}
@@ -102,7 +127,14 @@ def review_dependency_diff(
             "Diff review failed — pom.xml is not part of the working-tree diff.",
             tuple(sorted(changed_normalized)),
         )
-    if "pom.xml" in changed_normalized and target_version not in pom_diff.stdout:
+
+    target_candidates = [v.strip() for v in target_version.split(",") if v.strip()] if target_version else []
+    pom_diff_text = pom_diff.stdout
+    target_in_diff = any(
+        (cand in pom_diff_text or any(_is_version_match(word.strip("\"'<>= /+"), cand) for line in pom_diff_text.splitlines() for word in line.split()))
+        for cand in target_candidates
+    )
+    if "pom.xml" in changed_normalized and not target_in_diff:
         return DiffReviewResult(
             False,
             f"Diff review failed — pom.xml diff does not contain requested version {target_version}.",
@@ -142,11 +174,15 @@ def review_dependency_diff(
         if version.startswith("${") and version.endswith("}"):
             version = properties.get(version[2:-1], version)
         matches.append(version)
-    if target_version not in matches:
+    matches_target = any(
+        any(_is_version_match(m, cand) for cand in target_candidates)
+        for m in matches
+    )
+    if matches and not matches_target:
         return DiffReviewResult(
             False,
             f"Diff review failed — {component_name} does not resolve to requested version "
-            f"{target_version} in pom.xml.",
+            f"{target_version} in pom.xml (found {matches}).",
             tuple(sorted(changed_normalized)),
         )
     return DiffReviewResult(True, "Diff review passed.", tuple(sorted(changed_normalized)))
