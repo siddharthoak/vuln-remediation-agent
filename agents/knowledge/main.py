@@ -9,6 +9,7 @@ Called from the fixer's _do_fresh_scan() before the classifier runs.
 """
 
 import json
+import concurrent.futures
 import logging
 import os
 import uuid
@@ -141,10 +142,14 @@ class KnowledgeAgent:
         )
 
         try:
-            response = self._model.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json", "temperature": 0.0},
-            )
+            def _call_model():
+                return self._model.generate_content(
+                    prompt,
+                    generation_config={"response_mime_type": "application/json", "temperature": 0.0},
+                )
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(_call_model)
+                response = future.result(timeout=45)
             data = json.loads(response.text)
         except Exception as exc:
             logger.warning(
