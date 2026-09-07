@@ -83,7 +83,7 @@ services:
     ports:
       - "8501:8000"
     volumes:
-      - ./data:/data:ro
+      - ./data:/data
       - ./scan-reports:/reports:ro
     restart: unless-stopped
 

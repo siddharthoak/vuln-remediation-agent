@@ -270,6 +270,7 @@ def _records_as_dicts() -> list:
         completion_tokens = (tu or {}).get("completion_tokens") or 0
         d["prompt_tokens"] = prompt_tokens
         d["completion_tokens"] = completion_tokens
+        d["model_name"] = (tu or {}).get("model_name")
         d["total_tokens"] = prompt_tokens + completion_tokens
         d["status_icon"] = STATUS_ICONS.get(d["status"], "•")
         d["status_class"] = _status_class(d["status"])
@@ -501,17 +502,26 @@ def partial_metrics(request: Request):
     p95_resolution = _percentile(resolved_times, 0.95) / 60 if resolved_times else None
 
     total_tokens = sum(r["total_tokens"] for r in records)
-    tokens_per_pr = {}
+    tokens_per_issue = {}
     for r in records:
-        if r.get("pr_number") is not None:
-            tokens_per_pr[r["pr_number"]] = tokens_per_pr.get(r["pr_number"], 0) + r["total_tokens"]
-    avg_tokens_per_pr = (sum(tokens_per_pr.values()) / len(tokens_per_pr)) if tokens_per_pr else None
+        vid = r.get("vulnerability_id") or r.get("component_name") or r.get("tracking_id")
+        if vid:
+            tokens_per_issue[vid] = tokens_per_issue.get(vid, 0) + r["total_tokens"]
+    avg_tokens_per_issue = (sum(tokens_per_issue.values()) / len(tokens_per_issue)) if tokens_per_issue else None
 
     tokens_by_attempt: dict = {}
     for r in records:
         n = r.get("attempt_number") or 1
         tokens_by_attempt[n] = tokens_by_attempt.get(n, 0) + r["total_tokens"]
     tokens_by_attempt_bars = _bars(sorted(tokens_by_attempt.items()))
+
+    tokens_by_component: dict = {}
+    for r in records:
+        comp = r.get("component_name") or "Unknown"
+        tokens_by_component[comp] = tokens_by_component.get(comp, 0) + (r.get("total_tokens") or 0)
+    
+    sorted_comps = sorted(tokens_by_component.items(), key=lambda x: x[1], reverse=True)
+    tokens_by_component_bars = _bars(sorted_comps[:15])
 
     status_counts: dict = {}
     for r in records:
@@ -540,8 +550,9 @@ def partial_metrics(request: Request):
         "p50_resolution": p50_resolution,
         "p95_resolution": p95_resolution,
         "total_tokens": total_tokens,
-        "avg_tokens_per_pr": avg_tokens_per_pr,
+        "avg_tokens_per_issue": avg_tokens_per_issue,
         "tokens_by_attempt_bars": tokens_by_attempt_bars,
+        "tokens_by_component_bars": tokens_by_component_bars,
         "status_bars": status_bars,
         "depth_bars": depth_bars,
     })

@@ -58,6 +58,7 @@ class ChangeSummary:
     # reasoning. 0 would misrepresent "no LLM used" as "confirmed zero cost".
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
+    model_name: Optional[str] = None
 
 
 # ── Prompt templates ─────────────────────────────────────────────────────────
@@ -258,6 +259,7 @@ class CodeFixer:
         record.token_usage = {
             "prompt_tokens": summary.prompt_tokens,
             "completion_tokens": summary.completion_tokens,
+            "model_name": summary.model_name,
         }
         tracking_store.update(record)
         return summary
@@ -304,6 +306,7 @@ class CodeFixer:
         record.token_usage = {
             "prompt_tokens": summary.prompt_tokens,
             "completion_tokens": summary.completion_tokens,
+            "model_name": summary.model_name,
         }
         tracking_store.update(record)
         return summary
@@ -341,6 +344,7 @@ class CodeFixer:
         record.token_usage = {
             "prompt_tokens": summary.prompt_tokens,
             "completion_tokens": summary.completion_tokens,
+            "model_name": summary.model_name,
         }
         tracking_store.update(record)
         return summary
@@ -422,6 +426,7 @@ class CodeFixer:
             cve_ids=cve_ids,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
+            model_name=result.model_name,
         )
 
     def _execute_transitive_fix(
@@ -492,6 +497,7 @@ class CodeFixer:
             cve_ids=cve_ids,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
+            model_name=result.model_name,
         )
 
     # ── Prompt construction (engine-agnostic) ─────────────────────────────────

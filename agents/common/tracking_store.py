@@ -175,13 +175,8 @@ class InMemoryTrackingStore:
         return list(self._records.values())
 
     def count_attempts_for_pr(self, pr_number: int) -> int:
-        # ENGINE_ERROR records don't count -- the engine never produced a fix
-        # to evaluate, so they shouldn't consume retry budget. See
-        # TrackingStatus.ENGINE_ERROR.
-        return sum(
-            1 for r in self._records.values()
-            if r.pr_number == pr_number and r.status != TrackingStatus.ENGINE_ERROR.value
-        )
+        attempts = [r.attempt_number for r in self._records.values() if r.pr_number == pr_number and r.status != TrackingStatus.ENGINE_ERROR.value]
+        return max(attempts) if attempts else 0
 
     def update(self, record: TrackingRecord) -> None:
         record.updated_at = _now()
@@ -252,12 +247,9 @@ class FirestoreTrackingStore:
         return [TrackingRecord(**d.to_dict()) for d in self._col.stream()]
 
     def count_attempts_for_pr(self, pr_number: int) -> int:
-        # Filtered client-side (not a second Firestore where-clause) to avoid
-        # requiring a new composite index for pr_number + status. Volumes here
-        # are bounded by MAX_RETRY_ATTEMPTS, so this is cheap. ENGINE_ERROR
-        # records don't count -- see TrackingStatus.ENGINE_ERROR.
         docs = self._col.where("pr_number", "==", pr_number).stream()
-        return sum(1 for d in docs if d.to_dict().get("status") != TrackingStatus.ENGINE_ERROR.value)
+        attempts = [d.to_dict().get("attempt_number", 1) for d in docs if d.to_dict().get("status") != TrackingStatus.ENGINE_ERROR.value]
+        return max(attempts) if attempts else 0
 
     def update(self, record: TrackingRecord) -> None:
         record.updated_at = _now()
@@ -330,10 +322,8 @@ class FileTrackingStore:
 
     def count_attempts_for_pr(self, pr_number: int) -> int:
         with FileLock(self._lock_path):
-            return sum(
-                1 for v in self._load().values()
-                if v.get("pr_number") == pr_number and v.get("status") != TrackingStatus.ENGINE_ERROR.value
-            )
+            attempts = [v.get("attempt_number", 1) for v in self._load().values() if v.get("pr_number") == pr_number and v.get("status") != TrackingStatus.ENGINE_ERROR.value]
+            return max(attempts) if attempts else 0
 
     def update(self, record: TrackingRecord) -> None:
         record.updated_at = _now()

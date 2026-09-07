@@ -22,10 +22,19 @@
 
     <div class="metric-row">
       <div class="metric"><div class="value">{{ "{:,}".format(total_tokens) }}</div><div class="label">Total tokens consumed</div></div>
-      {% if avg_tokens_per_pr is not none %}
-      <div class="metric"><div class="value">{{ "{:,.0f}".format(avg_tokens_per_pr) }}</div><div class="label">Avg tokens per PR</div></div>
+      {% if avg_tokens_per_issue is not none %}
+      <div class="metric"><div class="value">{{ "{:,.0f}".format(avg_tokens_per_issue) }}</div><div class="label">Avg tokens per issue</div></div>
       {% endif %}
     </div>
+
+        <h2>Token usage by component (Top 15)</h2>
+    {% for b in tokens_by_component_bars %}
+      <div class="bar-row" title="{{ b.label }}">
+        <div class="bar-label" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 300px;">{{ b.label }}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:{{ b.pct }}%"></div></div>
+        <div class="bar-value">{{ "{:,}".format(b.value) }}</div>
+      </div>
+    {% endfor %}
 
     <h2>Token usage by attempt number</h2>
     {% for b in tokens_by_attempt_bars %}

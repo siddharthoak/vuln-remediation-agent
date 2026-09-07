@@ -69,8 +69,8 @@
                   {% if r.time_to_resolution_seconds is not none %}
                   <div class="metric"><div class="value">{{ (r.time_to_resolution_seconds / 60) | round(1) }} min</div><div class="label">Time to outcome</div></div>
                   {% endif %}
-                  {% if r.total_tokens %}
-                  <div class="metric"><div class="value">{{ "{:,}".format(r.total_tokens) }}</div><div class="label">Tokens ({{ r.prompt_tokens }}p / {{ r.completion_tokens }}c)</div></div>
+                  {% if r.total_tokens is not none %}
+                  <div class="metric"><div class="value">{{ "{:,}".format(r.total_tokens) }}</div><div class="label">Tokens ({{ r.prompt_tokens }}p / {{ r.completion_tokens }}c){% if r.model_name %} - {{ r.model_name }}{% endif %}</div></div>
                   {% endif %}
                   {% if r.kb_bucket is not none %}
                   <div class="metric">

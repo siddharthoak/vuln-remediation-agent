@@ -100,6 +100,7 @@ class AdkVertexEngine:
             files_changed=list(dict.fromkeys(self._applied_changes)),
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            model_name=self._model_name,
         )
 
     async def _run_agent_async(self, agent: Agent) -> tuple:
