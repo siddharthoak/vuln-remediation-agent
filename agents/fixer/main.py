@@ -436,7 +436,7 @@ def _do_fresh_scan():
             
             with push_lock:
                 try:
-                    repo.commit_changes(commit_msg)
+                    repo.commit_changes(commit_msg, files=summary.files_changed)
                     # Fetch and rebase to merge other threads' pushes
                     repo._repo.git.pull('--rebase', 'origin', branch_name)
                     repo.push_branch(branch_name)
@@ -595,7 +595,7 @@ def _run_retry(tracking_id: str):
             f"fix(retry): attempt {record.attempt_number} — "
             f"{summary.rationale[:120] if summary.rationale else 'CI failure fix'}"
         )
-        repo.commit_changes(commit_msg)
+        repo.commit_changes(commit_msg, files=summary.files_changed)
         repo.push_branch(record.branch_name)
 
     record = tracking_store.get(tracking_id)
