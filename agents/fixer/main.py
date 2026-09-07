@@ -300,12 +300,10 @@ def _do_fresh_scan():
         source_repo.cleanup()
         return
 
-    successful_fixes = []
-
-    with RepoOps() as repo:
-        repo.clone_local(source_path, github_repo_url, github_pat)
-        branch_created = repo.create_branch(branch_name, skip_if_exists=True)
-        
+    # Create the shared branch once before threads start
+    with RepoOps() as init_repo:
+        init_repo.clone(github_repo_url, github_pat)
+        branch_created = init_repo.create_branch(branch_name, skip_if_exists=True)
         if not branch_created:
             existing_pr = pr_client.find_any_pr(branch_name, base_branch)
             if existing_pr:
@@ -322,12 +320,21 @@ def _do_fresh_scan():
                 logger.warning("Branch already exists but no PR found. Leaving records as CREATED.")
             source_repo.cleanup()
             return
-            
-        fixer = CodeFixer(repo_path=repo._local_path)
+        # push the initial branch so workers can pull from it
+        init_repo.push_branch(branch_name)
+
+    push_lock = threading.Lock()
+
+    def _fix_one_concurrent(task):
+        finding, record, kb_entry = task
+        logger.info("Processing %s on branch %s in isolated clone", finding.component_name, branch_name)
         
-        for task in tasks:
-            finding, record, kb_entry = task
-            logger.info("Processing %s on branch %s", finding.component_name, branch_name)
+        with RepoOps() as repo:
+            repo.clone_local(source_path, github_repo_url, github_pat)
+            repo._repo.git.fetch('origin', branch_name)
+            repo._repo.git.checkout(branch_name)
+            
+            fixer = CodeFixer(repo_path=repo._local_path)
             
             try:
                 if finding.is_transitive:
@@ -361,8 +368,7 @@ def _do_fresh_scan():
                 current = tracking_store.get(record.tracking_id)
                 current.status = "TRIAGE_OPENED"
                 tracking_store.update(current)
-                repo._repo.git.reset('--hard')
-                continue
+                return None
             except Exception as exc:
                 logger.exception("Fix failed for %s", finding.component_name)
                 current = tracking_store.get(record.tracking_id)
@@ -378,8 +384,7 @@ def _do_fresh_scan():
                     )
                 except Exception:
                     pass
-                repo._repo.git.reset('--hard')
-                continue
+                return None
                 
             tests_passed, test_message = ecosystem.verify_tests(repo._local_path)
             if not tests_passed:
@@ -396,8 +401,7 @@ def _do_fresh_scan():
                     )
                 except Exception:
                     pass
-                repo._repo.git.reset('--hard')
-                continue
+                return None
                 
             try:
                 review = repo.review_dependency_diff(
@@ -422,23 +426,47 @@ def _do_fresh_scan():
                     )
                 except Exception:
                     pass
-                repo._repo.git.reset('--hard')
-                continue
+                return None
                 
             fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"
             commit_msg = (
                 f"fix: upgrade {finding.component_name} to {finding.recommended_version} ({fix_kind})"
                 + (f" ({', '.join(finding.cve_ids)})" if finding.cve_ids else "")
             )
-            repo.commit_changes(commit_msg)
             
-            successful_fixes.append((finding, record, summary))
-            
-        if successful_fixes:
-            repo.push_branch(branch_name)
+            with push_lock:
+                try:
+                    repo.commit_changes(commit_msg)
+                    # Fetch and rebase to merge other threads' pushes
+                    repo._repo.git.pull('--rebase', 'origin', branch_name)
+                    repo.push_branch(branch_name)
+                    return (finding, record, summary)
+                except Exception as e:
+                    logger.error("Failed to push %s due to rebase conflict or error: %s", finding.component_name, e)
+                    try:
+                        repo._repo.git.rebase('--abort')
+                    except Exception:
+                        pass
+                    message = f"Merge conflict or push error during combined PR assembly: {e}"
+                    current = tracking_store.get(record.tracking_id)
+                    if current is not None:
+                        current.status = TrackingStatus.ESCALATED.value
+                        current.failure_log_excerpt = message[:4000]
+                        tracking_store.update(current)
+                    return None
 
-    source_repo.cleanup()
-    logger.info("Source clone cleaned up.")
+    successful_fixes = []
+    
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_FIXES) as executor:
+            futures = {executor.submit(_fix_one_concurrent, t): t for t in tasks}
+            for future in as_completed(futures):
+                res = future.result()
+                if res:
+                    successful_fixes.append(res)
+    finally:
+        source_repo.cleanup()
+        logger.info("Source clone cleaned up.")
 
     if successful_fixes:
         pr_result = pr_client.open_combined_remediation_pr(
@@ -456,6 +484,7 @@ def _do_fresh_scan():
             logger.info("Combined PR already existed: %s", pr_result.pr_url)
         else:
             logger.info("Opened Combined PR #%d: %s", pr_result.pr_number, pr_result.pr_url)
+
 
 
 
