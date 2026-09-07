@@ -274,13 +274,14 @@ def _do_fresh_scan():
             )
     # ─────────────────────────────────────────────────────────────────────────
 
+    branch_name = "fix/vulnerability-remediation"
+    
     tasks = []
     for finding in findings:
         result = classification[finding.component_name]
         if result.bucket in (1, 4):
             continue  # triage issue already created above
 
-        branch_name = RepoOps.make_branch_name(finding.component_name, finding.current_version)
         record = make_fresh_record(
             vulnerability_id=finding.cve_ids[0] if finding.cve_ids else finding.component_name,
             repo=github_repo,
@@ -293,41 +294,41 @@ def _do_fresh_scan():
         record.kb_entry_id  = result.kb_entry.entry_id if result.kb_entry else None
         record.classifier_rationale = result.rationale
         tracking_store.create(record)
-        tasks.append((finding, branch_name, record, result.kb_entry))
+        tasks.append((finding, record, result.kb_entry))
 
-    def _fix_one(task):
-        finding, branch_name, record, kb_entry = task
-        logger.info("Processing %s → branch %s", finding.component_name, branch_name)
+    if not tasks:
+        source_repo.cleanup()
+        return
 
-        with RepoOps() as repo:
-            repo.clone_local(source_path, github_repo_url, github_pat)
-            branch_created = repo.create_branch(branch_name, skip_if_exists=True)
-            if not branch_created:
-                # The branch existing means a PR was very likely opened for
-                # it on some earlier run -- attach it (whatever its current
-                # state) rather than silently abandoning this tracking
-                # record at CREATED forever. find_any_pr checks state="all",
-                # not just "open", so a PR that's since been closed manually
-                # still gets linked -- see PRClient.find_any_pr's docstring.
-                existing_pr = pr_client.find_any_pr(branch_name, base_branch)
-                if existing_pr:
-                    logger.info(
-                        "Branch already exists for %s -- found PR #%d (%s), attaching to tracking record.",
-                        finding.component_name, existing_pr.pr_number, existing_pr.pr_url,
-                    )
+    successful_fixes = []
+
+    with RepoOps() as repo:
+        repo.clone_local(source_path, github_repo_url, github_pat)
+        branch_created = repo.create_branch(branch_name, skip_if_exists=True)
+        
+        if not branch_created:
+            existing_pr = pr_client.find_any_pr(branch_name, base_branch)
+            if existing_pr:
+                logger.info(
+                    "Branch already exists -- found PR #%d (%s), attaching to tracking records.",
+                    existing_pr.pr_number, existing_pr.pr_url,
+                )
+                for finding, record, kb_entry in tasks:
                     current = tracking_store.get(record.tracking_id)
                     current.pr_number = existing_pr.pr_number
                     current.status = TrackingStatus.PR_OPENED.value
                     tracking_store.update(current)
-                else:
-                    logger.warning(
-                        "Branch already exists for %s but no PR found for it in any "
-                        "state -- leaving tracking record as CREATED for manual investigation.",
-                        finding.component_name,
-                    )
-                return None
-
-            fixer = CodeFixer(repo_path=repo._local_path)
+            else:
+                logger.warning("Branch already exists but no PR found. Leaving records as CREATED.")
+            source_repo.cleanup()
+            return
+            
+        fixer = CodeFixer(repo_path=repo._local_path)
+        
+        for task in tasks:
+            finding, record, kb_entry = task
+            logger.info("Processing %s on branch %s", finding.component_name, branch_name)
+            
             try:
                 if finding.is_transitive:
                     summary = fixer.run_transitive_fix(
@@ -352,19 +353,16 @@ def _do_fresh_scan():
             except PomXMLError as exc:
                 logger.warning(
                     "Could not process dependency %s in pom.xml; opening triage issue: %s",
-                    finding.component_name,
-                    exc,
+                    finding.component_name, exc,
                 )
                 pr_client.open_triage_issue(
-                    finding=finding,
-                    bucket=2,
-                    rationale=str(exc),
-                    kb_entry=kb_entry,
+                    finding=finding, bucket=2, rationale=str(exc), kb_entry=kb_entry,
                 )
                 current = tracking_store.get(record.tracking_id)
                 current.status = "TRIAGE_OPENED"
                 tracking_store.update(current)
-                return None
+                repo._repo.git.reset('--hard')
+                continue
             except Exception as exc:
                 logger.exception("Fix failed for %s", finding.component_name)
                 current = tracking_store.get(record.tracking_id)
@@ -372,34 +370,20 @@ def _do_fresh_scan():
                     current.status = TrackingStatus.ESCALATED.value
                     current.failure_log_excerpt = str(exc)[:4000]
                     tracking_store.update(current)
-                else:
-                    logger.error(
-                        "Could not update tracking record %s after fix failure.",
-                        record.tracking_id[:8],
-                    )
                 try:
                     pr_client.open_triage_issue(
-                        finding=finding,
-                        bucket=2,
-                        rationale=(
-                            "Automatic remediation failed unexpectedly and requires "
-                            f"manual investigation: {str(exc)[:1000]}"
-                        ),
+                        finding=finding, bucket=2,
+                        rationale=f"Automatic remediation failed: {str(exc)[:1000]}",
                         kb_entry=kb_entry,
                     )
                 except Exception:
-                    logger.exception(
-                        "Could not open triage issue for failed fix %s.",
-                        finding.component_name,
-                    )
-                return None
-
+                    pass
+                repo._repo.git.reset('--hard')
+                continue
+                
             tests_passed, test_message = ecosystem.verify_tests(repo._local_path)
             if not tests_passed:
-                message = (
-                    f"Runtime verification failed for {finding.component_name}: "
-                    f"{test_message[:3500]}"
-                )
+                message = f"Runtime verification failed for {finding.component_name}: {test_message[:3500]}"
                 logger.error("%s", message)
                 current = tracking_store.get(record.tracking_id)
                 if current is not None:
@@ -408,19 +392,13 @@ def _do_fresh_scan():
                     tracking_store.update(current)
                 try:
                     pr_client.open_triage_issue(
-                        finding=finding,
-                        bucket=2,
-                        rationale=message,
-                        kb_entry=kb_entry,
+                        finding=finding, bucket=2, rationale=message, kb_entry=kb_entry,
                     )
                 except Exception:
-                    logger.exception(
-                        "Could not open triage issue after runtime verification "
-                        "failure for %s.",
-                        finding.component_name,
-                    )
-                return None
-
+                    pass
+                repo._repo.git.reset('--hard')
+                continue
+                
             try:
                 review = repo.review_dependency_diff(
                     component_name=finding.component_name,
@@ -429,6 +407,7 @@ def _do_fresh_scan():
                 )
             except Exception as exc:
                 review = DiffReviewResult(False, f"Diff review could not run: {exc}")
+                
             if not review.passed:
                 message = f"Automated diff review failed: {review.message}"
                 logger.error("%s", message)
@@ -439,58 +418,45 @@ def _do_fresh_scan():
                     tracking_store.update(current)
                 try:
                     pr_client.open_triage_issue(
-                        finding=finding,
-                        bucket=2,
-                        rationale=message,
-                        kb_entry=kb_entry,
+                        finding=finding, bucket=2, rationale=message, kb_entry=kb_entry,
                     )
                 except Exception:
-                    logger.exception(
-                        "Could not open triage issue after diff review failure for %s.",
-                        finding.component_name,
-                    )
-                return None
-
+                    pass
+                repo._repo.git.reset('--hard')
+                continue
+                
             fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"
             commit_msg = (
                 f"fix: upgrade {finding.component_name} to {finding.recommended_version} ({fix_kind})"
                 + (f" ({', '.join(finding.cve_ids)})" if finding.cve_ids else "")
             )
             repo.commit_changes(commit_msg)
+            
+            successful_fixes.append((finding, record, summary))
+            
+        if successful_fixes:
             repo.push_branch(branch_name)
 
-        return (finding, branch_name, record, summary)
-    try:
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_FIXES) as executor:
-            futures = {executor.submit(_fix_one, t): t for t in tasks}
+    source_repo.cleanup()
+    logger.info("Source clone cleaned up.")
 
-            for future in as_completed(futures):
-                result = future.result()
-                if result is None:
-                    continue
+    if successful_fixes:
+        pr_result = pr_client.open_combined_remediation_pr(
+            branch_name=branch_name,
+            base_branch=base_branch,
+            successful_fixes=successful_fixes,
+        )
+        for finding, record, summary in successful_fixes:
+            current = tracking_store.get(record.tracking_id)
+            current.pr_number = pr_result.pr_number
+            current.status = TrackingStatus.PR_OPENED.value if pr_result.was_existing else TrackingStatus.CI_PENDING.value
+            tracking_store.update(current)
+            
+        if pr_result.was_existing:
+            logger.info("Combined PR already existed: %s", pr_result.pr_url)
+        else:
+            logger.info("Opened Combined PR #%d: %s", pr_result.pr_number, pr_result.pr_url)
 
-                finding, branch_name, record, summary = result
-
-                pr_result = pr_client.open_remediation_pr(
-                    branch_name=branch_name,
-                    base_branch=base_branch,
-                    change_summary=summary,
-                )
-
-                record = tracking_store.get(record.tracking_id)
-                record.pr_number = pr_result.pr_number
-                record.status = TrackingStatus.PR_OPENED.value
-                tracking_store.update(record)
-
-                if pr_result.was_existing:
-                    logger.info("PR already existed: %s", pr_result.pr_url)
-                else:
-                    logger.info("Opened PR #%d: %s", pr_result.pr_number, pr_result.pr_url)
-                    record.status = TrackingStatus.CI_PENDING.value
-                    tracking_store.update(record)
-    finally:
-        source_repo.cleanup()
-        logger.info("Source clone cleaned up.")
 
 
 # ── Mode B: Watcher retry ─────────────────────────────────────────────────────

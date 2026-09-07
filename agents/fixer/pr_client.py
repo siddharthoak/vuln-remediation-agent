@@ -84,6 +84,63 @@ class PRClient:
         logger.info("Created PR #%d: %s", pr.number, pr.html_url)
         return PRResult(pr_number=pr.number, pr_url=pr.html_url, was_existing=False)
 
+    def open_combined_remediation_pr(
+        self,
+        branch_name: str,
+        base_branch: str,
+        successful_fixes: list,
+    ) -> PRResult:
+        """
+        Open a single pull request for multiple remediations on the given branch.
+        """
+        existing = self._find_open_pr(branch_name, base_branch)
+        if existing:
+            logger.info(
+                "Open PR #%d already exists for branch '%s' — skipping creation.",
+                existing.number,
+                branch_name,
+            )
+            return PRResult(
+                pr_number=existing.number,
+                pr_url=existing.html_url,
+                was_existing=True,
+            )
+
+        title = "fix: multiple vulnerability remediations"
+        
+        body_parts = ["## OSS Vulnerability Remediation (Combined)\n"]
+        for finding, record, change_summary in successful_fixes:
+            cve_list = ", ".join(finding.cve_ids) if finding.cve_ids else "see Nexus IQ report"
+            files_list = "\n".join(f"- `{f}`" for f in change_summary.files_changed)
+            
+            body_parts.append(f"### Component: `{finding.component_name}`")
+            body_parts.append(f"**Previous version:** `{finding.current_version}`")
+            body_parts.append(f"**Remediated version:** `{finding.recommended_version}`")
+            body_parts.append(f"**CVEs addressed:** {cve_list}")
+            body_parts.append(f"\n**Changes made:**\n{files_list}")
+            body_parts.append(f"\n**Rationale:**\n{change_summary.rationale}\n---")
+
+        body_parts.append("\n> This PR was opened automatically by the OSS Remediation Agent.")
+        body_parts.append("> Human review is required before merge.")
+        
+        body = "\n".join(body_parts)
+
+        try:
+            pr = self._repo.create_pull(
+                title=title,
+                body=body,
+                head=branch_name,
+                base=base_branch,
+                draft=False,
+            )
+        except GithubException as exc:
+            raise RuntimeError(
+                f"Failed to create PR for branch '{branch_name}': {exc.data}"
+            ) from exc
+
+        logger.info("Created PR #%d: %s", pr.number, pr.html_url)
+        return PRResult(pr_number=pr.number, pr_url=pr.html_url, was_existing=False)
+
     def find_any_pr(self, branch_name: str, base_branch: str) -> Optional[PRResult]:
         """Return the most recent PR for head=branch_name in ANY state (open,
         closed, or merged), or None if no PR was ever opened for this branch.
