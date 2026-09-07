@@ -1,10 +1,11 @@
 import os
 import json
+import glob
 import urllib.request
 import urllib.error
 
 PAT = 'REDACTED_DUMMY_GITHUB_PAT_VALUE_00000000'
-REPO = 'Neurealm-Gaurav/vul-app'
+REPO = 'Neurealm-Gaurav/Test_repo_1'
 
 url = f'https://api.github.com/repos/{REPO}/pulls?state=open'
 req = urllib.request.Request(url, headers={'Authorization': f'token {PAT}', 'Accept': 'application/vnd.github.v3+json'})
@@ -37,3 +38,13 @@ with open('data/tracking.json', 'w') as f:
 
 with open('data/kb.json', 'w') as f:
     f.write('{}')
+
+try:
+    with open('data/scan_poll_checkpoint.json', 'w') as f:
+        f.write('{}')
+except:
+    pass
+
+for report in glob.glob('scan-reports/*.json'):
+    os.remove(report)
+    print(f"Deleted {report}")
