@@ -20,6 +20,8 @@ import logging
 import os
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -33,6 +35,8 @@ from fastapi.templating import Jinja2Templates
 
 from common.tracking_store import make_tracking_store, TrackingStatus  # noqa: E402
 from common.knowledge_store import make_knowledge_store  # noqa: E402
+from common.config import get_target_repo, get_github_pat, save_config, normalize_repo_name  # noqa: E402
+from common.reset_ops import reset_repository_state  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +177,7 @@ def _fetch_pr_states(repo: str) -> dict:
         return cached[1]
 
     url = f"https://api.github.com/repos/{repo}/pulls?state=all&per_page=100"
-    pat = os.environ.get("GITHUB_PAT")
+    pat = get_github_pat()
 
     prs = None
     if pat:
@@ -365,6 +369,23 @@ def _sidebar_status() -> dict:
     }
 
 
+def _repo_config_context(notice: dict = None) -> dict:
+    repo = get_target_repo()
+    pat = get_github_pat()
+    masked_pat = ""
+    if pat:
+        masked_pat = pat[:4] + "*" * max(0, len(pat) - 8) + pat[-4:] if len(pat) > 8 else "****"
+    return {
+        "config": {
+            "repo": repo,
+            "pat": pat,
+            "masked_pat": masked_pat,
+            "has_pat": bool(pat),
+        },
+        "notice": notice,
+    }
+
+
 # ── Routes: full page ──────────────────────────────────────────────────────
 
 @app.get("/")
@@ -374,8 +395,131 @@ def index(request: Request):
         "records": records,
         "has_records": bool(records),
         "sidebar": _sidebar_status(),
+        **_repo_config_context(),
         **_run_history_context(records),
     })
+
+
+# ── Routes: partials & API actions ──────────────────────────────────────────
+
+@app.get("/partials/repo-config")
+def partial_repo_config(request: Request):
+    return templates.TemplateResponse(request, "partials/repo_config.html", _repo_config_context())
+
+
+@app.post("/api/config")
+async def api_save_config(request: Request):
+    body = await request.body()
+    form_data = urllib.parse.parse_qs(body.decode("utf-8", errors="ignore"))
+    repo_val = form_data.get("repo", [""])[0].strip()
+    pat_val = form_data.get("pat", [""])[0].strip()
+
+    if not repo_val:
+        ctx = _repo_config_context(notice={"type": "err", "message": "Repository cannot be empty."})
+        return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+    clean_repo = normalize_repo_name(repo_val)
+    active_pat = pat_val if pat_val else get_github_pat()
+
+    warning = ""
+    if active_pat:
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{clean_repo}",
+                headers={
+                    "Authorization": f"Bearer {active_pat}",
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "vuln-remediation-agent",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                if resp.status == 200:
+                    pass
+        except urllib.error.HTTPError as he:
+            if he.code == 404:
+                warning = f" (Warning: repo '{clean_repo}' returned 404 — verify owner/repo and PAT access)"
+            elif he.code == 401:
+                warning = " (Warning: GitHub returned 401 Unauthorized — verify PAT)"
+        except Exception:
+            pass
+
+    save_config(clean_repo, pat_val if pat_val else None)
+    _PR_STATE_CACHE.clear()
+
+    notice_msg = f"Target repository switched to '{clean_repo}'!{warning}"
+    ctx = _repo_config_context(notice={"type": "warn" if warning else "ok", "message": notice_msg})
+    return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+
+@app.post("/api/reset")
+async def api_reset(request: Request):
+    repo = get_target_repo()
+    pat = get_github_pat()
+
+    if not repo:
+        ctx = _repo_config_context(notice={"type": "err", "message": "No target repository configured."})
+        return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+    try:
+        res = reset_repository_state(repo=repo, pat=pat, keep_kb=True)
+        _PR_STATE_CACHE.clear()
+
+        msg_parts = [f"Reset complete for {repo}!"]
+        if res["prs_closed"]:
+            msg_parts.append(f"Closed PR(s): {', '.join(map(str, res['prs_closed']))}.")
+        if res["branches_deleted"]:
+            msg_parts.append(f"Deleted branch(es): {', '.join(res['branches_deleted'])}.")
+        msg_parts.append("Tracking state & scan reports cleared.")
+        msg_parts.append("Knowledge Base (kb.json) preserved!")
+        if res["errors"]:
+            msg_parts.append(f"Warnings: {'; '.join(res['errors'])}")
+
+        ctx = _repo_config_context(notice={"type": "ok", "message": " ".join(msg_parts)})
+    except Exception as exc:
+        logger.error("Reset failed: %s", exc, exc_info=True)
+        ctx = _repo_config_context(notice={"type": "err", "message": f"Reset failed: {exc}"})
+
+    return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+
+@app.post("/api/trigger-scan")
+async def api_trigger_scan(request: Request):
+    repo = get_target_repo()
+    pat = get_github_pat()
+
+    if not repo:
+        ctx = _repo_config_context(notice={"type": "err", "message": "No target repository configured."})
+        return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+    if not pat:
+        ctx = _repo_config_context(notice={"type": "err", "message": "GitHub PAT required to trigger scan workflow."})
+        return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/security-scan.yml/dispatches"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"ref": "main"}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {pat}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "vuln-remediation-agent",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status in (200, 204):
+                msg = f"Dispatched security-scan.yml on GitHub Actions for '{repo}' (ref: main)! ScanPoller will detect it once complete."
+                ctx = _repo_config_context(notice={"type": "ok", "message": msg})
+            else:
+                ctx = _repo_config_context(notice={"type": "warn", "message": f"Workflow dispatch returned status {resp.status}."})
+    except urllib.error.HTTPError as he:
+        err_body = he.read().decode("utf-8", errors="ignore")
+        msg = f"Failed to trigger scan workflow (HTTP {he.code}): {he.reason}. {err_body}"
+        ctx = _repo_config_context(notice={"type": "err", "message": msg})
+    except Exception as exc:
+        ctx = _repo_config_context(notice={"type": "err", "message": f"Failed to trigger workflow: {exc}"})
+
+    return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
 
 
 # ── Routes: partials (HTMX targets, each self-polling) ─────────────────────

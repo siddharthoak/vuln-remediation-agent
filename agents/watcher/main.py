@@ -30,6 +30,7 @@ from pattern_learner import PatternLearner
 
 from common.tracking_store import make_tracking_store, TrackingStatus
 from common.knowledge_store import make_knowledge_store
+from common.config import get_target_repo, get_github_pat
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,8 +73,12 @@ def main():
 
 
 def _run_once():
-    github_repo = os.environ["GITHUB_REPO_TARGET"]
-    github_pat  = os.environ["GITHUB_PAT"]
+    github_repo = get_target_repo()
+    github_pat  = get_github_pat()
+
+    if not github_repo:
+        logger.warning("No target repository configured. Skipping watcher cycle.")
+        return
 
     gh   = Github(github_pat)
     repo = gh.get_repo(github_repo)

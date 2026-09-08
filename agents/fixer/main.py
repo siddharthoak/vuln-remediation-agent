@@ -11,8 +11,10 @@ tracking record lifecycle, and PR creation are all UNCHANGED.
 import logging
 import os
 import sys
+import multiprocessing
+import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json as _json
 from types import SimpleNamespace
@@ -35,6 +37,8 @@ from common.tracking_store import (
     TrackingStatus,
 )
 from common.knowledge_store import make_knowledge_store
+from common.file_lock import FileLock
+from common.config import get_target_repo, get_github_pat
 from knowledge.main import KnowledgeAgent
 from classifier.classifier import Classifier, ClassifierResult
 
@@ -76,8 +80,8 @@ def _run_server():
       2. HTTP server on :8080 — accepts POST /retry from the Watcher and
          invokes _run_retry() for CI-failure re-fix attempts.
     """
-    github_repo = os.environ["GITHUB_REPO_TARGET"]
-    github_pat  = os.environ["GITHUB_PAT"]
+    github_repo = get_target_repo()
+    github_pat  = get_github_pat()
     report_dir  = os.environ.get("SCAN_REPORT_PATH", "/reports")
     poll_interval = int(os.environ.get("SCAN_POLL_INTERVAL", "60"))
 
@@ -130,18 +134,203 @@ def _make_retry_server(port: int) -> HTTPServer:
             self.send_response(202)
             self.end_headers()
 
-            threading.Thread(
+            multiprocessing.Process(
                 target=_run_retry,
                 args=(tracking_id,),
                 daemon=True,
                 name=f"retry-{tracking_id[:8]}",
             ).start()
-            logger.info("Retry accepted for tracking_id=%s", tracking_id[:8])
+            logger.info("Retry accepted for tracking_id=%s (spawned process)", tracking_id[:8])
 
         def log_message(self, fmt, *args):  # suppress default access log noise
             logger.debug("HTTP %s", fmt % args)
 
     return HTTPServer(("0.0.0.0", port), RetryHandler)
+
+
+# ── Multiprocessing worker for parallel remediation ──────────────────────────
+
+def _fix_one_process_worker(task: dict):
+    """
+    Worker executed in an independent OS process via ProcessPoolExecutor.
+    Bypasses Python's Global Interpreter Lock (GIL) for true process-level parallelism.
+    """
+    finding = task["finding"]
+    record = task["record"]
+    kb_entry = task["kb_entry"]
+    source_path = task["source_path"]
+    branch_name = task["branch_name"]
+    github_repo = task["github_repo"]
+    github_repo_url = task["github_repo_url"]
+    github_pat = task["github_pat"]
+
+    logger.info(
+        "Processing %s on branch %s in isolated process (PID %d)",
+        finding.component_name, branch_name, os.getpid()
+    )
+
+    tracking_store = make_tracking_store()
+    pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+
+    with RepoOps() as repo:
+        repo.clone_local(source_path, github_repo_url, github_pat)
+        repo._repo.git.fetch('origin', branch_name)
+        repo._repo.git.checkout(branch_name)
+
+        fixer = CodeFixer(repo_path=repo._local_path)
+        ecosystem = get_ecosystem(repo._local_path)
+
+        try:
+            if finding.is_transitive:
+                summary = fixer.run_transitive_fix(
+                    component_name=finding.component_name,
+                    current_version=finding.current_version,
+                    target_version=finding.recommended_version,
+                    introduced_by=finding.introduced_by,
+                    tracking_id=record.tracking_id,
+                    tracking_store=tracking_store,
+                    cve_ids=finding.cve_ids,
+                )
+            else:
+                summary = fixer.run_fresh_fix(
+                    component_name=finding.component_name,
+                    current_version=finding.current_version,
+                    target_version=finding.recommended_version,
+                    tracking_id=record.tracking_id,
+                    tracking_store=tracking_store,
+                    cve_ids=finding.cve_ids,
+                    kb_entry=kb_entry,
+                )
+        except PomXMLError as exc:
+            logger.warning(
+                "Could not process dependency %s in pom.xml; opening triage issue: %s",
+                finding.component_name, exc,
+            )
+            pr_client.open_triage_issue(
+                finding=finding, bucket=2, rationale=str(exc), kb_entry=kb_entry,
+            )
+            current = tracking_store.get(record.tracking_id)
+            if current is not None:
+                current.status = "TRIAGE_OPENED"
+                tracking_store.update(current)
+            return None
+        except Exception as exc:
+            logger.exception("Fix failed for %s", finding.component_name)
+            current = tracking_store.get(record.tracking_id)
+            if current is not None:
+                current.status = TrackingStatus.ESCALATED.value
+                current.failure_log_excerpt = str(exc)[:4000]
+                tracking_store.update(current)
+            try:
+                pr_client.open_triage_issue(
+                    finding=finding, bucket=2,
+                    rationale=f"Automatic remediation failed: {str(exc)[:1000]}",
+                    kb_entry=kb_entry,
+                )
+            except Exception:
+                pass
+            return None
+
+        tests_passed, test_message = ecosystem.verify_tests(repo._local_path)
+        if not tests_passed:
+            message = f"Runtime verification failed for {finding.component_name}: {test_message[:3500]}"
+            logger.error("%s", message)
+            current = tracking_store.get(record.tracking_id)
+            if current is not None:
+                current.status = TrackingStatus.ESCALATED.value
+                current.failure_log_excerpt = message[:4000]
+                tracking_store.update(current)
+            try:
+                pr_client.open_triage_issue(
+                    finding=finding, bucket=2, rationale=message, kb_entry=kb_entry,
+                )
+            except Exception:
+                pass
+            return None
+
+        try:
+            review = repo.review_dependency_diff(
+                component_name=finding.component_name,
+                target_version=finding.recommended_version,
+                expected_files=summary.files_changed,
+            )
+        except Exception as exc:
+            review = DiffReviewResult(False, f"Diff review could not run: {exc}")
+
+        if not review.passed:
+            message = f"Automated diff review failed: {review.message}"
+            logger.error("%s", message)
+            current = tracking_store.get(record.tracking_id)
+            if current is not None:
+                current.status = TrackingStatus.ESCALATED.value
+                current.failure_log_excerpt = message[:4000]
+                tracking_store.update(current)
+            try:
+                pr_client.open_triage_issue(
+                    finding=finding, bucket=2, rationale=message, kb_entry=kb_entry,
+                )
+            except Exception:
+                pass
+            return None
+
+        fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"
+        commit_msg = (
+            f"fix: upgrade {finding.component_name} to {finding.recommended_version} ({fix_kind})"
+            + (f" ({', '.join(finding.cve_ids)})" if finding.cve_ids else "")
+        )
+
+        lock_path = os.path.join(tempfile.gettempdir(), f"fixer_push_{branch_name.replace('/', '_')}.lock")
+        with FileLock(lock_path, timeout_seconds=180.0):
+            try:
+                repo.commit_changes(commit_msg, files=summary.files_changed)
+                # Fetch and rebase to merge other processes' pushes
+                repo._repo.git.pull('--rebase', 'origin', branch_name)
+                repo.push_branch(branch_name)
+                return (finding, record, summary)
+            except Exception as e:
+                logger.warning("Rebase conflict for %s. Retrying fix holding process lock...", finding.component_name)
+                try:
+                    repo._repo.git.rebase('--abort')
+                except Exception:
+                    pass
+
+                try:
+                    repo._repo.git.fetch('origin', branch_name)
+                    repo._repo.git.reset('--hard', f'origin/{branch_name}')
+
+                    if finding.is_transitive:
+                        summary = fixer.run_transitive_fix(
+                            component_name=finding.component_name,
+                            current_version=finding.current_version,
+                            target_version=finding.recommended_version,
+                            introduced_by=finding.introduced_by,
+                            tracking_id=record.tracking_id,
+                            tracking_store=tracking_store,
+                            cve_ids=finding.cve_ids,
+                        )
+                    else:
+                        summary = fixer.run_fresh_fix(
+                            component_name=finding.component_name,
+                            current_version=finding.current_version,
+                            target_version=finding.recommended_version,
+                            tracking_id=record.tracking_id,
+                            tracking_store=tracking_store,
+                            cve_ids=finding.cve_ids,
+                            kb_entry=kb_entry,
+                        )
+
+                    repo.commit_changes(commit_msg, files=summary.files_changed)
+                    repo.push_branch(branch_name)
+                    return (finding, record, summary)
+                except Exception as inner_e:
+                    logger.error("Failed to re-apply fix during conflict resolution: %s", inner_e)
+                    message = f"Merge conflict could not be automatically resolved: {inner_e}"
+                    current = tracking_store.get(record.tracking_id)
+                    if current is not None:
+                        current.status = TrackingStatus.ESCALATED.value
+                        current.failure_log_excerpt = message[:4000]
+                        tracking_store.update(current)
+                    return None
 
 
 # ── Mode A: fresh scan ────────────────────────────────────────────────────────
@@ -159,9 +348,9 @@ def _run_fresh_scan():
 def _do_fresh_scan():
     logger.info("Mode: FRESH SCAN (scheduler-triggered)")
 
-    github_repo     = os.environ["GITHUB_REPO_TARGET"]
+    github_repo     = get_target_repo()
     github_repo_url = f"https://github.com/{github_repo}.git"
-    github_pat      = os.environ["GITHUB_PAT"]
+    github_pat      = get_github_pat()
 
     server_mode = os.environ.get("FIXER_SERVER_MODE", "0") == "1"
 
@@ -334,181 +523,37 @@ def _do_fresh_scan():
         # push the initial branch so workers can pull from it
         init_repo.push_branch(branch_name)
 
-    push_lock = threading.Lock()
-
-    def _fix_one_concurrent(task):
-        finding, record, kb_entry = task
-        logger.info("Processing %s on branch %s in isolated clone", finding.component_name, branch_name)
-        
-        with RepoOps() as repo:
-            repo.clone_local(source_path, github_repo_url, github_pat)
-            repo._repo.git.fetch('origin', branch_name)
-            repo._repo.git.checkout(branch_name)
-            
-            fixer = CodeFixer(repo_path=repo._local_path)
-            
-            try:
-                if finding.is_transitive:
-                    summary = fixer.run_transitive_fix(
-                        component_name=finding.component_name,
-                        current_version=finding.current_version,
-                        target_version=finding.recommended_version,
-                        introduced_by=finding.introduced_by,
-                        tracking_id=record.tracking_id,
-                        tracking_store=tracking_store,
-                        cve_ids=finding.cve_ids,
-                    )
-                else:
-                    summary = fixer.run_fresh_fix(
-                        component_name=finding.component_name,
-                        current_version=finding.current_version,
-                        target_version=finding.recommended_version,
-                        tracking_id=record.tracking_id,
-                        tracking_store=tracking_store,
-                        cve_ids=finding.cve_ids,
-                        kb_entry=kb_entry,
-                    )
-            except PomXMLError as exc:
-                logger.warning(
-                    "Could not process dependency %s in pom.xml; opening triage issue: %s",
-                    finding.component_name, exc,
-                )
-                pr_client.open_triage_issue(
-                    finding=finding, bucket=2, rationale=str(exc), kb_entry=kb_entry,
-                )
-                current = tracking_store.get(record.tracking_id)
-                current.status = "TRIAGE_OPENED"
-                tracking_store.update(current)
-                return None
-            except Exception as exc:
-                logger.exception("Fix failed for %s", finding.component_name)
-                current = tracking_store.get(record.tracking_id)
-                if current is not None:
-                    current.status = TrackingStatus.ESCALATED.value
-                    current.failure_log_excerpt = str(exc)[:4000]
-                    tracking_store.update(current)
-                try:
-                    pr_client.open_triage_issue(
-                        finding=finding, bucket=2,
-                        rationale=f"Automatic remediation failed: {str(exc)[:1000]}",
-                        kb_entry=kb_entry,
-                    )
-                except Exception:
-                    pass
-                return None
-                
-            tests_passed, test_message = ecosystem.verify_tests(repo._local_path)
-            if not tests_passed:
-                message = f"Runtime verification failed for {finding.component_name}: {test_message[:3500]}"
-                logger.error("%s", message)
-                current = tracking_store.get(record.tracking_id)
-                if current is not None:
-                    current.status = TrackingStatus.ESCALATED.value
-                    current.failure_log_excerpt = message[:4000]
-                    tracking_store.update(current)
-                try:
-                    pr_client.open_triage_issue(
-                        finding=finding, bucket=2, rationale=message, kb_entry=kb_entry,
-                    )
-                except Exception:
-                    pass
-                return None
-                
-            try:
-                review = repo.review_dependency_diff(
-                    component_name=finding.component_name,
-                    target_version=finding.recommended_version,
-                    expected_files=summary.files_changed,
-                )
-            except Exception as exc:
-                review = DiffReviewResult(False, f"Diff review could not run: {exc}")
-                
-            if not review.passed:
-                message = f"Automated diff review failed: {review.message}"
-                logger.error("%s", message)
-                current = tracking_store.get(record.tracking_id)
-                if current is not None:
-                    current.status = TrackingStatus.ESCALATED.value
-                    current.failure_log_excerpt = message[:4000]
-                    tracking_store.update(current)
-                try:
-                    pr_client.open_triage_issue(
-                        finding=finding, bucket=2, rationale=message, kb_entry=kb_entry,
-                    )
-                except Exception:
-                    pass
-                return None
-                
-            fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"
-            commit_msg = (
-                f"fix: upgrade {finding.component_name} to {finding.recommended_version} ({fix_kind})"
-                + (f" ({', '.join(finding.cve_ids)})" if finding.cve_ids else "")
-            )
-            
-            with push_lock:
-                try:
-                    repo.commit_changes(commit_msg, files=summary.files_changed)
-                    # Fetch and rebase to merge other threads' pushes
-                    repo._repo.git.pull('--rebase', 'origin', branch_name)
-                    repo.push_branch(branch_name)
-                    return (finding, record, summary)
-                except Exception as e:
-                    logger.warning("Rebase conflict for %s. Retrying fix holding the lock...", finding.component_name)
-                    try:
-                        repo._repo.git.rebase('--abort')
-                    except Exception:
-                        pass
-                    
-                    try:
-                        # Reset our branch to match the remote branch (which someone else pushed to)
-                        repo._repo.git.fetch('origin', branch_name)
-                        repo._repo.git.reset('--hard', f'origin/{branch_name}')
-                        
-                        # Re-run the fix logic on this new base
-                        if finding.is_transitive:
-                            summary = fixer.run_transitive_fix(
-                                component_name=finding.component_name,
-                                current_version=finding.current_version,
-                                target_version=finding.recommended_version,
-                                introduced_by=finding.introduced_by,
-                                tracking_id=record.tracking_id,
-                                tracking_store=tracking_store,
-                                cve_ids=finding.cve_ids,
-                            )
-                        else:
-                            summary = fixer.run_fresh_fix(
-                                component_name=finding.component_name,
-                                current_version=finding.current_version,
-                                target_version=finding.recommended_version,
-                                tracking_id=record.tracking_id,
-                                tracking_store=tracking_store,
-                                cve_ids=finding.cve_ids,
-                                kb_entry=kb_entry,
-                            )
-                            
-                        # Try to commit and push again
-                        repo.commit_changes(commit_msg, files=summary.files_changed)
-                        repo.push_branch(branch_name)
-                        return (finding, record, summary)
-                    except Exception as inner_e:
-                        logger.error("Failed to re-apply fix during conflict resolution: %s", inner_e)
-                        message = f"Merge conflict could not be automatically resolved: {inner_e}"
-                        current = tracking_store.get(record.tracking_id)
-                        if current is not None:
-                            current.status = TrackingStatus.ESCALATED.value
-                            current.failure_log_excerpt = message[:4000]
-                            tracking_store.update(current)
-                        return None
+    worker_tasks = [
+        {
+            "finding": finding,
+            "record": record,
+            "kb_entry": kb_entry,
+            "source_path": source_path,
+            "branch_name": branch_name,
+            "github_repo": github_repo,
+            "github_repo_url": github_repo_url,
+            "github_pat": github_pat,
+            "base_branch": base_branch,
+        }
+        for finding, record, kb_entry in tasks
+    ]
 
     successful_fixes = []
-    
+
     try:
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_FIXES) as executor:
-            futures = {executor.submit(_fix_one_concurrent, t): t for t in tasks}
+        logger.info(
+            "Executing %d remediation task(s) using ProcessPoolExecutor (max_workers=%d, multiprocessing)",
+            len(worker_tasks), MAX_PARALLEL_FIXES,
+        )
+        with ProcessPoolExecutor(max_workers=MAX_PARALLEL_FIXES) as executor:
+            futures = {executor.submit(_fix_one_process_worker, t): t for t in worker_tasks}
             for future in as_completed(futures):
-                res = future.result()
-                if res:
-                    successful_fixes.append(res)
+                try:
+                    res = future.result()
+                    if res:
+                        successful_fixes.append(res)
+                except Exception as exc:
+                    logger.error("Process worker error: %s", exc, exc_info=True)
     finally:
         source_repo.cleanup()
         logger.info("Source clone cleaned up.")
@@ -538,9 +583,9 @@ def _do_fresh_scan():
 def _run_retry(tracking_id: str):
     logger.info("Mode: WATCHER RETRY (tracking_id=%s)", tracking_id[:8])
 
-    github_repo     = os.environ["GITHUB_REPO_TARGET"]
+    github_repo     = get_target_repo()
     github_repo_url = f"https://github.com/{github_repo}.git"
-    github_pat      = os.environ["GITHUB_PAT"]
+    github_pat      = get_github_pat()
 
     tracking_store = make_tracking_store()
     record = tracking_store.get(tracking_id)

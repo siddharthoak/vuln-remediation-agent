@@ -1,50 +1,65 @@
+#!/usr/bin/env python3
+"""
+Reset script for OSS Remediation Agent.
+
+Dynamically detects repository target and GitHub PAT from:
+1. data/config.json
+2. config/.env
+3. Environment variables
+
+Closes open fix PRs on GitHub, deletes remote fix branches,
+resets tracking and checkpoint state, and cleans scan reports.
+
+CRITICAL: Preserves data/kb.json so learned fixes and playbooks
+are not lost when switching repositories!
+"""
+
 import os
-import json
-import glob
-import urllib.request
-import urllib.error
+import sys
 
-PAT = 'REDACTED_DUMMY_GITHUB_PAT_VALUE_00000000'
-REPO = 'Neurealm-Gaurav/Test_repo_1'
+# Add agents directory to sys.path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "agents"))
 
-url = f'https://api.github.com/repos/{REPO}/pulls?state=open'
-req = urllib.request.Request(url, headers={'Authorization': f'token {PAT}', 'Accept': 'application/vnd.github.v3+json'})
-with urllib.request.urlopen(req) as response:
-    prs = json.loads(response.read().decode())
+from common.config import get_target_repo, get_github_pat
+from common.reset_ops import reset_repository_state
 
-for pr in prs:
-    print(f"Closing PR {pr['number']}")
-    patch_url = f'https://api.github.com/repos/{REPO}/pulls/{pr["number"]}'
-    data = json.dumps({'state': 'closed'}).encode('utf-8')
-    patch_req = urllib.request.Request(patch_url, data=data, headers={'Authorization': f'token {PAT}', 'Accept': 'application/vnd.github.v3+json'}, method='PATCH')
-    try:
-        urllib.request.urlopen(patch_req)
-        print("Closed")
-    except Exception as e:
-        print("Failed to close:", e)
 
-    branch = pr['head']['ref']
-    print(f"Deleting branch {branch}")
-    del_url = f'https://api.github.com/repos/{REPO}/git/refs/heads/{branch}'
-    del_req = urllib.request.Request(del_url, headers={'Authorization': f'token {PAT}', 'Accept': 'application/vnd.github.v3+json'}, method='DELETE')
-    try:
-        urllib.request.urlopen(del_req)
-        print("Deleted branch")
-    except Exception as e:
-        print("Failed to delete branch:", e)
+def main():
+    repo = get_target_repo()
+    pat = get_github_pat()
 
-with open('data/tracking.json', 'w') as f:
-    f.write('{}')
+    print(f"Target repository: {repo or '(none)'}")
+    if not repo:
+        print("ERROR: No target repository configured in config/.env or data/config.json")
+        sys.exit(1)
 
-with open('data/kb.json', 'w') as f:
-    f.write('{}')
+    print("Running reset (preserving Knowledge Base)...")
+    res = reset_repository_state(repo=repo, pat=pat, keep_kb=True)
 
-try:
-    with open('data/scan_poll_checkpoint.json', 'w') as f:
-        f.write('{}')
-except:
-    pass
+    if res["prs_closed"]:
+        print(f"Closed PRs: {res['prs_closed']}")
+    else:
+        print("No open PRs to close.")
 
-for report in glob.glob('scan-reports/*.json'):
-    os.remove(report)
-    print(f"Deleted {report}")
+    if res["branches_deleted"]:
+        print(f"Deleted branches: {res['branches_deleted']}")
+    else:
+        print("No remote fix branches to delete.")
+
+    if res["tracking_cleared"]:
+        print("Cleared data/tracking.json -> {}")
+    if res["checkpoint_cleared"]:
+        print("Cleared data/scan_poll_checkpoint.json -> {}")
+
+    for rep in res["reports_deleted"]:
+        print(f"Deleted report: {rep}")
+
+    print("Knowledge base preserved: kb.json was NOT wiped.")
+    if res["errors"]:
+        print(f"Warnings/Errors: {res['errors']}")
+
+    print("Reset completed successfully.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,68 @@
+<div id="repo-config-card" class="card repo-config-card">
+  <div class="card-header">
+    <strong>&#9881;&#65039; Target Repository</strong>
+  </div>
+
+  {% if notice %}
+    <div class="notice-banner {{ notice.type }}">
+      {% if notice.type == "ok" %}&#10003;{% elif notice.type == "err" %}&#10007;{% else %}&#9888;{% endif %}
+      {{ notice.message }}
+    </div>
+  {% endif %}
+
+  <form hx-post="/api/config" hx-target="#repo-config-card" hx-swap="outerHTML">
+    <div class="form-group">
+      <label class="form-label" for="repo-input">Repo Link / Name</label>
+      <input
+        type="text"
+        id="repo-input"
+        name="repo"
+        class="form-input"
+        value="{{ config.repo }}"
+        placeholder="owner/repo or https://github.com/..."
+        required
+      />
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="pat-input">GitHub PAT</label>
+      <input
+        type="password"
+        id="pat-input"
+        name="pat"
+        class="form-input"
+        placeholder="{% if config.has_pat %}{{ config.masked_pat }}{% else %}ghp_...{% endif %}"
+      />
+      <small class="form-help">{% if config.has_pat %}Configured (leave blank to keep){% else %}Required for GitHub operations{% endif %}</small>
+    </div>
+
+    <div class="btn-stack">
+      <button type="submit" class="btn btn-primary" title="Save repository and PAT configuration">
+        &#128190; Save &amp; Switch
+      </button>
+      <div class="btn-row">
+        <button
+          type="button"
+          class="btn btn-scan"
+          hx-post="/api/trigger-scan"
+          hx-target="#repo-config-card"
+          hx-swap="outerHTML"
+          title="Trigger security-scan.yml on GitHub Actions"
+        >
+          &#9654; Trigger Scan
+        </button>
+        <button
+          type="button"
+          class="btn btn-danger"
+          hx-post="/api/reset"
+          hx-target="#repo-config-card"
+          hx-swap="outerHTML"
+          hx-confirm="Reset repository state? This will close open remediation PRs and reset local tracking records, while keeping your Knowledge Base intact."
+          title="Close open PRs, delete fix branches, reset tracking (preserves Knowledge Base)"
+        >
+          &#8634; Reset
+        </button>
+      </div>
+    </div>
+  </form>
+</div>

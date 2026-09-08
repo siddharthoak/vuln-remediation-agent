@@ -21,6 +21,8 @@ from typing import Callable, Optional
 
 import requests
 
+from common.config import get_target_repo, get_github_pat
+
 logger = logging.getLogger(__name__)
 
 WORKFLOW_FILE     = "security-scan.yml"
@@ -80,6 +82,15 @@ class ScanPoller:
     # ── Poll cycle ────────────────────────────────────────────────────────────
 
     def _poll_once(self) -> None:
+        current_repo = get_target_repo()
+        current_pat = get_github_pat()
+        if current_repo and current_repo != self._repo:
+            logger.info("ScanPoller: target repo switched from %s to %s", self._repo, current_repo)
+            self._repo = current_repo
+            self._base = f"https://api.github.com/repos/{current_repo}"
+        if current_pat:
+            self._headers["Authorization"] = f"Bearer {current_pat}"
+
         last_id = self._load_checkpoint()
         run = self._latest_completed_run()
         if run is None:

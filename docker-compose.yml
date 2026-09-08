@@ -29,6 +29,7 @@ services:
       - ./scan-reports:/reports
       # Bind mount so the dashboard container can read tracking.json directly
       - ./data:/data
+      - ./config:/config
       # GCP credentials for Vertex AI (ADC)
       - ./config/my-google-service-account.json:/gcp/adc.json:ro
     restart: unless-stopped
@@ -57,6 +58,7 @@ services:
       WATCHER_SLEEP_SECONDS: "900"  # 15 minutes
     volumes:
       - ./data:/data
+      - ./config:/config
     depends_on:
       - fixer-server
     restart: unless-stopped
@@ -84,7 +86,8 @@ services:
       - "8501:8000"
     volumes:
       - ./data:/data
-      - ./scan-reports:/reports:ro
+      - ./scan-reports:/reports
+      - ./config:/config
     restart: unless-stopped
 
   # ── Fixer one-shot (manual use) ───────────────────────────────────────────
