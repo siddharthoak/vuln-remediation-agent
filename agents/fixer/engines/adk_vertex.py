@@ -24,14 +24,14 @@ from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
 from ecosystems.maven import compile_repo, test_repo
-from engines.base import FixResult
+from engines.base import FixResult, EngineExecutionError
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 10  # Passed to ADK Runner as max_llm_calls to guard runaway loops
 
 
-class CodeFixerError(Exception):
+class CodeFixerError(EngineExecutionError):
     """Raised when the model response cannot be parsed into the expected format."""
 
 
@@ -94,9 +94,20 @@ class AdkVertexEngine:
             tools=tools,
         )
 
-        reasoning, prompt_tokens, completion_tokens = asyncio.run(self._run_agent_async(agent))
+        try:
+            reasoning, prompt_tokens, completion_tokens = asyncio.run(
+                asyncio.wait_for(self._run_agent_async(agent), timeout=180.0)
+            )
+        except asyncio.TimeoutError as exc:
+            logger.error("ADK Vertex runner timed out after 180s")
+            raise EngineExecutionError("ADK Vertex agent runner timed out after 180s") from exc
+        except Exception as exc:
+            if not isinstance(exc, EngineExecutionError):
+                raise EngineExecutionError(f"ADK Vertex engine failed: {exc}") from exc
+            raise
+
         return FixResult(
-            rationale=reasoning.get("rationale", ""),
+            rationale=reasoning.get("rationale", "") if isinstance(reasoning, dict) else str(reasoning),
             files_changed=list(dict.fromkeys(self._applied_changes)),
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
@@ -143,12 +154,19 @@ class AdkVertexEngine:
 
         json_match = re.search(r"```json\s*(.*?)\s*```", final_text, re.DOTALL)
         json_str = json_match.group(1) if json_match else final_text.strip()
-        try:
-            reasoning = json.loads(json_str)
-        except json.JSONDecodeError as exc:
-            raise CodeFixerError(
-                f"Model response could not be parsed as JSON: {exc}\n\nRaw:\n{final_text}"
-            ) from exc
+        reasoning = {}
+        if json_str:
+            try:
+                reasoning = json.loads(json_str)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Model response was not valid JSON; falling back to text rationale: %s",
+                    final_text[:200],
+                )
+                reasoning = {"rationale": final_text.strip()}
+        else:
+            logger.warning("Model response was empty; using fallback rationale.")
+            reasoning = {"rationale": "Applied fix based on vulnerability scan recommendations."}
 
         return reasoning, total_prompt_tokens, total_completion_tokens
 

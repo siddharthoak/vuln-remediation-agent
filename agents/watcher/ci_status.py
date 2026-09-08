@@ -9,6 +9,8 @@ which the Watcher needs to reason about failures.
 
 import logging
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -70,6 +72,7 @@ class CIStatusWatcher:
 
     def __init__(self, repo_full_name: str, github_pat: str):
         self._repo_full_name = repo_full_name
+        self._github_pat = github_pat
         gh = Github(github_pat)
         self._repo = gh.get_repo(repo_full_name)
 
@@ -178,14 +181,13 @@ class CIStatusWatcher:
     def _fetch_log(self, check_run) -> str:
         """
         Fetch the log output for a failed check run.
-
-        GitHub's Checks API does not expose full log text directly on the check run object;
-        it is available via the annotations or the `output` field summary/text properties.
-        For GitHub Actions specifically, full job logs require the Actions API.
-
-        We use output.text + output.summary as the primary signal, which is what most
-        CI integrations populate and is sufficient for LLM-based failure diagnosis.
+        Attempts to fetch full raw job logs from GitHub Actions first,
+        falling back to check_run.output if unavailable.
         """
+        gh_log = self._fetch_github_actions_log(check_run.id)
+        if gh_log:
+            return gh_log
+
         try:
             output = check_run.output
             parts = []
@@ -199,3 +201,64 @@ class CIStatusWatcher:
         except Exception as exc:
             logger.warning("Could not fetch log for check run %d: %s", check_run.id, exc)
             return ""
+
+    def _fetch_github_actions_log(self, job_id: int) -> str:
+        """Fetch raw job log from GitHub Actions, handling the presigned redirect safely."""
+        class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        url = f"https://api.github.com/repos/{self._repo_full_name}/actions/jobs/{job_id}/logs"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {self._github_pat}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "vuln-remediation-agent",
+            },
+        )
+        opener = urllib.request.build_opener(NoRedirectHandler)
+        presigned_url = None
+        try:
+            opener.open(req)
+        except urllib.error.HTTPError as err:
+            if err.code in (301, 302, 307, 308):
+                presigned_url = err.headers.get("Location")
+            else:
+                logger.debug("Failed to request job log URL for %d: %s", job_id, err)
+                return ""
+        except Exception as exc:
+            logger.debug("Error requesting job log URL for %d: %s", job_id, exc)
+            return ""
+
+        if not presigned_url:
+            return ""
+
+        try:
+            # Pre-signed S3/Azure URL MUST NOT have the GitHub Authorization header
+            req2 = urllib.request.Request(presigned_url, headers={"User-Agent": "vuln-remediation-agent"})
+            with urllib.request.urlopen(req2, timeout=20) as resp:
+                raw_text = resp.read().decode("utf-8", errors="replace")
+                return self._extract_relevant_log(raw_text)
+        except Exception as exc:
+            logger.warning("Failed to download job log from presigned URL for %d: %s", job_id, exc)
+            return ""
+
+    @staticmethod
+    def _extract_relevant_log(raw_log: str, max_chars: int = 4000) -> str:
+        if not raw_log:
+            return ""
+        lines = raw_log.splitlines()
+        err_indices = [
+            i for i, line in enumerate(lines)
+            if any(k in line for k in ("CRITICAL", "HIGH", "ERROR", "FAILURE", "BUILD FAILURE", "Compilation failure", "Failed to execute goal"))
+        ]
+        if err_indices:
+            start = max(0, err_indices[0] - 5)
+            end = min(len(lines), err_indices[-1] + 25)
+            snippet = "\n".join(lines[start:end])
+            if len(snippet) > max_chars:
+                snippet = snippet[:max_chars] + "\n...[truncated]..."
+            return snippet
+        return "\n".join(lines[-60:])[-max_chars:]
+

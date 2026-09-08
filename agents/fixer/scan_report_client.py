@@ -92,10 +92,12 @@ class ScanReportClient:
                     for cve in f.cve_ids:
                         if cve not in existing.cve_ids:
                             existing.cve_ids.append(cve)
-                    # Prefer a concrete safe version over UNKNOWN
-                    if existing.recommended_version.startswith("UNKNOWN") and \
-                       not f.recommended_version.startswith("UNKNOWN"):
-                        existing.recommended_version = f.recommended_version
+                    existing.severity = self._highest_severity([existing.severity, f.severity])
+                    # Prefer a higher concrete safe version over UNKNOWN or lower version
+                    if not f.recommended_version.startswith("UNKNOWN"):
+                        if existing.recommended_version.startswith("UNKNOWN") or \
+                           self._parse_version_tuple(f.recommended_version) > self._parse_version_tuple(existing.recommended_version):
+                            existing.recommended_version = f.recommended_version
                 else:
                     findings[key] = f
         else:
@@ -163,6 +165,11 @@ class ScanReportClient:
                 else:
                     if cve_id and cve_id not in findings[key].cve_ids:
                         findings[key].cve_ids.append(cve_id)
+                    findings[key].severity = self._highest_severity([findings[key].severity, severity])
+                    if fixed_ver and not fixed_ver.startswith("UNKNOWN"):
+                        cur_rec = findings[key].recommended_version
+                        if cur_rec.startswith("UNKNOWN") or self._parse_version_tuple(fixed_ver) > self._parse_version_tuple(cur_rec):
+                            findings[key].recommended_version = fixed_ver
 
         return list(findings.values())
 
@@ -219,6 +226,11 @@ class ScanReportClient:
             else:
                 if cve_id and cve_id not in findings[key].cve_ids:
                     findings[key].cve_ids.append(cve_id)
+                findings[key].severity = self._highest_severity([findings[key].severity, severity])
+                if fixed_ver and not fixed_ver.startswith("UNKNOWN"):
+                    cur_rec = findings[key].recommended_version
+                    if cur_rec.startswith("UNKNOWN") or self._parse_version_tuple(fixed_ver) > self._parse_version_tuple(cur_rec):
+                        findings[key].recommended_version = fixed_ver
 
         return list(findings.values())
 
@@ -272,7 +284,24 @@ class ScanReportClient:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _select_best_fixed_version(fixed_ver_str: str, installed_ver: str) -> str:
+    def _parse_version_tuple(v: str) -> tuple:
+        if not v or v.startswith("UNKNOWN"):
+            return (-1,)
+        clean = v.strip().lstrip("v")
+        for suffix in [".RELEASE", "-RELEASE", ".Final", "-Final", ".GA", "-GA", ".jre", "-jre", ".android", "-android"]:
+            if clean.endswith(suffix):
+                clean = clean[:-len(suffix)]
+        clean = clean.split("-")[0]
+        parts = []
+        for p in clean.split("."):
+            try:
+                parts.append(int(p))
+            except ValueError:
+                break
+        return tuple(parts) if parts else (0,)
+
+    @classmethod
+    def _select_best_fixed_version(cls, fixed_ver_str: str, installed_ver: str) -> str:
         if not fixed_ver_str or fixed_ver_str.startswith("UNKNOWN"):
             return fixed_ver_str
         candidates = [v.strip() for v in fixed_ver_str.split(",") if v.strip()]
@@ -280,21 +309,32 @@ class ScanReportClient:
             return fixed_ver_str
         if len(candidates) == 1:
             return candidates[0]
-        inst_clean = installed_ver.strip().lstrip("v")
-        inst_parts = inst_clean.split(".")
+
+        inst_tuple = cls._parse_version_tuple(installed_ver)
+        # Filter to candidates that are upgrades (>= installed_ver)
+        upgrades = [c for c in candidates if cls._parse_version_tuple(c) >= inst_tuple]
+        valid_candidates = upgrades if upgrades else candidates
+
+        inst_parts = installed_ver.strip().lstrip("v").split(".")
         # 1. Match same major and minor version if possible
-        for cand in candidates:
-            cand_clean = cand.strip().lstrip("v")
-            cand_parts = cand_clean.split(".")
+        for cand in valid_candidates:
+            cand_parts = cand.strip().lstrip("v").split(".")
             if len(inst_parts) >= 2 and len(cand_parts) >= 2 and inst_parts[0] == cand_parts[0] and inst_parts[1] == cand_parts[1]:
                 return cand
-        # 2. Match same major version
-        for cand in candidates:
-            cand_clean = cand.strip().lstrip("v")
-            cand_parts = cand_clean.split(".")
+        # 2. Match same major version (smallest upgrade on that major)
+        same_major = []
+        for cand in valid_candidates:
+            cand_parts = cand.strip().lstrip("v").split(".")
             if len(inst_parts) >= 1 and len(cand_parts) >= 1 and inst_parts[0] == cand_parts[0]:
-                return cand
-        return candidates[0]
+                same_major.append(cand)
+        if same_major:
+            same_major.sort(key=cls._parse_version_tuple)
+            return same_major[0]
+
+        valid_candidates.sort(key=cls._parse_version_tuple)
+        return valid_candidates[0]
+
+
 
     @staticmethod
     def _name_from_purl(purl: str) -> str:

@@ -123,6 +123,14 @@ def _process_pr(pr, tracking_store, ci_watcher, retry_gate, kb_store, pattern_le
         logger.info("PR #%d: status=%s (terminal). Skipping.", pr_number, record.status)
         return
 
+    if record.status == TrackingStatus.RETRY_REQUESTED.value:
+        logger.info(
+            "PR #%d (%s): status is RETRY_REQUESTED (attempt %d). "
+            "Fixer is actively processing this retry. Waiting for retry commit push before checking CI.",
+            pr_number, pr.head.ref, record.attempt_number,
+        )
+        return
+
     logger.info(
         "PR #%d (%s): checking CI. Current status=%s",
         pr_number, pr.head.ref, record.status,

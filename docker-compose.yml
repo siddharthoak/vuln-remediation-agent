@@ -20,6 +20,7 @@ services:
       KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
       FIXER_SERVER_MODE: "1"
+      AUTO_FETCH_SCAN: "1"          # Automatically triggers security-scan.yml if reports are missing or new scan needed
       SCAN_POLL_INTERVAL: "60"      # seconds between GitHub Actions polls
       KB_HYDRATION: "1"             # set to "0" to skip Knowledge Agent (faster local testing)
     ports:

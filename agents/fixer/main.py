@@ -18,6 +18,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json as _json
 from types import SimpleNamespace
+from typing import Optional
 
 from github import Github
 from scan_report_client import ScanReportClient, ScanReportError
@@ -97,7 +98,7 @@ def _run_server():
     poller_thread = threading.Thread(target=poller.poll_forever, daemon=True, name="scan-poller")
     poller_thread.start()
 
-    server = _make_retry_server(port=8080)
+    server = _make_retry_server(port=8080, poller=poller)
     logger.info("Fixer HTTP server listening on :8080")
     try:
         server.serve_forever()
@@ -105,20 +106,41 @@ def _run_server():
         logger.info("Fixer server shutting down.")
 
 
-def _make_retry_server(port: int) -> HTTPServer:
+def _make_retry_server(port: int, poller: Optional[ScanPoller] = None) -> HTTPServer:
     class RetryHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path != "/":
-                self.send_error(404)
+            if self.path in ("/", "/status"):
+                payload = {
+                    "status": "ok",
+                    "service": "fixer-server",
+                    "scan_running": poller.is_scan_running() if poller else False,
+                    "has_reports": poller.has_reports() if poller else False,
+                }
+                body = _json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
-            body = b'{"status":"ok","service":"fixer-server"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.send_error(404)
 
         def do_POST(self):
+            if self.path == "/scan":
+                dispatched = False
+                if poller:
+                    dispatched = poller.dispatch_scan()
+                body = _json.dumps({
+                    "status": "dispatched" if dispatched else "failed_or_no_poller",
+                    "workflow": "security-scan.yml",
+                }).encode("utf-8")
+                self.send_response(202 if dispatched else 500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if self.path != "/retry":
                 self.send_error(404)
                 return
@@ -354,7 +376,7 @@ def _do_fresh_scan():
 
     server_mode = os.environ.get("FIXER_SERVER_MODE", "0") == "1"
 
-    if AUTO_FETCH_SCAN:
+    if AUTO_FETCH_SCAN and not server_mode:
         report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
         logger.info("AUTO_FETCH_SCAN=1 — triggering security-scan workflow on %s", github_repo)
         fetcher = ScanFetcher(
@@ -601,117 +623,137 @@ def _run_retry(tracking_id: str):
         )
         sys.exit(1)
 
-    with RepoOps() as repo:
-        repo.clone(github_repo_url, github_pat)
-        repo._repo.git.checkout(record.branch_name)
+    try:
+        with RepoOps() as repo:
+            repo.clone(github_repo_url, github_pat)
+            repo._repo.git.checkout(record.branch_name)
 
-        fixer = CodeFixer(repo_path=repo._local_path)
-        try:
+            fixer = CodeFixer(repo_path=repo._local_path)
             summary = fixer.run_retry_fix(
                 tracking_id=tracking_id,
                 tracking_store=tracking_store,
             )
-        except InvalidRetryError as exc:
-            logger.error("Retry validation failed: %s", exc)
-            sys.exit(1)
-        except EngineExecutionError as exc:
-            # The FixEngine itself failed to run (CLI crash/timeout/missing
-            # binary) -- it never produced a fix to evaluate, so this is not
-            # the same as a fix attempt that ran and turned out wrong. Don't
-            # let the record silently rot in RETRY_REQUESTED forever: mark it
-            # ENGINE_ERROR (excluded from count_attempts_for_pr, so it won't
-            # consume retry budget) and escalate to a human via the PR
-            # instead of leaving the Watcher polling a branch nothing was
-            # ever pushed to.
-            logger.error("Fixer engine failed to run for retry %s: %s", tracking_id[:8], exc)
-            record.status = TrackingStatus.ENGINE_ERROR.value
-            tracking_store.update(record)
-            pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+
+            # A retry must not push a source edit that the CI build will reject.
+            # The engine is instructed to compile, but this gate is authoritative
+            # and also covers engines that cannot execute Maven locally.
+            retry_ecosystem = get_ecosystem(repo._local_path)
+            compiled, compile_message = retry_ecosystem.verify_build(repo._local_path)
+            if not compiled:
+                message = (
+                    f"Retry verification failed for {record.component_name}: "
+                    f"{compile_message[:3500]}"
+                )
+                logger.error("%s", message)
+                current = tracking_store.get(tracking_id)
+                if current is not None:
+                    current.status = TrackingStatus.ESCALATED.value
+                    current.failure_log_excerpt = message[:4000]
+                    tracking_store.update(current)
+                return
+
             try:
-                pr_client.add_comment(
-                    record.pr_number,
-                    "## OSS Remediation Agent — Engine Failure\n\n"
-                    f"Fix attempt {record.attempt_number} could not run "
-                    "(the tooling that generates fixes failed, not the fix itself -- "
-                    "e.g. a crash, timeout, or missing dependency). This attempt did "
-                    "not consume a retry, but automatic retries are paused pending "
-                    f"investigation.\n\n**Error:**\n```\n{str(exc)[:1500]}\n```\n\n"
-                    "Please investigate the Fixer's engine configuration before "
-                    "re-triggering a fix for this PR.",
+                review = repo.review_dependency_diff(
+                    component_name=record.component_name,
+                    target_version=record.new_version,
+                    expected_files=summary.files_changed,
+                    allow_manifest_already_applied=True,
                 )
-            except Exception as comment_exc:
-                logger.error(
-                    "Could not post engine-failure comment on PR #%s: %s",
-                    record.pr_number, comment_exc,
+            except Exception as exc:
+                review = DiffReviewResult(False, f"Diff review could not run: {exc}")
+            if not review.passed:
+                message = f"Automated diff review failed: {review.message}"
+                logger.error("%s", message)
+                current = tracking_store.get(tracking_id)
+                if current is not None:
+                    current.status = TrackingStatus.ESCALATED.value
+                    current.failure_log_excerpt = message[:4000]
+                    tracking_store.update(current)
+                triage_finding = SimpleNamespace(
+                    component_name=record.component_name,
+                    current_version=record.old_version,
+                    recommended_version=record.new_version,
+                    severity="unknown",
+                    cve_ids=[record.vulnerability_id] if record.vulnerability_id else [],
                 )
-            sys.exit(1)
+                try:
+                    PRClient(repo_full_name=github_repo, github_pat=github_pat).open_triage_issue(
+                        finding=triage_finding,
+                        bucket=2,
+                        rationale=message,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not open triage issue after retry diff review failure for %s.",
+                        record.component_name,
+                    )
+                return
 
-        # A retry must not push a source edit that the CI build will reject.
-        # The engine is instructed to compile, but this gate is authoritative
-        # and also covers engines that cannot execute Maven locally.
-        retry_ecosystem = get_ecosystem(repo._local_path)
-        compiled, compile_message = retry_ecosystem.verify_build(repo._local_path)
-        if not compiled:
-            message = (
-                f"Retry verification failed for {record.component_name}: "
-                f"{compile_message[:3500]}"
+            commit_msg = (
+                f"fix(retry): attempt {record.attempt_number} — "
+                f"{summary.rationale[:120] if summary.rationale else 'CI failure fix'}"
             )
-            logger.error("%s", message)
-            record.status = TrackingStatus.ESCALATED.value
-            record.failure_log_excerpt = message[:4000]
-            tracking_store.update(record)
-            return
+            repo.commit_changes(commit_msg, files=summary.files_changed)
+            repo.push_branch(record.branch_name)
 
-        try:
-            review = repo.review_dependency_diff(
-                component_name=record.component_name,
-                target_version=record.new_version,
-                expected_files=summary.files_changed,
-                allow_manifest_already_applied=True,
-            )
-        except Exception as exc:
-            review = DiffReviewResult(False, f"Diff review could not run: {exc}")
-        if not review.passed:
-            message = f"Automated diff review failed: {review.message}"
-            logger.error("%s", message)
-            record.status = TrackingStatus.ESCALATED.value
-            record.failure_log_excerpt = message[:4000]
-            tracking_store.update(record)
-            triage_finding = SimpleNamespace(
-                component_name=record.component_name,
-                current_version=record.old_version,
-                recommended_version=record.new_version,
-                severity="unknown",
-                cve_ids=[record.vulnerability_id] if record.vulnerability_id else [],
-            )
-            try:
-                PRClient(repo_full_name=github_repo, github_pat=github_pat).open_triage_issue(
-                    finding=triage_finding,
-                    bucket=2,
-                    rationale=message,
-                )
-            except Exception:
-                logger.exception(
-                    "Could not open triage issue after retry diff review failure for %s.",
-                    record.component_name,
-                )
-            return
+        current = tracking_store.get(tracking_id)
+        if current is not None:
+            current.status = TrackingStatus.CI_PENDING.value
+            tracking_store.update(current)
 
-        commit_msg = (
-            f"fix(retry): attempt {record.attempt_number} — "
-            f"{summary.rationale[:120] if summary.rationale else 'CI failure fix'}"
+        logger.info(
+            "Retry fix pushed for PR #%s on branch '%s'.",
+            record.pr_number, record.branch_name,
         )
-        repo.commit_changes(commit_msg, files=summary.files_changed)
-        repo.push_branch(record.branch_name)
-
-    record = tracking_store.get(tracking_id)
-    record.status = TrackingStatus.CI_PENDING.value
-    tracking_store.update(record)
-
-    logger.info(
-        "Retry fix pushed for PR #%s on branch '%s'.",
-        record.pr_number, record.branch_name,
-    )
+    except InvalidRetryError as exc:
+        logger.error("Retry validation failed for %s: %s", tracking_id[:8], exc)
+        current = tracking_store.get(tracking_id)
+        if current is not None:
+            current.status = TrackingStatus.ESCALATED.value
+            current.failure_log_excerpt = f"Retry validation failed: {exc}"[:4000]
+            tracking_store.update(current)
+    except EngineExecutionError as exc:
+        logger.error("Fixer engine failed to run for retry %s: %s", tracking_id[:8], exc)
+        current = tracking_store.get(tracking_id)
+        if current is not None:
+            current.status = TrackingStatus.ENGINE_ERROR.value
+            current.failure_log_excerpt = f"Engine execution error: {exc}"[:4000]
+            tracking_store.update(current)
+        try:
+            pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+            pr_client.add_comment(
+                record.pr_number,
+                "## OSS Remediation Agent — Engine Failure\n\n"
+                f"Fix attempt {record.attempt_number} could not run "
+                "(the tooling that generates fixes failed, not the fix itself -- "
+                "e.g. a crash, timeout, or missing dependency). This attempt did "
+                "not consume a retry, but automatic retries are paused pending "
+                f"investigation.\n\n**Error:**\n```\n{str(exc)[:1500]}\n```\n\n"
+                "Please investigate the Fixer's engine configuration before "
+                "re-triggering a fix for this PR.",
+            )
+        except Exception as comment_exc:
+            logger.error(
+                "Could not post engine-failure comment on PR #%s: %s",
+                record.pr_number, comment_exc,
+            )
+    except Exception as exc:
+        logger.exception("Unexpected error during retry for %s: %s", tracking_id[:8], exc)
+        current = tracking_store.get(tracking_id)
+        if current is not None:
+            current.status = TrackingStatus.ESCALATED.value
+            current.failure_log_excerpt = f"Unexpected retry error: {exc}"[:4000]
+            tracking_store.update(current)
+        try:
+            pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+            pr_client.add_comment(
+                record.pr_number,
+                f"## OSS Remediation Agent — Retry Escalation\n\n"
+                f"Fix attempt {record.attempt_number} encountered an error: `{exc}`. "
+                "Automatic retry has been escalated for manual review.",
+            )
+        except Exception as comment_exc:
+            logger.error("Could not post escalation comment on PR #%s: %s", record.pr_number, comment_exc)
 
 
 if __name__ == "__main__":

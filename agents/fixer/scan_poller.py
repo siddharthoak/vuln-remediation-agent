@@ -34,8 +34,9 @@ SKIP_CONCLUSIONS  = {"cancelled", "skipped", "action_required", "timed_out"}
 
 class ScanPoller:
     """
-    Background poller that detects newly completed security-scan.yml runs and
-    downloads the resulting artifact so the fixer can act on it.
+    Background poller that detects newly completed security-scan.yml runs,
+    can automatically dispatch scans if missing or enabled, and downloads
+    the resulting artifact so the fixer can act on it.
 
     Checkpoint: last processed run ID is persisted next to tracking.json in
     /data so the poller doesn't re-process completed runs after a restart.
@@ -49,6 +50,7 @@ class ScanPoller:
         on_new_scan_ready: Callable[[], None],
         poll_interval: int = DEFAULT_INTERVAL,
         branch: str = "main",
+        auto_dispatch: Optional[bool] = None,
     ):
         self._repo       = repo_full_name
         self._report_dir = Path(report_dir)
@@ -65,12 +67,59 @@ class ScanPoller:
         tracking_path = os.environ.get("TRACKING_STORE_PATH", "/data/tracking.json")
         self._checkpoint = Path(os.path.dirname(tracking_path)) / CHECKPOINT_FILE
 
+        if auto_dispatch is not None:
+            self._auto_dispatch = auto_dispatch
+        else:
+            self._auto_dispatch = os.environ.get("AUTO_FETCH_SCAN", "0") == "1"
+
+        self._has_dispatched_initial = False
+
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def has_reports(self) -> bool:
+        """Check if scan report files currently exist in the report directory."""
+        if not self._report_dir.exists():
+            return False
+        return (
+            (self._report_dir / "trivy-report.json").exists()
+            or (self._report_dir / "grype-report.json").exists()
+            or (self._report_dir / "dependency-check-report" / "dependency-check-report.json").exists()
+        )
+
+    def is_scan_running(self) -> bool:
+        """Check if any security-scan run is currently queued or in-progress."""
+        url = (
+            f"{self._base}/actions/workflows/{WORKFLOW_FILE}/runs"
+            f"?branch={self._branch}&per_page=5"
+        )
+        try:
+            resp = requests.get(url, headers=self._headers, timeout=30)
+            if resp.status_code == 200:
+                for r in resp.json().get("workflow_runs", []):
+                    if r.get("status") in ("in_progress", "queued", "requested", "waiting"):
+                        return True
+        except Exception as exc:
+            logger.warning("ScanPoller: error checking active runs: %s", exc)
+        return False
+
+    def dispatch_scan(self) -> bool:
+        """Trigger security-scan.yml via GitHub Actions workflow_dispatch."""
+        url = f"{self._base}/actions/workflows/{WORKFLOW_FILE}/dispatches"
+        try:
+            resp = requests.post(url, headers=self._headers, json={"ref": self._branch}, timeout=30)
+            if resp.status_code == 204:
+                logger.info("ScanPoller: successfully dispatched workflow %s on branch %s", WORKFLOW_FILE, self._branch)
+                return True
+            else:
+                logger.warning("ScanPoller: workflow dispatch returned HTTP %s: %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            logger.error("ScanPoller: failed to dispatch workflow %s: %s", WORKFLOW_FILE, exc)
+        return False
 
     def poll_forever(self) -> None:
         logger.info(
-            "ScanPoller: started. repo=%s branch=%s interval=%ds",
-            self._repo, self._branch, self._interval,
+            "ScanPoller: started. repo=%s branch=%s interval=%ds auto_dispatch=%s",
+            self._repo, self._branch, self._interval, self._auto_dispatch,
         )
         while True:
             try:
@@ -90,6 +139,22 @@ class ScanPoller:
             self._base = f"https://api.github.com/repos/{current_repo}"
         if current_pat:
             self._headers["Authorization"] = f"Bearer {current_pat}"
+
+        # Touch checkpoint activity so dashboard displays active status
+        self._touch_checkpoint()
+
+        # If auto-dispatch is enabled, or if no reports exist yet:
+        # Check if a scan is running; if not, trigger a new scan automatically!
+        if (self._auto_dispatch or not self.has_reports()) and not self._has_dispatched_initial:
+            if not self.is_scan_running():
+                logger.info(
+                    "ScanPoller: auto_dispatch=%s, has_reports=%s — automatically dispatching %s",
+                    self._auto_dispatch, self.has_reports(), WORKFLOW_FILE,
+                )
+                self.dispatch_scan()
+            else:
+                logger.info("ScanPoller: workflow %s is already in progress/queued.", WORKFLOW_FILE)
+            self._has_dispatched_initial = True
 
         last_id = self._load_checkpoint()
         run = self._latest_completed_run()
@@ -186,11 +251,23 @@ class ScanPoller:
             logger.warning("ScanPoller: cannot read checkpoint (%s) — starting from latest run", exc)
             return None
 
+    def _touch_checkpoint(self) -> None:
+        try:
+            self._checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            last_id = self._load_checkpoint()
+            self._checkpoint.write_text(
+                json.dumps({"last_run_id": last_id, "last_poll_time": time.time()}),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.debug("ScanPoller: cannot touch checkpoint: %s", exc)
+
     def _save_checkpoint(self, run_id: int) -> None:
         try:
             self._checkpoint.parent.mkdir(parents=True, exist_ok=True)
             self._checkpoint.write_text(
-                json.dumps({"last_run_id": run_id}), encoding="utf-8"
+                json.dumps({"last_run_id": run_id, "last_poll_time": time.time()}),
+                encoding="utf-8",
             )
         except OSError as exc:
             logger.warning("ScanPoller: cannot write checkpoint (%s) — progress will not be persisted", exc)
