@@ -103,6 +103,7 @@ services:
     env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
+      KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
     volumes:
       - ./scan-reports:/reports

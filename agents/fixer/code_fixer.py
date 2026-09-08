@@ -406,6 +406,35 @@ class CodeFixer:
             prompt_failure = (
                 f"{failure_log_excerpt}\n\n" if failure_log_excerpt else ""
             ) + "Compile verification after the pom.xml bump failed:\n" + compile_failure
+
+        # Handle the known Struts 2.5+ package move deterministically before
+        # asking an LLM to diagnose it. This is a compile-only compatibility
+        # change and prevents a predictable broken PR when the model misses the
+        # import in a multi-finding remediation branch.
+        known_files = self._apply_known_compatibility_fixes(
+            component_name=component_name,
+            target_version=target_version,
+        )
+        if known_files:
+            compiled, compatibility_message = self._ecosystem.verify_build(self._repo_path)
+            if compiled:
+                return ChangeSummary(
+                    component_name=component_name,
+                    old_version=current_version,
+                    new_version=target_version,
+                    files_changed=["pom.xml", *known_files],
+                    rationale=(
+                        f"Dependency upgraded from {current_version} to {target_version}; "
+                        "updated the Struts filter package for the upgraded API."
+                    ),
+                    cve_ids=cve_ids,
+                )
+            prompt_failure = (
+                f"{prompt_failure}\n\n"
+                "Compile verification after the deterministic compatibility fix failed:\n"
+                f"{compatibility_message}"
+            )
+
         file_listing = self._build_file_listing()
         prompt = self._build_prompt(
             component_name=component_name,
@@ -428,6 +457,36 @@ class CodeFixer:
             completion_tokens=result.completion_tokens,
             model_name=result.model_name,
         )
+
+    def _apply_known_compatibility_fixes(
+        self,
+        component_name: str,
+        target_version: str,
+    ) -> list:
+        """Apply narrow, well-known source migrations for Maven API moves."""
+        if component_name != "org.apache.struts:struts2-core":
+            return []
+
+        try:
+            version_parts = [int(part) for part in target_version.split(".")[:2]]
+        except (ValueError, AttributeError):
+            return []
+        if len(version_parts) < 2 or version_parts[0] != 2 or version_parts[1] < 5:
+            return []
+
+        old_import = "org.apache.struts2.dispatcher.ng.filter.StrutsPrepareAndExecuteFilter"
+        new_import = "org.apache.struts2.dispatcher.filter.StrutsPrepareAndExecuteFilter"
+
+        changed = []
+        for source_file in self._repo_path.rglob("*.java"):
+            if "target" in source_file.parts:
+                continue
+            content = source_file.read_text(encoding="utf-8")
+            if old_import not in content:
+                continue
+            source_file.write_text(content.replace(old_import, new_import, 1), encoding="utf-8")
+            changed.append(str(source_file.relative_to(self._repo_path)))
+        return changed
 
     def _execute_transitive_fix(
         self,

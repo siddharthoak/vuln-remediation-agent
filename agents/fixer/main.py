@@ -103,6 +103,17 @@ def _run_server():
 
 def _make_retry_server(port: int) -> HTTPServer:
     class RetryHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/":
+                self.send_error(404)
+                return
+            body = b'{"status":"ok","service":"fixer-server"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self):
             if self.path != "/retry":
                 self.send_error(404)
@@ -589,6 +600,22 @@ def _run_retry(tracking_id: str):
                     record.pr_number, comment_exc,
                 )
             sys.exit(1)
+
+        # A retry must not push a source edit that the CI build will reject.
+        # The engine is instructed to compile, but this gate is authoritative
+        # and also covers engines that cannot execute Maven locally.
+        retry_ecosystem = get_ecosystem(repo._local_path)
+        compiled, compile_message = retry_ecosystem.verify_build(repo._local_path)
+        if not compiled:
+            message = (
+                f"Retry verification failed for {record.component_name}: "
+                f"{compile_message[:3500]}"
+            )
+            logger.error("%s", message)
+            record.status = TrackingStatus.ESCALATED.value
+            record.failure_log_excerpt = message[:4000]
+            tracking_store.update(record)
+            return
 
         try:
             review = repo.review_dependency_diff(

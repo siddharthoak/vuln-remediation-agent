@@ -58,8 +58,10 @@ class Classifier:
         old_ver    = finding.current_version
         new_ver    = finding.recommended_version
 
+        kb_entry = self._kb.find_applicable(component, old_ver, new_ver)
+
         # ── Bucket 1: no fix available ────────────────────────────────────────
-        if _is_unknown_version(new_ver):
+        if _is_unknown_version(new_ver) and kb_entry is None:
             return ClassifierResult(
                 bucket=1,
                 rationale=(
@@ -99,7 +101,7 @@ class Classifier:
             introduced_by_stem = _component_stem(finding.introduced_by or "")
             introduced_by_complex = any(f in introduced_by_stem for f in COMPLEX_FRAMEWORKS)
             deep_chain = (finding.transitive_depth or 0) > 2
-            if introduced_by_complex or deep_chain:
+            if (introduced_by_complex or deep_chain) and kb_entry is None:
                 reason = (
                     f"introduced by complex framework {finding.introduced_by}"
                     if introduced_by_complex
