@@ -78,3 +78,11 @@ class PackageEcosystem(Protocol):
         (success, message), including for missing tooling and timeouts.
         """
         ...
+
+    def get_project_coordinates(self, repo_path: Path) -> dict:
+        """Returns metadata about the project itself (e.g. group_id, artifact_id, version, component_name)."""
+        ...
+
+    def has_dependency(self, repo_path: Path, component_name: str) -> bool:
+        """Returns True if component_name is declared in the project's manifest."""
+        ...

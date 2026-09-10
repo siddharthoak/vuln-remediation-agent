@@ -32,9 +32,28 @@ class PRClient:
 
     def __init__(self, repo_full_name: str, github_pat: Optional[str] = None):
         self._repo_full_name = repo_full_name
-        pat = github_pat or os.environ["GITHUB_PAT"]
-        self._gh = Github(pat)
-        self._repo = self._gh.get_repo(repo_full_name)
+        self._github_pat = github_pat
+        self._active_token: Optional[str] = None
+        self._gh: Optional[Github] = None
+        self._repo_cached = None
+
+    @property
+    def _repo(self):
+        """
+        Dynamically provides the PyGithub Repo object with an active, unexpired token.
+        Automatically re-authenticates if the previous token expired during long-running fixes (2h-8h).
+        """
+        try:
+            from common.config import get_github_pat
+            current_token = get_github_pat(self._repo_full_name) or self._github_pat or os.environ.get("GITHUB_PAT", "")
+        except Exception:
+            current_token = self._github_pat or os.environ.get("GITHUB_PAT", "")
+
+        if self._repo_cached is None or self._active_token != current_token:
+            self._active_token = current_token
+            self._gh = Github(current_token)
+            self._repo_cached = self._gh.get_repo(self._repo_full_name)
+        return self._repo_cached
 
     def open_remediation_pr(
         self,

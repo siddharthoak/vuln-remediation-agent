@@ -302,6 +302,68 @@ class MavenEcosystem:
     def verify_tests(self, repo_path: Path) -> Tuple[bool, str]:
         return test_repo(repo_path)
 
+    def get_project_coordinates(self, repo_path: Path) -> dict:
+        """Returns metadata about the project itself (groupId, artifactId, version, component_name)."""
+        pom_path = repo_path / "pom.xml"
+        if not pom_path.exists():
+            return {}
+        try:
+            tree = ET.parse(str(pom_path))
+            root = tree.getroot()
+            ns, tag, _, _, _, _ = _pom_namespace_helpers(root)
+            gid_el = root.find(tag("groupId"), ns)
+            if gid_el is None or not gid_el.text:
+                parent_el = root.find(tag("parent"), ns)
+                if parent_el is not None:
+                    gid_el = parent_el.find(tag("groupId"), ns)
+            aid_el = root.find(tag("artifactId"), ns)
+            ver_el = root.find(tag("version"), ns)
+            if ver_el is None or not ver_el.text:
+                parent_el = root.find(tag("parent"), ns)
+                if parent_el is not None:
+                    ver_el = parent_el.find(tag("version"), ns)
+
+            group_id = gid_el.text.strip() if gid_el is not None and gid_el.text else ""
+            artifact_id = aid_el.text.strip() if aid_el is not None and aid_el.text else ""
+            version = ver_el.text.strip() if ver_el is not None and ver_el.text else ""
+            return {
+                "group_id": group_id,
+                "artifact_id": artifact_id,
+                "version": version,
+                "component_name": f"{group_id}:{artifact_id}" if group_id and artifact_id else artifact_id,
+            }
+        except Exception as exc:
+            logger.warning("Could not read project coordinates from %s: %s", pom_path, exc)
+            return {}
+
+    def has_dependency(self, repo_path: Path, component_name: str) -> bool:
+        """Checks if component_name (groupId:artifactId or artifactId) is declared in pom.xml."""
+        pom_path = repo_path / "pom.xml"
+        if not pom_path.exists():
+            return False
+        try:
+            tree = ET.parse(str(pom_path))
+            root = tree.getroot()
+            ns, tag, _, _, dep_xpath, _ = _pom_namespace_helpers(root)
+            group_id, artifact_id = _split_ga(component_name)
+            for dep in root.findall(dep_xpath, ns):
+                aid_el = dep.find(tag("artifactId"), ns)
+                gid_el = dep.find(tag("groupId"), ns)
+                if aid_el is not None and aid_el.text == artifact_id:
+                    if group_id is None or (gid_el is not None and gid_el.text == group_id):
+                        return True
+            dm = root.find(tag("dependencyManagement"), ns)
+            if dm is not None:
+                for dep in dm.findall(dep_xpath, ns):
+                    aid_el = dep.find(tag("artifactId"), ns)
+                    gid_el = dep.find(tag("groupId"), ns)
+                    if aid_el is not None and aid_el.text == artifact_id:
+                        if group_id is None or (gid_el is not None and gid_el.text == group_id):
+                            return True
+        except Exception:
+            pass
+        return False
+
 
 def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str]:
     """Runs `mvn compile -q --batch-mode` in repo_path. Returns (success, message).

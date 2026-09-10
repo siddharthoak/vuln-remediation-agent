@@ -87,20 +87,29 @@ class AdkVertexEngine:
             FunctionTool(func=run_maven_test),
         ]
 
+        system_instruction = (
+            "You are an autonomous vulnerability remediation agent. "
+            "Use the provided tools to inspect files, apply surgical edits, "
+            "and verify repository compilation and tests."
+        )
+
         agent = Agent(
             name="code_fixer",
             model=self._model_name,
-            instruction=prompt,
+            instruction=system_instruction,
             tools=tools,
         )
 
+        # Sanitize any ${VAR} syntax from compiler/CI failure logs so template parsers never crash
+        safe_prompt = re.sub(r'\$\{([a-zA-Z0-9_]+)\}', r'$(\1)', prompt)
+
         try:
             reasoning, prompt_tokens, completion_tokens = asyncio.run(
-                asyncio.wait_for(self._run_agent_async(agent), timeout=180.0)
+                asyncio.wait_for(self._run_agent_async(agent, safe_prompt), timeout=360.0)
             )
         except asyncio.TimeoutError as exc:
-            logger.error("ADK Vertex runner timed out after 180s")
-            raise EngineExecutionError("ADK Vertex agent runner timed out after 180s") from exc
+            logger.error("ADK Vertex runner timed out after 360s")
+            raise EngineExecutionError("ADK Vertex agent runner timed out after 360s") from exc
         except Exception as exc:
             if not isinstance(exc, EngineExecutionError):
                 raise EngineExecutionError(f"ADK Vertex engine failed: {exc}") from exc
@@ -114,43 +123,58 @@ class AdkVertexEngine:
             model_name=self._model_name,
         )
 
-    async def _run_agent_async(self, agent: Agent) -> tuple:
+    async def _run_agent_async(self, agent: Agent, prompt: str) -> tuple:
         """Async runner for the ADK agent. Called via asyncio.run() from run_fix."""
-        session_service = InMemorySessionService()
-        runner = Runner(
-            agent=agent,
-            app_name="vuln-code-fixer",
-            session_service=session_service,
-        )
-
-        session = await session_service.create_session(
-            app_name="vuln-code-fixer",
-            user_id="fixer",
-        )
-
         trigger = genai_types.Content(
             role="user",
-            parts=[genai_types.Part(text="Execute the fix based on your instructions.")],
+            parts=[genai_types.Part(text=prompt)],
         )
 
-        final_text = ""
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
+        max_rate_attempts = 4
+        for attempt in range(1, max_rate_attempts + 1):
+            session_service = InMemorySessionService()
+            runner = Runner(
+                agent=agent,
+                app_name="vuln-code-fixer",
+                session_service=session_service,
+            )
 
-        async for event in runner.run_async(
-            user_id="fixer",
-            session_id=session.id,
-            new_message=trigger,
-        ):
-            if event.is_final_response() and event.content:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        final_text += part.text
+            session = await session_service.create_session(
+                app_name="vuln-code-fixer",
+                user_id="fixer",
+            )
 
-            usage = getattr(event, "usage_metadata", None)
-            if usage:
-                total_prompt_tokens     += getattr(usage, "prompt_token_count",     0) or 0
-                total_completion_tokens += getattr(usage, "candidates_token_count", 0) or 0
+            final_text = ""
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+
+            try:
+                async for event in runner.run_async(
+                    user_id="fixer",
+                    session_id=session.id,
+                    new_message=trigger,
+                ):
+                    if event.is_final_response() and event.content:
+                        for part in event.content.parts:
+                            if hasattr(part, "text") and part.text:
+                                final_text += part.text
+
+                    usage = getattr(event, "usage_metadata", None)
+                    if usage:
+                        total_prompt_tokens     += getattr(usage, "prompt_token_count",     0) or 0
+                        total_completion_tokens += getattr(usage, "candidates_token_count", 0) or 0
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                is_rate_limit = "429" in err_str or "resource_exhausted" in err_str or "resourceexhausted" in type(e).__name__.lower()
+                if is_rate_limit and attempt < max_rate_attempts:
+                    backoff = attempt * 20
+                    logger.warning(
+                        f"ADK Vertex rate limit encountered ({type(e).__name__}). Backing off for {backoff}s (attempt {attempt}/{max_rate_attempts})..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
 
         json_match = re.search(r"```json\s*(.*?)\s*```", final_text, re.DOTALL)
         json_str = json_match.group(1) if json_match else final_text.strip()

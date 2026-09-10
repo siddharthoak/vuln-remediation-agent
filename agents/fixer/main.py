@@ -39,7 +39,7 @@ from common.tracking_store import (
 )
 from common.knowledge_store import make_knowledge_store
 from common.file_lock import FileLock
-from common.config import get_target_repo, get_github_pat
+from common.config import get_target_repo, get_target_repos, get_github_pat
 from knowledge.main import KnowledgeAgent
 from classifier.classifier import Classifier, ClassifierResult
 
@@ -50,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fixer.main")
 
-MAX_PARALLEL_FIXES = int(os.environ.get("MAX_PARALLEL_FIXES", "5"))
+MAX_PARALLEL_FIXES = int(os.environ.get("MAX_PARALLEL_FIXES", "2"))
 AUTO_FETCH_SCAN    = os.environ.get("AUTO_FETCH_SCAN", "0") == "1"
 
 # Prevents concurrent fresh-scan runs if the poller fires while one is in progress.
@@ -370,9 +370,10 @@ def _run_fresh_scan():
 def _do_fresh_scan():
     logger.info("Mode: FRESH SCAN (scheduler-triggered)")
 
-    github_repo     = get_target_repo()
+    target_repos    = get_target_repos()
+    github_repo     = target_repos[0] if target_repos else get_target_repo()
     github_repo_url = f"https://github.com/{github_repo}.git"
-    github_pat      = get_github_pat()
+    github_pat      = get_github_pat(github_repo)
 
     server_mode = os.environ.get("FIXER_SERVER_MODE", "0") == "1"
 
@@ -498,6 +499,33 @@ def _do_fresh_scan():
 
     branch_name = "fix/vulnerability-remediation"
     
+    if len(target_repos) > 1:
+        logger.info(
+            "Multi-repository dependency chain detected (%d repos: %s). "
+            "Executing MultiRepoChainCoordinator...",
+            len(target_repos), target_repos,
+        )
+        from multi_repo_chain import MultiRepoChainCoordinator
+        coordinator = MultiRepoChainCoordinator(
+            repo_chain=target_repos,
+            github_pat=github_pat,
+            tracking_store=tracking_store,
+            base_branch=base_branch,
+            branch_name=branch_name,
+        )
+        source_repo.cleanup()
+        for finding in findings:
+            result = classification.get(finding.component_name)
+            if result and result.bucket in (1, 4):
+                logger.info("Finding %s is in bucket %d -- skipping multi-repo fix.", finding.component_name, result.bucket)
+                continue
+            coordinator.remediate_finding_across_chain(
+                finding=finding,
+                kb_entry=result.kb_entry if result else None,
+            )
+        logger.info("Multi-repository dependency chain remediation complete.")
+        return
+
     tasks = []
     for finding in findings:
         result = classification[finding.component_name]
@@ -510,6 +538,9 @@ def _do_fresh_scan():
             component_name=finding.component_name,
             old_version=finding.current_version,
             new_version=finding.recommended_version,
+            is_transitive=finding.is_transitive,
+            introduced_by=finding.introduced_by,
+            transitive_depth=finding.transitive_depth,
         )
         record.branch_name  = branch_name
         record.kb_bucket    = result.bucket
@@ -527,21 +558,44 @@ def _do_fresh_scan():
         init_repo.clone(github_repo_url, github_pat)
         branch_created = init_repo.create_branch(branch_name, skip_if_exists=True)
         if not branch_created:
-            existing_pr = pr_client.find_any_pr(branch_name, base_branch)
-            if existing_pr:
+            existing_open_pr = pr_client._find_open_pr(branch_name, base_branch)
+            if existing_open_pr:
                 logger.info(
-                    "Branch already exists -- found PR #%d (%s), attaching to tracking records.",
-                    existing_pr.pr_number, existing_pr.pr_url,
+                    "Branch already exists with active open PR #%d (%s) -- attaching to tracking records.",
+                    existing_open_pr.number, existing_open_pr.html_url,
                 )
                 for finding, record, kb_entry in tasks:
-                    current = tracking_store.get(record.tracking_id)
-                    current.pr_number = existing_pr.pr_number
+                    current = tracking_store.get(record.tracking_id) or record
+                    current.pr_number = existing_open_pr.number
                     current.status = TrackingStatus.PR_OPENED.value
                     tracking_store.update(current)
+                source_repo.cleanup()
+                return
             else:
-                logger.warning("Branch already exists but no PR found. Leaving records as CREATED.")
-            source_repo.cleanup()
-            return
+                logger.info(
+                    "Remote branch '%s' exists but has no open PR (previous PR was closed/merged). "
+                    "Resetting remote branch from %s so a fresh remediation PR can be opened.",
+                    branch_name, base_branch,
+                )
+                try:
+                    init_repo._repo.git.push('origin', '--delete', branch_name)
+                    logger.info("Deleted stale remote branch '%s' on origin", branch_name)
+                except Exception as del_err:
+                    logger.warning("Could not delete stale remote branch: %s", del_err)
+
+                # Recreate branch from fresh base_branch
+                init_repo._repo.git.checkout(base_branch)
+                try:
+                    init_repo._repo.git.pull('origin', base_branch)
+                except Exception:
+                    pass
+                if branch_name in [h.name for h in init_repo._repo.heads]:
+                    try:
+                        init_repo._repo.git.branch('-D', branch_name)
+                    except Exception:
+                        pass
+                init_repo.create_branch(branch_name, skip_if_exists=False)
+
         # push the initial branch so workers can pull from it
         init_repo.push_branch(branch_name)
 
@@ -587,7 +641,7 @@ def _do_fresh_scan():
             successful_fixes=successful_fixes,
         )
         for finding, record, summary in successful_fixes:
-            current = tracking_store.get(record.tracking_id)
+            current = tracking_store.get(record.tracking_id) or record
             current.pr_number = pr_result.pr_number
             current.status = TrackingStatus.PR_OPENED.value if pr_result.was_existing else TrackingStatus.CI_PENDING.value
             tracking_store.update(current)
@@ -700,6 +754,17 @@ def _run_retry(tracking_id: str):
         if current is not None:
             current.status = TrackingStatus.CI_PENDING.value
             tracking_store.update(current)
+
+        # Synchronize all records associated with this PR to CI_PENDING
+        all_records = (
+            tracking_store.get_all_for_pr(record.pr_number)
+            if hasattr(tracking_store, "get_all_for_pr")
+            else []
+        )
+        for r in all_records:
+            if r.status in (TrackingStatus.CI_FAILED.value, TrackingStatus.ENGINE_ERROR.value):
+                r.status = TrackingStatus.CI_PENDING.value
+                tracking_store.update(r)
 
         logger.info(
             "Retry fix pushed for PR #%s on branch '%s'.",

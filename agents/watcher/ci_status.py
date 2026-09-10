@@ -76,6 +76,18 @@ class CIStatusWatcher:
         gh = Github(github_pat)
         self._repo = gh.get_repo(repo_full_name)
 
+    @property
+    def repo(self):
+        try:
+            from common.config import get_github_pat
+            token = get_github_pat(self._repo_full_name) or self._github_pat
+            if token != self._github_pat:
+                self._github_pat = token
+                self._repo = Github(token).get_repo(self._repo_full_name)
+        except Exception:
+            pass
+        return self._repo
+
     def wait_for_ci(
         self,
         pr_number: int,
@@ -83,13 +95,13 @@ class CIStatusWatcher:
         timeout_seconds: int = 1800,
     ) -> CIResult:
         """
-        Poll until all CI check runs on the PR's head commit reach a terminal state,
-        or until `timeout_seconds` is exceeded.
+        Poll until all CI check runs or workflow runs on the PR's head commit reach
+        a terminal state, or until `timeout_seconds` is exceeded.
 
         poll_interval_seconds and timeout_seconds are intentionally configurable since
         CI run durations vary enormously across projects and need tuning in practice.
         """
-        pr = self._repo.get_pull(pr_number)
+        pr = self.repo.get_pull(pr_number)
         head_sha = pr.head.sha
 
         logger.info(
@@ -99,11 +111,11 @@ class CIStatusWatcher:
 
         elapsed = 0
         while elapsed < timeout_seconds:
-            result = self._evaluate_check_runs(pr_number, head_sha)
+            result = self._evaluate_ci(pr_number, head_sha)
             if result is not None:
                 return result
 
-            logger.debug(
+            logger.info(
                 "PR #%d: CI still in progress. Waiting %ds (elapsed %ds/%ds)...",
                 pr_number, poll_interval_seconds, elapsed, timeout_seconds,
             )
@@ -120,23 +132,36 @@ class CIStatusWatcher:
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _evaluate_check_runs(self, pr_number: int, head_sha: str) -> Optional[CIResult]:
-        """
-        Inspect the current state of all check runs on `head_sha`.
+        """Backward-compatible wrapper delegating to _evaluate_ci."""
+        return self._evaluate_ci(pr_number, head_sha)
 
-        Returns a CIResult if all check runs have reached a terminal state, or None
-        if any check is still in a pending/queued/in_progress state.
+    def _evaluate_ci(self, pr_number: int, head_sha: str) -> Optional[CIResult]:
+        """
+        Inspect the current CI state on `head_sha`.
+        Tries the GitHub Checks API first (when available with 'checks: read' permission).
+        If the Checks API returns 403 Forbidden or returns no check runs, falls back
+        seamlessly to the GitHub Actions Workflow Runs API ('actions: read' permission).
         """
         try:
-            commit = self._repo.get_commit(head_sha)
+            commit = self.repo.get_commit(head_sha)
             check_runs = list(commit.get_check_runs())
+            if check_runs:
+                return self._classify_check_runs(check_runs, pr_number, head_sha)
         except GithubException as exc:
-            logger.warning("GitHub API error fetching check runs: %s", exc)
-            return None
+            if exc.status == 403:
+                logger.debug(
+                    "Checks API returned 403 for %s (using Workflow Runs API fallback).",
+                    head_sha[:8],
+                )
+            else:
+                logger.warning("GitHub API error fetching check runs: %s", exc)
+        except Exception as exc:
+            logger.warning("Unexpected error fetching check runs: %s", exc)
 
-        if not check_runs:
-            # No checks registered yet — CI hasn't started; keep waiting
-            return None
+        # Fall back to GitHub Actions Workflow Runs API
+        return self._evaluate_workflow_runs(pr_number, head_sha)
 
+    def _classify_check_runs(self, check_runs, pr_number: int, head_sha: str) -> Optional[CIResult]:
         in_progress_statuses = {"queued", "in_progress"}
         all_terminal = all(cr.status not in in_progress_statuses for cr in check_runs)
 
@@ -177,6 +202,104 @@ class CIStatusWatcher:
             pr_number=pr_number,
             head_sha=head_sha,
         )
+
+    def _evaluate_workflow_runs(self, pr_number: int, head_sha: str) -> Optional[CIResult]:
+        """
+        Inspect GitHub Actions workflow runs for `head_sha`.
+        Returns CIResult if all runs are complete, or None if in progress / no runs yet.
+        """
+        try:
+            runs = list(self.repo.get_workflow_runs(head_sha=head_sha))
+        except GithubException as exc:
+            logger.warning("GitHub API error fetching workflow runs for %s: %s", head_sha[:8], exc)
+            return None
+        except Exception as exc:
+            logger.warning("Unexpected error fetching workflow runs: %s", exc)
+            return None
+
+        if not runs:
+            # CI hasn't started or no workflows registered for this commit yet
+            return None
+
+        in_progress_statuses = {"queued", "in_progress", "waiting", "pending", "requested"}
+        any_running = any(run.status in in_progress_statuses for run in runs)
+        if any_running:
+            return None  # At least one workflow still running
+
+        failed_checks = []
+        for run in runs:
+            if run.conclusion in self.FAILURE_CONCLUSIONS:
+                try:
+                    jobs = list(run.jobs())
+                except Exception as exc:
+                    logger.warning("Could not fetch jobs for workflow run %s: %s", run.id, exc)
+                    jobs = []
+
+                failed_jobs = [j for j in jobs if j.conclusion in self.FAILURE_CONCLUSIONS]
+                if not failed_jobs:
+                    failed_checks.append(FailedCheck(
+                        name=run.name or f"Workflow {run.id}",
+                        check_run_id=run.id,
+                        conclusion=run.conclusion or "failure",
+                        details_url=run.html_url or "",
+                        log_text="",
+                    ))
+                else:
+                    for job in failed_jobs:
+                        log_text = self._fetch_job_log(job)
+                        failed_checks.append(FailedCheck(
+                            name=f"{run.name} / {job.name}",
+                            check_run_id=job.id,
+                            conclusion=job.conclusion or "failure",
+                            details_url=job.html_url or run.html_url or "",
+                            log_text=log_text,
+                        ))
+
+        if failed_checks:
+            logger.info(
+                "PR #%d: CI FAILED — %d workflow job(s) failed: %s",
+                pr_number,
+                len(failed_checks),
+                [fc.name for fc in failed_checks],
+            )
+            return CIResult(
+                status=CIOutcome.FAILURE,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                check_run_url=failed_checks[0].details_url,
+                failed_checks=failed_checks,
+            )
+
+        logger.info("PR #%d: CI PASSED — all %d workflow run(s) succeeded.", pr_number, len(runs))
+        return CIResult(
+            status=CIOutcome.SUCCESS,
+            pr_number=pr_number,
+            head_sha=head_sha,
+        )
+
+    def _fetch_job_log(self, job) -> str:
+        """Fetch log for a failed WorkflowJob using job.logs_url()."""
+        try:
+            logs_url = job.logs_url()
+            if logs_url:
+                req = urllib.request.Request(logs_url, headers={"User-Agent": "vuln-remediation-agent"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    raw_text = resp.read().decode("utf-8", errors="replace")
+                    return self._extract_relevant_log(raw_text)
+        except Exception as exc:
+            logger.warning("Could not fetch log for job %s: %s", getattr(job, "id", "unknown"), exc)
+
+        try:
+            steps_info = []
+            for step in getattr(job, "steps", []):
+                if step.conclusion in self.FAILURE_CONCLUSIONS:
+                    steps_info.append(f"Step '{step.name}' failed (status: {step.status}, conclusion: {step.conclusion})")
+            if steps_info:
+                return "\n".join(steps_info)
+        except Exception:
+            pass
+
+        return ""
 
     def _fetch_log(self, check_run) -> str:
         """

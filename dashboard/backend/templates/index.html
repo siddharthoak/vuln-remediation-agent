@@ -138,6 +138,16 @@
   .pr-badge.unknown { background: #6e7781; color: #fff; }
   .pr-badge.none { background: transparent; color: inherit; opacity: 0.55; border: 1px dashed #8888; font-weight: 500; }
   .pr-badge.open:hover, .pr-badge.merged:hover, .pr-badge.closed:hover, .pr-badge.unknown:hover { filter: brightness(1.1); }
+
+  .badge {
+    display: inline-flex; align-items: center; white-space: nowrap;
+    padding: 0.12rem 0.45rem; border-radius: 4px;
+    font-size: 0.68rem; font-weight: 600; text-decoration: none;
+    margin-left: 0.35rem; vertical-align: middle; line-height: 1.2;
+  }
+  .badge-transitive { background: #8250df18; color: #8250df; border: 1px solid #8250df44; }
+  .badge-direct     { background: #16a34a18; color: #16a34a; border: 1px solid #16a34a44; }
+  .badge-chain      { background: #0284c718; color: #0284c7; border: 1px solid #0284c744; }
   details[open] { border-left-width: 4px; }
   details > *:not(summary) { margin-top: 0.6rem; }
 

@@ -471,21 +471,32 @@ class CodeFixer:
             version_parts = [int(part) for part in target_version.split(".")[:2]]
         except (ValueError, AttributeError):
             return []
-        if len(version_parts) < 2 or version_parts[0] != 2 or version_parts[1] < 5:
+        if len(version_parts) < 2:
+            return []
+        major, minor = version_parts[0], version_parts[1]
+        # Matches Struts 2.5+ as well as Struts 6+ and beyond
+        if not (major > 2 or (major == 2 and minor >= 5)):
             return []
 
-        old_import = "org.apache.struts2.dispatcher.ng.filter.StrutsPrepareAndExecuteFilter"
-        new_import = "org.apache.struts2.dispatcher.filter.StrutsPrepareAndExecuteFilter"
+        replacements = [
+            ("org.apache.struts2.dispatcher.ng.filter.StrutsPrepareAndExecuteFilter", "org.apache.struts2.dispatcher.filter.StrutsPrepareAndExecuteFilter"),
+            ("org.apache.struts2.dispatcher.StrutsFilter", "org.apache.struts2.dispatcher.filter.StrutsPrepareAndExecuteFilter"),
+            ("StrutsFilter.class", "StrutsPrepareAndExecuteFilter.class"),
+            ("StrutsFilter", "StrutsPrepareAndExecuteFilter"),
+        ]
 
         changed = []
         for source_file in self._repo_path.rglob("*.java"):
             if "target" in source_file.parts:
                 continue
             content = source_file.read_text(encoding="utf-8")
-            if old_import not in content:
-                continue
-            source_file.write_text(content.replace(old_import, new_import, 1), encoding="utf-8")
-            changed.append(str(source_file.relative_to(self._repo_path)))
+            modified = content
+            for old_text, new_text in replacements:
+                if old_text in modified:
+                    modified = modified.replace(old_text, new_text)
+            if modified != content:
+                source_file.write_text(modified, encoding="utf-8")
+                changed.append(str(source_file.relative_to(self._repo_path)))
         return changed
 
     def _execute_transitive_fix(

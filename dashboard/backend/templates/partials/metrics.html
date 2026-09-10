@@ -10,6 +10,11 @@
       <div class="metric"><div class="value warn">{{ in_progress }}</div><div class="label">In progress</div></div>
       <div class="metric"><div class="value err">{{ escalated }}</div><div class="label">Escalated</div></div>
       <div class="metric"><div class="value">{{ resolution_rate | round(1) }}%</div><div class="label">Resolution rate</div></div>
+      <div class="metric"><div class="value">{{ transitive_count }}</div><div class="label">Transitive findings</div></div>
+      <div class="metric"><div class="value">{{ direct_count }}</div><div class="label">Direct findings</div></div>
+      {% if chain_count %}
+      <div class="metric"><div class="value">{{ chain_count }}</div><div class="label">Multi-repo steps</div></div>
+      {% endif %}
     </div>
 
     {% if avg_resolution is not none %}

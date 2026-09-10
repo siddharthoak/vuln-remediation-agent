@@ -1,5 +1,5 @@
 <div id="run-history-root"
-     hx-get="/partials/run-history?status={{ selected_status | urlencode }}&component={{ selected_component | urlencode }}&repo={{ selected_repo | urlencode }}"
+     hx-get="/partials/run-history?status={{ selected_status | urlencode }}&component={{ selected_component | urlencode }}&repo={{ selected_repo | urlencode }}&locality={{ selected_locality | urlencode }}"
      hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML">
 
   <h2>All Fix Attempts <small>({{ view | length }} of {{ total_count }} shown)</small></h2>
@@ -19,6 +19,11 @@
       <select name="repo" hx-get="/partials/run-history" hx-trigger="change" hx-target="#run-history-root" hx-swap="outerHTML" hx-include="#run-history-filters">
         <option value="">Repo: (all)</option>
         {% for r in repos %}<option value="{{ r }}" {% if r == selected_repo %}selected{% endif %}>{{ r }}</option>{% endfor %}
+      </select>
+      <select name="locality" hx-get="/partials/run-history" hx-trigger="change" hx-target="#run-history-root" hx-swap="outerHTML" hx-include="#run-history-filters">
+        <option value="">Locality: (all)</option>
+        <option value="transitive" {% if selected_locality == 'transitive' %}selected{% endif %}>Transitive</option>
+        <option value="direct" {% if selected_locality == 'direct' %}selected{% endif %}>Direct</option>
       </select>
     </form>
 
@@ -40,7 +45,19 @@
             {% for r in g.records %}
               <details class="record-card status-{{ r.status_class }}">
                 <summary>
-                  <span class="col-component" title="{{ r.component_name }}">{{ r.component_name }}</span>
+                  <span class="col-component" title="{{ r.component_name }}">
+                    {{ r.component_name }}
+                    {% if r.is_transitive %}
+                      <span class="badge badge-transitive" title="Transitive dependency (depth {{ r.transitive_depth or '2+' }}) introduced via {{ r.introduced_by or 'ancestor' }}">
+                        Transitive{% if r.transitive_depth %} (d:{{ r.transitive_depth }}){% endif %}
+                      </span>
+                    {% endif %}
+                    {% if r.chain_step %}
+                      <span class="badge badge-chain" title="Multi-repo chain step {{ r.chain_step }} of {{ r.chain_total }}">
+                        Chain {{ r.chain_step }}/{{ r.chain_total }}
+                      </span>
+                    {% endif %}
+                  </span>
                   <span class="col-version" title="{{ r.old_version }} → {{ r.new_version }}">{{ r.old_version }} &rarr; {{ r.new_version }}</span>
                   <span class="col-status" title="{{ r.status }} — {{ r.status_description }}">{{ r.status_icon }} {{ r.status }} <small>&mdash; {{ r.status_description }}</small></span>
                   <span class="col-pr">
@@ -66,6 +83,20 @@
                     </div>
                     <div class="label">Vulnerability{% if r.vulnerability_url %} (NVD){% endif %}</div>
                   </div>
+                  {% if r.is_transitive %}
+                  <div class="metric metric-text">
+                    <div class="value" title="{{ r.introduced_by or 'Transitive dependency' }}">
+                      {% if r.introduced_by %}{{ r.introduced_by }}{% else %}Transitive (via BOM/dep){% endif %}
+                    </div>
+                    <div class="label">Locality: Transitive (depth {{ r.transitive_depth or 2 }})</div>
+                  </div>
+                  {% endif %}
+                  {% if r.chain_step %}
+                  <div class="metric">
+                    <div class="value">Step {{ r.chain_step }} / {{ r.chain_total }}</div>
+                    <div class="label">Multi-repo chain</div>
+                  </div>
+                  {% endif %}
                   {% if r.time_to_resolution_seconds is not none %}
                   <div class="metric"><div class="value">{{ (r.time_to_resolution_seconds / 60) | round(1) }} min</div><div class="label">Time to outcome</div></div>
                   {% endif %}

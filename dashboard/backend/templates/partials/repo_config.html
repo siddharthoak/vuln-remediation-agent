@@ -12,32 +12,65 @@
 
   <form hx-post="/api/config" hx-target="#repo-config-card" hx-swap="outerHTML">
     <div class="form-group">
-      <label class="form-label" for="repo-input">Repo Link / Name</label>
-      <input
-        type="text"
+      <label class="form-label" for="repo-input">Target Repository / Chain (Unlimited Repositories)</label>
+      <textarea
         id="repo-input"
         name="repo"
         class="form-input"
-        value="{{ config.repo }}"
-        placeholder="owner/repo or https://github.com/..."
+        rows="2"
+        placeholder="e.g. org/repo-a, org/repo-b, org/repo-c, org/repo-d, ..."
         required
-      />
+        style="resize: vertical; font-family: monospace; font-size: 0.85rem;"
+      >{{ config.repo }}</textarea>
+      <small class="form-help">Enter any number of repositories separated by commas or newlines (e.g. <code>repo-a, repo-b, repo-c, ...</code>). The agent resolves the full dependency DAG bottom-up.</small>
+
+      {% if config.is_multi_repo %}
+        <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px;">
+          {% for r in config.repo_chain %}
+            <span style="background: #1e293b; color: #93c5fd; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; border: 1px solid #334155; font-family: monospace;">
+              <strong>#{{ loop.index }}</strong> {{ r }}
+            </span>
+          {% endfor %}
+        </div>
+      {% endif %}
     </div>
 
-    <div class="form-group">
-      <label class="form-label" for="pat-input">GitHub PAT</label>
-      <input
-        type="password"
-        id="pat-input"
-        name="pat"
-        class="form-input"
-        placeholder="{% if config.has_pat %}{{ config.masked_pat }}{% else %}ghp_...{% endif %}"
-      />
-      <small class="form-help">{% if config.has_pat %}Configured (leave blank to keep){% else %}Required for GitHub operations{% endif %}</small>
-    </div>
+    {% if config.is_github_app %}
+      <div style="background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 0.82rem; color: #6ee7b7;">
+        <strong>&#10003; Production GitHub App Active</strong> (App ID: <code style="color: #a7f3d0;">{{ config.app_id }}</code>)
+        <div style="color: #94a3b8; font-size: 0.75rem; margin-top: 3px; line-height: 1.3;">
+          Authentication tokens are dynamically minted for each repository link. Zero manual token entry required.
+        </div>
+      </div>
+      <details style="margin-bottom: 12px; font-size: 0.8rem; color: #94a3b8;">
+        <summary style="cursor: pointer; color: #60a5fa; margin-bottom: 6px;">Manual PAT Override (Optional)</summary>
+        <div class="form-group" style="margin-top: 6px;">
+          <input
+            type="password"
+            id="pat-input"
+            name="pat"
+            class="form-input"
+            placeholder="{% if config.has_pat %}{{ config.masked_pat }}{% else %}ghp_... (leave blank to use GitHub App){% endif %}"
+          />
+          <small class="form-help">Leave blank to use the GitHub App credentials.</small>
+        </div>
+      </details>
+    {% else %}
+      <div class="form-group">
+        <label class="form-label" for="pat-input">GitHub PAT</label>
+        <input
+          type="password"
+          id="pat-input"
+          name="pat"
+          class="form-input"
+          placeholder="{% if config.has_pat %}{{ config.masked_pat }}{% else %}ghp_...{% endif %}"
+        />
+        <small class="form-help">{% if config.has_pat %}Configured (leave blank to keep){% else %}Required for GitHub operations unless GitHub App is configured{% endif %}</small>
+      </div>
+    {% endif %}
 
     <div class="btn-stack">
-      <button type="submit" class="btn btn-primary" title="Save repository and PAT configuration">
+      <button type="submit" class="btn btn-primary" title="Save repository chain and PAT configuration">
         &#128190; Save &amp; Switch
       </button>
       <div class="btn-row">

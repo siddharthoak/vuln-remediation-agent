@@ -209,6 +209,7 @@ class RepoOps:
     def __init__(self):
         self._repo: Optional[git.Repo] = None
         self._local_path: Optional[str] = None
+        self._repo_url: Optional[str] = None
 
     # ── Context manager ───────────────────────────────────────────────────────
 
@@ -234,6 +235,7 @@ class RepoOps:
         the GitHub clone cost N times.
         """
         self._local_path = tempfile.mkdtemp(prefix="oss-remediation-")
+        self._repo_url = remote_url
         logger.info("Local clone from %s to %s", source_path, self._local_path)
         self._repo = git.Repo.clone_from(source_path, self._local_path)
         # After a local clone, origin points to the source path — re-point to GitHub.
@@ -244,14 +246,32 @@ class RepoOps:
 
     def clone(self, repo_url: str, github_pat: str, local_path: Optional[str] = None) -> str:
         """
-        Clone `repo_url` using `github_pat` for HTTPS auth.
-
-        The PAT is injected via Git's credential helper configuration, NOT embedded in the
-        URL, to prevent it from appearing in git logs, reflog, or error messages.
-
-        Returns the local path where the repo was cloned.
+        Clone `repo_url` (remote HTTPS GitHub URL or local directory path).
+        If `repo_url` is a local directory (e.g. from an uploaded zip):
+          - Clones or copies locally and initializes git if not already a git repository.
+        If `repo_url` is remote:
+          - Uses `github_pat` for HTTPS auth via Git credential helper.
         """
         self._local_path = local_path or tempfile.mkdtemp(prefix="oss-remediation-")
+        self._repo_url = repo_url
+
+        # Local directory check (uploaded zip or local filesystem path)
+        source_p = Path(repo_url)
+        if source_p.is_dir():
+            logger.info("Initializing local repo from %s to %s", repo_url, self._local_path)
+            if (source_p / ".git").is_dir():
+                self._repo = git.Repo.clone_from(str(source_p.resolve()), self._local_path)
+            else:
+                shutil.copytree(str(source_p.resolve()), self._local_path, dirs_exist_ok=True)
+                self._repo = git.Repo.init(self._local_path)
+                with self._repo.config_writer() as config:
+                    config.set_value("user", "name", "OSS Remediation Agent")
+                    config.set_value("user", "email", "agent@remediation.local")
+                self._repo.git.add(A=True)
+                if not self._repo.heads:
+                    self._repo.index.commit("Initial commit from local repository archive")
+            logger.info("Local clone complete: %s", self._local_path)
+            return self._local_path
 
         # Build an authenticated URL by injecting credentials as a Git config credential
         # helper override rather than in the URL string itself.
@@ -274,7 +294,7 @@ class RepoOps:
         """
         Create and check out `branch_name` off the current default branch.
 
-        If the branch already exists remotely:
+        If the branch already exists remotely or locally:
           - skip_if_exists=True (default): logs a warning and returns False.
             The caller should interpret False as "PR already in progress, skip this run."
           - skip_if_exists=False: raises RepoBranchExistsError.
@@ -283,17 +303,33 @@ class RepoOps:
         """
         self._require_repo()
 
-        # Fetch remote refs so we can check for existing branches
-        origin = self._repo.remotes.origin
-        origin.fetch()
+        has_origin = False
+        try:
+            has_origin = "origin" in [r.name for r in self._repo.remotes]
+        except Exception:
+            pass
 
-        remote_branches = [ref.name for ref in origin.refs]
-        remote_branch_ref = f"origin/{branch_name}"
+        if has_origin:
+            origin = self._repo.remotes.origin
+            try:
+                origin.fetch()
+                remote_branches = [ref.name for ref in origin.refs]
+                remote_branch_ref = f"origin/{branch_name}"
+                if remote_branch_ref in remote_branches:
+                    message = f"Branch '{branch_name}' already exists remotely — PR likely already open."
+                    if skip_if_exists:
+                        logger.warning(message + " Skipping this remediation run.")
+                        return False
+                    raise RepoBranchExistsError(message)
+            except Exception as exc:
+                logger.debug("Could not fetch remote origin: %s", exc)
 
-        if remote_branch_ref in remote_branches:
-            message = f"Branch '{branch_name}' already exists remotely — PR likely already open."
+        # Check local branches
+        if branch_name in [h.name for h in self._repo.heads]:
+            message = f"Branch '{branch_name}' already exists locally."
             if skip_if_exists:
-                logger.warning(message + " Skipping this remediation run.")
+                logger.warning(message + " Checking out existing branch.")
+                self._repo.heads[branch_name].checkout()
                 return False
             raise RepoBranchExistsError(message)
 
@@ -320,12 +356,40 @@ class RepoOps:
         logger.info("Committed %s: %s", commit.hexsha[:8], message)
         return commit.hexsha
 
+    def _refresh_credentials_if_needed(self) -> None:
+        """
+        Refreshes git credentials with a fresh GitHub token before pushing.
+        Ensures long-running repairs (2h - 8h) do not fail due to expired tokens.
+        """
+        if not self._repo_url or not self._local_path:
+            return
+        try:
+            from common.config import get_github_pat, normalize_repo_name
+            clean_name = normalize_repo_name(self._repo_url)
+            if clean_name and "/" in clean_name:
+                fresh_token = get_github_pat(clean_name)
+                if fresh_token:
+                    self._configure_credential_helper(fresh_token, self._repo_url)
+                    logger.debug("Refreshed git credentials for %s before push", clean_name)
+        except Exception as exc:
+            logger.debug("Pre-push credential refresh skipped: %s", exc)
+
     def push_branch(self, branch_name: str) -> None:
-        """Push `branch_name` to origin. Never force-pushes."""
+        """Push `branch_name` to origin if remote exists. Never force-pushes."""
         self._require_repo()
-        origin = self._repo.remotes.origin
-        origin.push(refspec=f"{branch_name}:{branch_name}")
-        logger.info("Pushed branch %s to origin", branch_name)
+        has_origin = False
+        try:
+            has_origin = "origin" in [r.name for r in self._repo.remotes]
+        except Exception:
+            pass
+
+        if has_origin:
+            self._refresh_credentials_if_needed()
+            origin = self._repo.remotes.origin
+            origin.push(refspec=f"{branch_name}:{branch_name}")
+            logger.info("Pushed branch %s to origin", branch_name)
+        else:
+            logger.info("Local repository without remote origin: branch %s committed locally", branch_name)
 
     def review_dependency_diff(
         self, component_name: str, target_version: str, expected_files: list,

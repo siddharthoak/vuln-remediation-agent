@@ -80,6 +80,20 @@ class TrackingRecord:
     kb_entry_id: Optional[str] = None    # KnowledgeEntry.entry_id used for this fix
     classifier_rationale: Optional[str] = None  # Classifier.classify()'s per-finding "why this bucket" explanation
 
+    # Transitive & Multi-repo chain tracking
+    is_transitive: bool = False
+    introduced_by: Optional[str] = None
+    transitive_depth: Optional[int] = None
+    chain_step: Optional[int] = None
+    chain_total: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TrackingRecord":
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in valid_fields}
+        return cls(**filtered)
+
 
 # ── Protocol (UNCHANGED) ──────────────────────────────────────────────────────
 
@@ -110,6 +124,11 @@ def make_fresh_record(
     component_name: str,
     old_version: str,
     new_version: str,
+    is_transitive: bool = False,
+    introduced_by: Optional[str] = None,
+    transitive_depth: Optional[int] = None,
+    chain_step: Optional[int] = None,
+    chain_total: Optional[int] = None,
 ) -> TrackingRecord:
     now = _now()
     return TrackingRecord(
@@ -124,6 +143,11 @@ def make_fresh_record(
         updated_at=now,
         parent_tracking_id=None,
         attempt_number=1,
+        is_transitive=is_transitive,
+        introduced_by=introduced_by,
+        transitive_depth=transitive_depth,
+        chain_step=chain_step,
+        chain_total=chain_total,
     )
 
 
@@ -144,6 +168,14 @@ def make_retry_record(parent: TrackingRecord, failure_log_excerpt: str) -> Track
         branch_name=parent.branch_name,
         attempt_number=parent.attempt_number + 1,
         failure_log_excerpt=failure_log_excerpt[:4000] if failure_log_excerpt else None,
+        kb_bucket=parent.kb_bucket,
+        kb_entry_id=parent.kb_entry_id,
+        classifier_rationale=parent.classifier_rationale,
+        is_transitive=parent.is_transitive,
+        introduced_by=parent.introduced_by,
+        transitive_depth=parent.transitive_depth,
+        chain_step=parent.chain_step,
+        chain_total=parent.chain_total,
     )
 
 
@@ -166,6 +198,10 @@ class InMemoryTrackingStore:
         if not matches:
             return None
         return sorted(matches, key=lambda r: r.attempt_number, reverse=True)[0]
+
+    def get_all_for_pr(self, pr_number: int) -> list:
+        return [r for r in self._records.values() if r.pr_number == pr_number]
+
 
     def get_lineage(self, pr_number: int) -> list:
         matches = [r for r in self._records.values() if r.pr_number == pr_number]
@@ -221,7 +257,7 @@ class FirestoreTrackingStore:
         doc = self._col.document(tracking_id).get()
         if not doc.exists:
             return None
-        return TrackingRecord(**doc.to_dict())
+        return TrackingRecord.from_dict(doc.to_dict())
 
     def get_latest_for_pr(self, pr_number: int) -> Optional[TrackingRecord]:
         from google.cloud.firestore_v1 import Query
@@ -232,7 +268,12 @@ class FirestoreTrackingStore:
             .limit(1)
             .stream()
         )
-        return TrackingRecord(**docs[0].to_dict()) if docs else None
+        return TrackingRecord.from_dict(docs[0].to_dict()) if docs else None
+
+    def get_all_for_pr(self, pr_number: int) -> list:
+        docs = self._col.where("pr_number", "==", pr_number).stream()
+        return [TrackingRecord.from_dict(d.to_dict()) for d in docs]
+
 
     def get_lineage(self, pr_number: int) -> list:
         docs = list(
@@ -241,10 +282,10 @@ class FirestoreTrackingStore:
             .order_by("attempt_number")
             .stream()
         )
-        return [TrackingRecord(**d.to_dict()) for d in docs]
+        return [TrackingRecord.from_dict(d.to_dict()) for d in docs]
 
     def get_all(self) -> list:
-        return [TrackingRecord(**d.to_dict()) for d in self._col.stream()]
+        return [TrackingRecord.from_dict(d.to_dict()) for d in self._col.stream()]
 
     def count_attempts_for_pr(self, pr_number: int) -> int:
         docs = self._col.where("pr_number", "==", pr_number).stream()
@@ -273,18 +314,31 @@ class FileTrackingStore:
         self._lock_path = self._path + ".lock"
 
     def _load(self) -> dict:
-        try:
-            with open(self._path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
+        import time
+        for attempt in range(3):
+            try:
+                with open(self._path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except FileNotFoundError:
+                return {}
+            except json.JSONDecodeError:
+                if attempt < 2:
+                    time.sleep(0.05)
+                    continue
+                return {}
+        return {}
 
     def _save(self, records: dict) -> None:
+        import time
         os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
-        temp_path = self._path + ".tmp"
+        temp_path = f"{self._path}.tmp.{os.getpid()}_{uuid.uuid4().hex[:8]}"
         with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(records, f, indent=2)
-        os.replace(temp_path, self._path)
+        try:
+            os.replace(temp_path, self._path)
+        except OSError:
+            time.sleep(0.05)
+            os.replace(temp_path, self._path)
 
     def create(self, record: TrackingRecord) -> None:
         with FileLock(self._lock_path):
@@ -296,29 +350,37 @@ class FileTrackingStore:
         with FileLock(self._lock_path):
             records = self._load()
             data = records.get(tracking_id)
-            return TrackingRecord(**data) if data else None
+            return TrackingRecord.from_dict(data) if data else None
 
     def get_latest_for_pr(self, pr_number: int) -> Optional[TrackingRecord]:
         with FileLock(self._lock_path):
             matches = [
-                TrackingRecord(**v) for v in self._load().values()
+                TrackingRecord.from_dict(v) for v in self._load().values()
                 if v.get("pr_number") == pr_number
             ]
             if not matches:
                 return None
             return sorted(matches, key=lambda r: r.attempt_number, reverse=True)[0]
 
+    def get_all_for_pr(self, pr_number: int) -> list:
+        with FileLock(self._lock_path):
+            return [
+                TrackingRecord.from_dict(v) for v in self._load().values()
+                if v.get("pr_number") == pr_number
+            ]
+
+
     def get_lineage(self, pr_number: int) -> list:
         with FileLock(self._lock_path):
             matches = [
-                TrackingRecord(**v) for v in self._load().values()
+                TrackingRecord.from_dict(v) for v in self._load().values()
                 if v.get("pr_number") == pr_number
             ]
             return sorted(matches, key=lambda r: r.attempt_number)
 
     def get_all(self) -> list:
         with FileLock(self._lock_path):
-            return [TrackingRecord(**v) for v in self._load().values()]
+            return [TrackingRecord.from_dict(v) for v in self._load().values()]
 
     def count_attempts_for_pr(self, pr_number: int) -> int:
         with FileLock(self._lock_path):

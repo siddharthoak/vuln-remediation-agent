@@ -22,6 +22,7 @@ services:
       FIXER_SERVER_MODE: "1"
       AUTO_FETCH_SCAN: "1"          # Automatically triggers security-scan.yml if reports are missing or new scan needed
       SCAN_POLL_INTERVAL: "60"      # seconds between GitHub Actions polls
+      MAX_PARALLEL_FIXES: "2"       # Limit concurrent fixes to avoid Vertex AI rate limits
       KB_HYDRATION: "1"             # set to "0" to skip Knowledge Agent (faster local testing)
     ports:
       - "8080:8080"
@@ -56,10 +57,12 @@ services:
       KB_STORE_PATH: /data/kb.json
       FIXER_RETRY_URL: http://fixer-server:8080/retry
       WATCHER_DAEMON: "1"
-      WATCHER_SLEEP_SECONDS: "900"  # 15 minutes
+      WATCHER_SLEEP_SECONDS: "${WATCHER_SLEEP_SECONDS:-60}"
+
     volumes:
       - ./data:/data
       - ./config:/config
+      - ./config/my-google-service-account.json:/gcp/adc.json:ro
     depends_on:
       - fixer-server
     restart: unless-stopped

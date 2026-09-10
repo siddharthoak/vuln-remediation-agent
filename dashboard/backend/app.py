@@ -18,24 +18,38 @@ swaps that element out for a different tab (no JS needed to pause it).
 import json
 import logging
 import os
+import re
+import shutil
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "agents"))
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from common.tracking_store import make_tracking_store, TrackingStatus  # noqa: E402
 from common.knowledge_store import make_knowledge_store  # noqa: E402
-from common.config import get_target_repo, get_github_pat, save_config, normalize_repo_name  # noqa: E402
+from common.config import (  # noqa: E402
+    get_target_repo,
+    get_target_repos,
+    get_github_pat,
+    save_config,
+    normalize_repo_name,
+    get_upload_dir,
+    get_download_dir,
+    resolve_repo_source,
+)
+from common.github_auth import get_auth_mode  # noqa: E402
 from common.reset_ops import reset_repository_state  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -177,7 +191,7 @@ def _fetch_pr_states(repo: str) -> dict:
         return cached[1]
 
     url = f"https://api.github.com/repos/{repo}/pulls?state=all&per_page=100"
-    pat = get_github_pat()
+    pat = get_github_pat(repo=repo)
 
     prs = None
     if pat:
@@ -371,16 +385,40 @@ def _sidebar_status() -> dict:
 
 def _repo_config_context(notice: dict = None) -> dict:
     repo = get_target_repo()
+    repos = get_target_repos()
     pat = get_github_pat()
+    auth_info = get_auth_mode()
     masked_pat = ""
     if pat:
         masked_pat = pat[:4] + "*" * max(0, len(pat) - 8) + pat[-4:] if len(pat) > 8 else "****"
+    repo_display = ", ".join(repos) if len(repos) > 1 else repo
+
+    download_dir = get_download_dir()
+    downloadable_zips = []
+    if download_dir.exists():
+        for z in sorted(download_dir.glob("*.zip"), key=lambda f: f.stat().st_mtime, reverse=True):
+            size_kb = z.stat().st_size / 1024
+            size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb/1024:.1f} MB"
+            downloadable_zips.append({
+                "name": z.name,
+                "clean_name": z.name.replace("-remediated.zip", "").replace(".zip", ""),
+                "size": size_str,
+            })
+
     return {
         "config": {
-            "repo": repo,
+            "repo": repo_display,
             "pat": pat,
             "masked_pat": masked_pat,
             "has_pat": bool(pat),
+            "is_multi_repo": len(repos) > 1,
+            "repo_chain": repos,
+            "downloadable_zips": downloadable_zips,
+            "auth_mode": auth_info["mode"],
+            "auth_label": auth_info["label"],
+            "auth_desc": auth_info["description"],
+            "is_github_app": auth_info["mode"] == "github_app",
+            "app_id": auth_info.get("app_id"),
         },
         "notice": notice,
     }
@@ -418,43 +456,166 @@ async def api_save_config(request: Request):
         ctx = _repo_config_context(notice={"type": "err", "message": "Repository cannot be empty."})
         return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
 
-    clean_repo = normalize_repo_name(repo_val)
-    active_pat = pat_val if pat_val else get_github_pat()
+    # Check if multiple repos were supplied (e.g. Repo A, Repo B, Repo C)
+    if "," in repo_val or "\n" in repo_val:
+        raw_parts = [r.strip() for r in re.split(r"[,;\n]+", repo_val) if r.strip()]
+        clean_chain = [normalize_repo_name(r) for r in raw_parts if normalize_repo_name(r)]
+        clean_repo = clean_chain[0] if clean_chain else normalize_repo_name(repo_val)
+        save_config(repo=clean_repo, pat=pat_val if pat_val else None, repo_chain=clean_chain)
+        notice_msg = f"Multi-repository chain configured ({len(clean_chain)} repos: {' → '.join(clean_chain)})!"
+    else:
+        clean_repo = normalize_repo_name(repo_val)
+        save_config(clean_repo, pat_val if pat_val else None, repo_chain=[clean_repo])
+        notice_msg = f"Target repository switched to '{clean_repo}'!"
 
-    warning = ""
-    if active_pat:
-        try:
-            req = urllib.request.Request(
-                f"https://api.github.com/repos/{clean_repo}",
-                headers={
-                    "Authorization": f"Bearer {active_pat}",
-                    "Accept": "application/vnd.github+json",
-                    "User-Agent": "vuln-remediation-agent",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                if resp.status == 200:
-                    pass
-        except urllib.error.HTTPError as he:
-            if he.code == 404:
-                warning = f" (Warning: repo '{clean_repo}' returned 404 — verify owner/repo and PAT access)"
-            elif he.code == 401:
-                warning = " (Warning: GitHub returned 401 Unauthorized — verify PAT)"
-        except Exception:
-            pass
-
-    save_config(clean_repo, pat_val if pat_val else None)
     _PR_STATE_CACHE.clear()
 
-    notice_msg = f"Target repository switched to '{clean_repo}'!{warning}"
-    ctx = _repo_config_context(notice={"type": "warn" if warning else "ok", "message": notice_msg})
+    ctx = _repo_config_context(notice={"type": "ok", "message": notice_msg})
     return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+
+def _safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
+    """Safely extracts zip_path into target_dir preventing Zip Slip."""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir_resolved = target_dir.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            member_path = (target_dir / member.filename).resolve()
+            if not str(member_path).startswith(str(target_dir_resolved)):
+                raise ValueError(f"Zip path traversal detected: {member.filename}")
+        zf.extractall(target_dir)
+
+    # If the zip archive has a single wrapper folder (e.g. repo-main/...), unwrap it
+    entries = [e for e in target_dir.iterdir() if e.name not in ("__MACOSX",)]
+    if len(entries) == 1 and entries[0].is_dir() and entries[0].name not in (".git", "src", "target", "build"):
+        nested = entries[0]
+        temp_dest = target_dir.parent / f"{target_dir.name}_unwrap_{int(time.time())}"
+        nested.rename(temp_dest)
+        shutil.rmtree(target_dir, ignore_errors=True)
+        temp_dest.rename(target_dir)
+
+    # Initialize git repo if not already present
+    git_dir = target_dir / ".git"
+    if not git_dir.exists():
+        try:
+            import git
+            repo = git.Repo.init(str(target_dir))
+            with repo.config_writer() as config:
+                config.set_value("user", "name", "OSS Remediation Agent")
+                config.set_value("user", "email", "agent@remediation.local")
+            repo.git.add(A=True)
+            if not repo.heads:
+                repo.index.commit("Initial commit from uploaded zip archive")
+        except Exception as exc:
+            logger.warning("Could not initialize git for %s: %s", target_dir, exc)
+
+
+@app.post("/api/upload-zips")
+async def api_upload_zips(request: Request, repo_zips: list[UploadFile] = File(...)):
+    if not repo_zips:
+        ctx = _repo_config_context(notice={"type": "err", "message": "No files selected for upload."})
+        return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+    upload_dir = get_upload_dir()
+    extracted_repos = []
+    errors = []
+
+    for file_obj in repo_zips:
+        filename = file_obj.filename or "repo.zip"
+        if not filename.lower().endswith(".zip"):
+            errors.append(f"{filename}: only .zip files are supported.")
+            continue
+
+        clean_name = normalize_repo_name(filename)
+        dest_repo_dir = upload_dir / clean_name
+
+        temp_zip = upload_dir / f"{clean_name}_temp_{int(time.time())}.zip"
+        try:
+            content = await file_obj.read()
+            temp_zip.write_bytes(content)
+            _safe_extract_zip(temp_zip, dest_repo_dir)
+            extracted_repos.append(clean_name)
+        except Exception as exc:
+            logger.exception("Failed extracting zip %s: %s", filename, exc)
+            errors.append(f"{filename}: {exc}")
+        finally:
+            if temp_zip.exists():
+                try:
+                    temp_zip.unlink()
+                except Exception:
+                    pass
+
+    if not extracted_repos:
+        msg = "Upload failed: " + "; ".join(errors) if errors else "No valid repositories extracted."
+        ctx = _repo_config_context(notice={"type": "err", "message": msg})
+        return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+    # Set uploaded repos as active chain (or combine)
+    existing_repos = get_target_repos()
+    # If existing repos were just the default test repo, replace with uploaded repos
+    if len(existing_repos) == 1 and ("Test_repo_1" in existing_repos[0] or "vuln-remediation-agent" in existing_repos[0]):
+        combined_chain = extracted_repos
+    else:
+        combined_chain = list(dict.fromkeys(existing_repos + extracted_repos))
+
+    save_config(repo=combined_chain[0], pat=get_github_pat() or None, repo_chain=combined_chain)
+    _PR_STATE_CACHE.clear()
+
+    notice_msg = f"Successfully uploaded and extracted {len(extracted_repos)} repository archive(s): {', '.join(extracted_repos)}!"
+    if errors:
+        notice_msg += f" (Warnings: {'; '.join(errors)})"
+
+    ctx = _repo_config_context(notice={"type": "ok", "message": notice_msg})
+    return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+
+@app.get("/api/download-zip/{repo_name}")
+def download_remediated_zip(repo_name: str):
+    clean_name = normalize_repo_name(repo_name).replace("/", "_")
+    download_dir = get_download_dir()
+
+    # Direct zip file match in data/downloads
+    cands = [
+        download_dir / f"{clean_name}-remediated.zip",
+        download_dir / f"{clean_name}.zip",
+        download_dir / f"{repo_name}.zip",
+        download_dir / repo_name,
+    ]
+    for cand in cands:
+        if cand.is_file():
+            return FileResponse(
+                path=str(cand.resolve()),
+                filename=cand.name,
+                media_type="application/zip",
+            )
+
+    # Check if directory exists in uploads and zip it on the fly
+    upload_dir = get_upload_dir()
+    repo_path = upload_dir / clean_name
+    if not repo_path.is_dir():
+        repo_path = upload_dir / repo_name
+    if repo_path.is_dir():
+        out_zip = download_dir / f"{clean_name}-remediated.zip"
+        with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _, filenames in os.walk(repo_path):
+                for filename in filenames:
+                    full_p = os.path.join(root, filename)
+                    rel_p = os.path.relpath(full_p, repo_path)
+                    if not rel_p.startswith(".git"):
+                        zf.write(full_p, rel_p)
+        return FileResponse(
+            path=str(out_zip.resolve()),
+            filename=out_zip.name,
+            media_type="application/zip",
+        )
+
+    raise HTTPException(status_code=404, detail=f"Archive for repository '{repo_name}' not found.")
 
 
 @app.post("/api/reset")
 async def api_reset(request: Request):
     repo = get_target_repo()
-    pat = get_github_pat()
+    pat = get_github_pat(repo=repo)
 
     if not repo:
         ctx = _repo_config_context(notice={"type": "err", "message": "No target repository configured."})
@@ -485,13 +646,13 @@ async def api_reset(request: Request):
 @app.post("/api/trigger-scan")
 async def api_trigger_scan(request: Request):
     repo = get_target_repo()
-    pat = get_github_pat()
+    pat = get_github_pat(repo=repo)
 
     if not repo:
         ctx = _repo_config_context(notice={"type": "err", "message": "No target repository configured."})
         return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
     if not pat:
-        ctx = _repo_config_context(notice={"type": "err", "message": "GitHub PAT required to trigger scan workflow."})
+        ctx = _repo_config_context(notice={"type": "err", "message": "GitHub authentication (GitHub App or PAT) required to trigger scan workflow."})
         return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
 
     url = f"https://api.github.com/repos/{repo}/actions/workflows/security-scan.yml/dispatches"
@@ -567,7 +728,7 @@ def _group_by_run(view: list) -> list:
     return result
 
 
-def _run_history_context(records: list, status: str = "", component: str = "", repo: str = "") -> dict:
+def _run_history_context(records: list, status: str = "", component: str = "", repo: str = "", locality: str = "") -> dict:
     statuses = sorted({r["status"] for r in records if r.get("status")})
     components = sorted({r["component_name"] for r in records if r.get("component_name")})
     repos = sorted({r["repo"] for r in records if r.get("repo")})
@@ -579,6 +740,10 @@ def _run_history_context(records: list, status: str = "", component: str = "", r
         view = [r for r in view if r["component_name"] == component]
     if repo:
         view = [r for r in view if r["repo"] == repo]
+    if locality == "transitive":
+        view = [r for r in view if r.get("is_transitive")]
+    elif locality == "direct":
+        view = [r for r in view if not r.get("is_transitive")]
     view = sorted(view, key=lambda r: r.get("created_at") or "", reverse=True)
 
     return {
@@ -590,14 +755,15 @@ def _run_history_context(records: list, status: str = "", component: str = "", r
         "selected_status": status,
         "selected_component": component,
         "selected_repo": repo,
+        "selected_locality": locality,
         "total_count": len(records),
     }
 
 
 @app.get("/partials/run-history")
-def partial_run_history(request: Request, status: str = "", component: str = "", repo: str = ""):
+def partial_run_history(request: Request, status: str = "", component: str = "", repo: str = "", locality: str = ""):
     records = _records_as_dicts()
-    ctx = _run_history_context(records, status, component, repo)
+    ctx = _run_history_context(records, status, component, repo, locality)
     return templates.TemplateResponse(request, "partials/run_history.html", ctx)
 
 
@@ -636,6 +802,11 @@ def partial_metrics(request: Request):
     escalated = sum(1 for r in latest if r["status"] in _ESCALATED_STATUSES)
     in_progress = total_prs - resolved - escalated
     resolution_rate = (resolved / total_prs * 100) if total_prs else 0.0
+
+    eval_set = latest if latest else records
+    transitive_count = sum(1 for r in eval_set if r.get("is_transitive"))
+    direct_count = sum(1 for r in eval_set if not r.get("is_transitive"))
+    chain_count = sum(1 for r in eval_set if r.get("chain_step"))
 
     resolved_times = sorted(
         r["time_to_resolution_seconds"] for r in latest
@@ -690,6 +861,9 @@ def partial_metrics(request: Request):
         "in_progress": in_progress,
         "escalated": escalated,
         "resolution_rate": resolution_rate,
+        "transitive_count": transitive_count,
+        "direct_count": direct_count,
+        "chain_count": chain_count,
         "avg_resolution": avg_resolution,
         "p50_resolution": p50_resolution,
         "p95_resolution": p95_resolution,

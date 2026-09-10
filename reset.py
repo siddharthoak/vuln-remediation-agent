@@ -46,6 +46,12 @@ def main():
     else:
         print("No remote fix branches to delete.")
 
+    if res.get("triage_issues_closed"):
+        print(f"Closed triage issues: {res['triage_issues_closed']}")
+    else:
+        print("No open triage issues to close.")
+
+
     if res["tracking_cleared"]:
         print("Cleared data/tracking.json -> {}")
     if res["checkpoint_cleared"]:
