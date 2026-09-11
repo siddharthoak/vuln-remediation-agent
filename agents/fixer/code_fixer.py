@@ -521,6 +521,40 @@ class CodeFixer:
         retry would use (_build_prompt selects it whenever failure_log_excerpt
         is set, regardless of why).
         """
+        # ── Dependency Hygiene: Try Parent-First upgrade before <dependencyManagement> ──
+        if introduced_by and hasattr(self._ecosystem, "try_parent_dependency_upgrade"):
+            try:
+                parent_upgrade = self._ecosystem.try_parent_dependency_upgrade(
+                    repo_path=self._repo_path,
+                    transitive_component=component_name,
+                    target_transitive_version=target_version,
+                    parent_component=introduced_by,
+                )
+                if parent_upgrade is not None:
+                    parent_old, parent_new, resolved_trans = parent_upgrade
+                    logger.info(
+                        "Dependency Hygiene: Upgraded direct parent %s (%s → %s) resolving %s to %s",
+                        introduced_by, parent_old, parent_new, component_name, resolved_trans,
+                    )
+                    return ChangeSummary(
+                        component_name=component_name,
+                        old_version=current_version,
+                        new_version=resolved_trans,
+                        files_changed=["pom.xml"],
+                        rationale=(
+                            f"Dependency Hygiene: Upgraded direct parent dependency {introduced_by} "
+                            f"({parent_old} → {parent_new}), which cleanly resolved transitive vulnerability "
+                            f"in {component_name} ({current_version} → {resolved_trans}) without requiring "
+                            "an artificial <dependencyManagement> override."
+                        ),
+                        cve_ids=cve_ids,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Parent-first upgrade attempt for %s via %s encountered an error: %s -- falling back to dependencyManagement.",
+                    component_name, introduced_by, e,
+                )
+
         self._ecosystem.add_transitive_override(self._repo_path, component_name, target_version)
 
         compiled, message = self._ecosystem.verify_build(self._repo_path)

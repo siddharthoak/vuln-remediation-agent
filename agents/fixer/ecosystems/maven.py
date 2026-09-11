@@ -101,6 +101,18 @@ def _parse_ga(line: str) -> Optional[str]:
     return f"{gav.group('groupId')}:{gav.group('artifactId')}" if gav else None
 
 
+def _parse_version_from_gav_line(line: str) -> Optional[str]:
+    match = _MARKER_RE.match(line)
+    content = line[match.end():] if match else line.strip()
+    clean = re.sub(r"\s+\(.*?\)$", "", content).strip()
+    parts = clean.split(":")
+    if len(parts) == 4 or len(parts) == 5:
+        return parts[3]
+    elif len(parts) >= 6:
+        return parts[4]
+    return None
+
+
 def _parse_tree(stdout: str, group_id: str, artifact_id: str) -> DependencyLocality:
     target = f"{group_id}:{artifact_id}"
     ancestor_at: Dict[int, str] = {}
@@ -117,8 +129,9 @@ def _parse_tree(stdout: str, group_id: str, artifact_id: str) -> DependencyLocal
         ancestor_at[depth] = ga
 
         if ga == target and depth > 0:
+            ver = _parse_version_from_gav_line(line)
             if depth == 1:
-                return DependencyLocality(found=True, is_transitive=False, depth=depth, raw_tree=stdout)
+                return DependencyLocality(found=True, is_transitive=False, depth=depth, raw_tree=stdout, resolved_version=ver)
             if best_match is None:
                 best_match = DependencyLocality(
                     found=True,
@@ -126,6 +139,7 @@ def _parse_tree(stdout: str, group_id: str, artifact_id: str) -> DependencyLocal
                     depth=depth,
                     introduced_by=ancestor_at.get(depth - 1),
                     raw_tree=stdout,
+                    resolved_version=ver,
                 )
 
     if best_match is not None:
@@ -363,6 +377,185 @@ class MavenEcosystem:
         except Exception:
             pass
         return False
+
+    def get_declared_dependency_version(self, repo_path: Path, component_name: str) -> Optional[str]:
+        """Returns the declared version of component_name directly in pom.xml, resolving ${properties}."""
+        pom_path = repo_path / "pom.xml"
+        if not pom_path.exists():
+            return None
+        try:
+            tree = ET.parse(str(pom_path))
+            root = tree.getroot()
+            ns, tag, _, prop_xpath, dep_xpath, _ = _pom_namespace_helpers(root)
+            group_id, artifact_id = _split_ga(component_name)
+            for dep in root.findall(dep_xpath, ns):
+                aid_el = dep.find(tag("artifactId"), ns)
+                gid_el = dep.find(tag("groupId"), ns)
+                ver_el = dep.find(tag("version"), ns)
+                if aid_el is None or ver_el is None or not ver_el.text:
+                    continue
+                if aid_el.text != artifact_id:
+                    continue
+                if group_id is not None and gid_el is not None and gid_el.text != group_id:
+                    continue
+                ver_text = ver_el.text.strip()
+                if ver_text.startswith("${") and ver_text.endswith("}"):
+                    prop_name = ver_text[2:-1]
+                    prop_el = root.find(prop_xpath(prop_name), ns)
+                    if prop_el is not None and prop_el.text:
+                        return prop_el.text.strip()
+                return ver_text
+        except Exception as exc:
+            logger.debug("Error reading declared dependency version for %s: %s", component_name, exc)
+        return None
+
+    def try_parent_dependency_upgrade(
+        self,
+        repo_path: Path,
+        transitive_component: str,
+        target_transitive_version: str,
+        parent_component: str,
+    ) -> Optional[Tuple[str, str, str]]:
+        """Dependency Hygiene: Checks if upgrading the direct parent dependency
+        resolves the transitive vulnerability cleanly, avoiding unnecessary <dependencyManagement>.
+        Returns (parent_current_version, candidate_version, resolved_transitive_version) if successful, else None.
+        """
+        pom_path = repo_path / "pom.xml"
+        if not pom_path.exists():
+            return None
+
+        parent_cur_ver = self.get_declared_dependency_version(repo_path, parent_component)
+        if not parent_cur_ver:
+            return None
+
+        parent_gid, parent_aid = _split_ga(parent_component)
+        if not parent_gid or not parent_aid:
+            return None
+
+        candidates = _fetch_newer_parent_versions(parent_gid, parent_aid, parent_cur_ver)
+        if not candidates:
+            return None
+
+        original_pom = pom_path.read_text(encoding="utf-8")
+        logger.info(
+            "Dependency Hygiene: Evaluating %d parent upgrade candidate(s) for %s to resolve %s",
+            len(candidates), parent_component, transitive_component,
+        )
+
+        for cand_ver in candidates[:4]:
+            try:
+                self.bump_direct_dependency(repo_path, parent_component, parent_cur_ver, cand_ver)
+                loc = self.resolve_locality(repo_path, transitive_component)
+                if loc.found and loc.resolved_version and _compare_versions(loc.resolved_version, target_transitive_version) >= 0:
+                    compiled, _ = self.verify_build(repo_path)
+                    if compiled:
+                        tested, _ = self.verify_tests(repo_path)
+                        if tested:
+                            logger.info(
+                                "Dependency Hygiene: Successfully upgraded direct parent %s (%s -> %s) "
+                                "which resolved transitive %s to %s!",
+                                parent_component, parent_cur_ver, cand_ver, transitive_component, loc.resolved_version,
+                            )
+                            return (parent_cur_ver, cand_ver, loc.resolved_version)
+            except Exception as exc:
+                logger.debug("Candidate parent upgrade %s to %s failed verification: %s", parent_component, cand_ver, exc)
+            finally:
+                pom_path.write_text(original_pom, encoding="utf-8")
+
+        return None
+
+
+def _parse_major(version: str) -> int:
+    try:
+        return int(version.strip().lstrip("v").split(".")[0])
+    except (ValueError, IndexError, AttributeError):
+        return -1
+
+
+def _compare_versions(v1: str, v2: str) -> int:
+    """Compares two Maven version strings. Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal."""
+    def _to_parts(v: str) -> list:
+        clean = re.sub(r"[-_](RELEASE|Final|GA|\.GA)$", "", v.strip().lstrip("v"), flags=re.IGNORECASE)
+        parts = []
+        for seg in re.split(r"[.-]", clean):
+            try:
+                parts.append((0, int(seg)))
+            except ValueError:
+                parts.append((1, seg))
+        return parts
+
+    p1, p2 = _to_parts(v1), _to_parts(v2)
+    for a, b in zip(p1, p2):
+        if a < b:
+            return -1
+        elif a > b:
+            return 1
+    if len(p1) < len(p2):
+        return -1
+    elif len(p1) > len(p2):
+        return 1
+    return 0
+
+
+def _fetch_newer_parent_versions(group_id: str, artifact_id: str, current_version: str) -> list[str]:
+    """Queries Maven Central for newer patch/minor releases of the direct parent dependency.
+    Prefers repo1.maven.org Fastly CDN maven-metadata.xml for speed and reliability,
+    falling back to Solr search.maven.org if needed.
+    """
+    import urllib.parse
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    import json
+
+    raw_versions: list[str] = []
+
+    # 1. Primary: Fastly CDN canonical maven-metadata.xml
+    g_path = group_id.replace(".", "/")
+    cdn_url = f"https://repo1.maven.org/maven2/{g_path}/{artifact_id}/maven-metadata.xml"
+    try:
+        req = urllib.request.Request(cdn_url, headers={"User-Agent": "vuln-remediation-agent"})
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            root = ET.fromstring(resp.read())
+            raw_versions = [
+                el.text.strip()
+                for el in root.findall(".//version")
+                if el.text and el.text.strip()
+            ]
+    except Exception as exc:
+        logger.debug("repo1.maven.org metadata query for %s:%s failed: %s", group_id, artifact_id, exc)
+
+    # 2. Fallback: Solr search.maven.org
+    if not raw_versions:
+        solr_url = f"https://search.maven.org/solrsearch/select?q=g:%22{group_id}%22+AND+a:%22{artifact_id}%22&core=gav&rows=40&wt=json"
+        try:
+            req = urllib.request.Request(solr_url, headers={"User-Agent": "vuln-remediation-agent"})
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                docs = data.get("response", {}).get("docs", [])
+                raw_versions = [d.get("v", "") for d in docs if d.get("v")]
+        except Exception as exc:
+            logger.debug("search.maven.org lookup for %s:%s failed: %s", group_id, artifact_id, exc)
+
+    if not raw_versions:
+        return []
+
+    cur_major = _parse_major(current_version)
+    candidates = []
+    seen = set()
+    for ver in raw_versions:
+        if not ver or ver in seen:
+            continue
+        seen.add(ver)
+        if any(kw in ver.lower() for kw in ("alpha", "beta", "rc", "m", "snapshot", "cr")):
+            continue
+        if cur_major != -1 and _parse_major(ver) != cur_major:
+            continue
+        if _compare_versions(ver, current_version) > 0:
+            candidates.append(ver)
+
+    import functools
+    candidates.sort(key=functools.cmp_to_key(_compare_versions))
+    return candidates
 
 
 def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str]:

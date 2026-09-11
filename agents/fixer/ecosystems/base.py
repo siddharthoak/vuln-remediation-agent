@@ -37,6 +37,7 @@ class DependencyLocality:
     depth: int  # 0 = the project itself, 1 = direct dependency, 2+ = transitive
     introduced_by: Optional[str] = None  # ecosystem-native name of the direct-dep ancestor
     raw_tree: str = ""
+    resolved_version: Optional[str] = None
 
 
 class PackageEcosystem(Protocol):
@@ -62,6 +63,19 @@ class PackageEcosystem(Protocol):
         as a direct dependency (Maven: <dependencyManagement>; npm: package.json
         "overrides"; pip: a constraints file -- each ecosystem's own primitive
         for the same idea).
+        """
+        ...
+
+    def try_parent_dependency_upgrade(
+        self,
+        repo_path: Path,
+        transitive_component: str,
+        target_transitive_version: str,
+        parent_component: str,
+    ) -> Optional[Tuple[str, str, str]]:
+        """Optional capability: attempts upgrading the direct parent dependency
+        instead of forcing a transitive override. Returns (parent_old, parent_new, resolved_transitive)
+        or None if not supported or unsuccessful.
         """
         ...
 
