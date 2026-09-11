@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -196,6 +197,27 @@ def reset_repository_state(
                 pass
 
     # 3. Reset scan_poll_checkpoint.json
+    # Fetch the latest completed run ID on GitHub so that any running ScanPoller daemon does NOT
+    # immediately treat existing prior scans as "new" and re-open a PR within 60 seconds of reset!
+    latest_run_id = None
+    if target_pat and target_repo:
+        try:
+            runs_url = f"https://api.github.com/repos/{target_repo}/actions/workflows/security-scan.yml/runs?status=completed&per_page=1"
+            req = urllib.request.Request(runs_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                runs = data.get("workflow_runs", [])
+                if runs and "id" in runs[0]:
+                    latest_run_id = runs[0]["id"]
+        except Exception as e:
+            logger.debug("Could not fetch latest completed run ID during checkpoint reset: %s", e)
+
+    checkpoint_payload = (
+        json.dumps({"last_run_id": latest_run_id, "last_poll_time": time.time()})
+        if latest_run_id
+        else "{}"
+    )
+
     checkpoint_candidates = [
         _REPO_ROOT / "data" / "scan_poll_checkpoint.json",
         Path("data/scan_poll_checkpoint.json"),
@@ -208,9 +230,9 @@ def reset_repository_state(
         try:
             if p.parent.exists() or p.exists():
                 p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text("{}", encoding="utf-8")
+                p.write_text(checkpoint_payload, encoding="utf-8")
                 summary["checkpoint_cleared"] = True
-                logger.info("Reset scan poll checkpoint at %s", p)
+                logger.info("Reset scan poll checkpoint at %s (checkpointed to run_id=%s)", p, latest_run_id)
         except Exception as e:
             logger.debug("Could not write checkpoint to %s: %s", p, e)
 

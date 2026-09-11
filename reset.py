@@ -25,8 +25,13 @@ from common.reset_ops import reset_repository_state
 
 
 def main():
-    repo = get_target_repo()
-    pat = get_github_pat()
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("Usage: python reset.py [owner/repo]")
+        print("Resets GitHub remediation PRs, remote fix branches, tracking state, and checkpoints.")
+        sys.exit(0)
+
+    repo = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else get_target_repo()
+    pat = get_github_pat(repo=repo)
 
     print(f"Target repository: {repo or '(none)'}")
     if not repo:
