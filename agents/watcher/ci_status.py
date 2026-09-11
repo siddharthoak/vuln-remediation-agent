@@ -75,6 +75,7 @@ class CIStatusWatcher:
         self._github_pat = github_pat
         gh = Github(github_pat)
         self._repo = gh.get_repo(repo_full_name)
+        self._checks_api_supported = True
 
     @property
     def repo(self):
@@ -142,21 +143,23 @@ class CIStatusWatcher:
         If the Checks API returns 403 Forbidden or returns no check runs, falls back
         seamlessly to the GitHub Actions Workflow Runs API ('actions: read' permission).
         """
-        try:
-            commit = self.repo.get_commit(head_sha)
-            check_runs = list(commit.get_check_runs())
-            if check_runs:
-                return self._classify_check_runs(check_runs, pr_number, head_sha)
-        except GithubException as exc:
-            if exc.status == 403:
-                logger.debug(
-                    "Checks API returned 403 for %s (using Workflow Runs API fallback).",
-                    head_sha[:8],
-                )
-            else:
-                logger.warning("GitHub API error fetching check runs: %s", exc)
-        except Exception as exc:
-            logger.warning("Unexpected error fetching check runs: %s", exc)
+        if getattr(self, "_checks_api_supported", True):
+            try:
+                commit = self.repo.get_commit(head_sha)
+                check_runs = list(commit.get_check_runs())
+                if check_runs:
+                    return self._classify_check_runs(check_runs, pr_number, head_sha)
+            except GithubException as exc:
+                if exc.status == 403:
+                    logger.info(
+                        "Checks API returned 403 for %s (token lacks checks:read). Switching permanently to Workflow Runs API.",
+                        head_sha[:8],
+                    )
+                    self._checks_api_supported = False
+                else:
+                    logger.warning("GitHub API error fetching check runs: %s", exc)
+            except Exception as exc:
+                logger.warning("Unexpected error fetching check runs: %s", exc)
 
         # Fall back to GitHub Actions Workflow Runs API
         return self._evaluate_workflow_runs(pr_number, head_sha)
