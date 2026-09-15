@@ -20,7 +20,6 @@ from vertexai.generative_models import GenerativeModel
 
 from knowledge.release_fetcher import ReleaseFetcher
 from common.knowledge_store import KnowledgeEntry
-
 logger = logging.getLogger(__name__)
 
 EXTRACTION_PROMPT = """\
