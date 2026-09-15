@@ -48,6 +48,8 @@ from common.config import (  # noqa: E402
     get_upload_dir,
     get_download_dir,
     resolve_repo_source,
+    is_nightly_run_enabled,
+    set_nightly_run_enabled,
 )
 from common.github_auth import get_auth_mode  # noqa: E402
 from common.reset_ops import reset_repository_state  # noqa: E402
@@ -419,9 +421,11 @@ def _repo_config_context(notice: dict = None) -> dict:
             "auth_desc": auth_info["description"],
             "is_github_app": auth_info["mode"] == "github_app",
             "app_id": auth_info.get("app_id"),
+            "nightly_run_enabled": is_nightly_run_enabled(),
         },
         "notice": notice,
     }
+
 
 
 # ── Routes: full page ──────────────────────────────────────────────────────
@@ -683,7 +687,41 @@ async def api_trigger_scan(request: Request):
     return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
 
 
+@app.post("/api/toggle-night-mode")
+async def api_toggle_night_mode(request: Request):
+    current_state = is_nightly_run_enabled()
+    new_state = not current_state
+    set_nightly_run_enabled(new_state)
+
+    if new_state:
+        msg = "Night Mode ENABLED: Agent scheduled to run once daily at 12:00 AM (Asia/Kolkata)."
+    else:
+        msg = "Night Mode DISABLED: Agent switched to Immediate Execution mode!"
+        # Attempt to dispatch immediate scan call to fixer server
+        try:
+            for target_url in ["http://fixer-server:8080/scan", "http://localhost:8080/scan"]:
+                try:
+                    req = urllib.request.Request(
+                        target_url,
+                        data=json.dumps({}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=3) as resp:
+                        if resp.status in (200, 202):
+                            msg += " Dispatched immediate scan execution!"
+                            break
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("Could not dispatch immediate scan: %s", exc)
+
+    ctx = _repo_config_context(notice={"type": "ok", "message": msg})
+    return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+
+
 # ── Routes: partials (HTMX targets, each self-polling) ─────────────────────
+
 
 @app.get("/partials/sidebar")
 def partial_sidebar(request: Request):

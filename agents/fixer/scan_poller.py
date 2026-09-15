@@ -76,6 +76,31 @@ class ScanPoller:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    @property
+    def poll_interval(self) -> int:
+        return self._interval
+
+    def clear_reports_and_checkpoint(self) -> None:
+        """Purge all report files and reset checkpoint file."""
+        import shutil
+        try:
+            if self._report_dir.exists():
+                for item in self._report_dir.iterdir():
+                    if item.is_file():
+                        item.unlink(missing_ok=True)
+                    elif item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                logger.info("ScanPoller: cleared old reports at %s", self._report_dir)
+        except Exception as exc:
+            logger.warning("ScanPoller: error clearing report dir %s: %s", self._report_dir, exc)
+
+        try:
+            if self._checkpoint.exists():
+                self._checkpoint.write_text(json.dumps({"last_run_id": None, "last_poll_time": time.time()}), encoding="utf-8")
+                logger.info("ScanPoller: reset checkpoint at %s", self._checkpoint)
+        except Exception as exc:
+            logger.warning("ScanPoller: error resetting checkpoint %s: %s", self._checkpoint, exc)
+
     def has_reports(self) -> bool:
         """Check if scan report files currently exist in the report directory."""
         if not self._report_dir.exists():
@@ -116,6 +141,10 @@ class ScanPoller:
             logger.error("ScanPoller: failed to dispatch workflow %s: %s", WORKFLOW_FILE, exc)
         return False
 
+    def poll_once(self) -> bool:
+        """Runs a single poll cycle."""
+        return self._poll_once()
+
     def poll_forever(self) -> None:
         logger.info(
             "ScanPoller: started. repo=%s branch=%s interval=%ds auto_dispatch=%s",
@@ -155,9 +184,11 @@ class ScanPoller:
         current_repo = get_target_repo()
         current_pat = get_github_pat()
         if current_repo and current_repo != self._repo:
-            logger.info("ScanPoller: target repo switched from %s to %s", self._repo, current_repo)
+            logger.info("ScanPoller: target repo switched from %s to %s — clearing old reports and checkpoint", self._repo, current_repo)
             self._repo = current_repo
             self._base = f"https://api.github.com/repos/{current_repo}"
+            self._has_dispatched_initial = False
+            self.clear_reports_and_checkpoint()
         if current_pat:
             self._headers["Authorization"] = f"Bearer {current_pat}"
 

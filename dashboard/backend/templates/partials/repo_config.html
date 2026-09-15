@@ -70,9 +70,25 @@
     {% endif %}
 
     <div class="btn-stack">
-      <button type="submit" class="btn btn-primary" title="Save repository chain and PAT configuration">
-        &#128190; Save &amp; Switch
-      </button>
+      <div class="btn-row">
+        <button type="submit" class="btn btn-primary" title="Save repository chain and PAT configuration">
+          &#128190; Save &amp; Switch
+        </button>
+        <button
+          type="button"
+          class="btn {% if config.nightly_run_enabled %}btn-night-on{% else %}btn-night-off{% endif %}"
+          hx-post="/api/toggle-night-mode"
+          hx-target="#repo-config-card"
+          hx-swap="outerHTML"
+          title="Toggle Night Mode (Run at 12:00 AM vs Run Immediately)"
+        >
+          {% if config.nightly_run_enabled %}
+            &#127769; Night Mode: ON (12:00 AM)
+          {% else %}
+            &#9889; Night Mode: OFF (Run Immediately)
+          {% endif %}
+        </button>
+      </div>
       <div class="btn-row">
         <button
           type="button"

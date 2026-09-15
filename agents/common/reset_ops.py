@@ -246,15 +246,20 @@ def reset_repository_state(
     if os.name != "nt" and Path("/reports").exists():
         report_dirs.insert(0, Path("/reports"))
 
+    import shutil
     for rd in report_dirs:
         if not rd or not rd.is_dir():
             continue
-        for rep in rd.glob("*.json"):
-            try:
-                rep.unlink(missing_ok=True)
-                summary["reports_deleted"].append(rep.name)
-            except Exception as e:
-                summary["errors"].append(f"Failed to delete report {rep}: {e}")
+        try:
+            for item in rd.iterdir():
+                if item.is_file():
+                    summary["reports_deleted"].append(item.name)
+                    item.unlink(missing_ok=True)
+                elif item.is_dir():
+                    summary["reports_deleted"].append(item.name)
+                    shutil.rmtree(item, ignore_errors=True)
+        except Exception as e:
+            summary["errors"].append(f"Failed to clean report directory {rd}: {e}")
 
     # 5. Clean up temporary push locks
     try:

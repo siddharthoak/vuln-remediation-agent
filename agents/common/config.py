@@ -325,6 +325,116 @@ def get_watcher_sleep_seconds() -> int:
     return int(os.environ.get("WATCHER_SLEEP_SECONDS", "60"))
 
 
+def is_nightly_run_enabled() -> bool:
+    """Returns True if Night Mode (scheduled 12:00 AM run) is enabled."""
+    # 1. Check data/config.json
+    for p in CONFIG_JSON_CANDIDATES:
+        try:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if "nightly_run_enabled" in data:
+                    val = data["nightly_run_enabled"]
+                    if isinstance(val, bool):
+                        return val
+                    return str(val).strip() in ("1", "true", "True")
+        except Exception:
+            pass
+
+    # 2. Check config/.env
+    for p in ENV_FILE_CANDIDATES:
+        try:
+            if p.exists():
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line.startswith("NIGHTLY_RUN_ENABLED="):
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        return val in ("1", "true", "True")
+        except Exception:
+            pass
+
+    # 3. os.environ
+    return os.environ.get("NIGHTLY_RUN_ENABLED", "0") in ("1", "true", "True")
+
+
+def set_nightly_run_enabled(enabled: bool) -> bool:
+    """Updates Night Mode toggle state across data/config.json, config/.env, and os.environ."""
+    val_str = "1" if enabled else "0"
+
+    # 1. Update data/config.json
+    for p in CONFIG_JSON_CANDIDATES:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data["nightly_run_enabled"] = enabled
+            p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            break
+        except Exception as exc:
+            logger.warning("Could not write nightly_run_enabled to %s: %s", p, exc)
+
+    # 2. Update config/.env
+    for p in ENV_FILE_CANDIDATES:
+        try:
+            if p.exists():
+                content = p.read_text(encoding="utf-8")
+                if re.search(r"^NIGHTLY_RUN_ENABLED=.*$", content, flags=re.MULTILINE):
+                    content = re.sub(r"^NIGHTLY_RUN_ENABLED=.*$", f"NIGHTLY_RUN_ENABLED={val_str}", content, flags=re.MULTILINE)
+                else:
+                    content += f"\nNIGHTLY_RUN_ENABLED={val_str}"
+                p.write_text(content, encoding="utf-8")
+                break
+        except Exception as exc:
+            logger.warning("Could not update NIGHTLY_RUN_ENABLED in %s: %s", p, exc)
+
+    # 3. In-memory update
+    os.environ["NIGHTLY_RUN_ENABLED"] = val_str
+    logger.info("Nightly mode updated: enabled=%s", enabled)
+    return enabled
+
+
+def _purge_reports_and_checkpoint() -> None:
+    """Deletes cached scan report files and resets scan_poll_checkpoint.json."""
+    import shutil
+    report_dirs = [
+        Path(os.environ["SCAN_REPORT_PATH"]) if os.environ.get("SCAN_REPORT_PATH") else None,
+        _REPO_ROOT / "scan-reports",
+        Path("scan-reports"),
+        Path("./scan-reports"),
+    ]
+    if os.name != "nt" and Path("/reports").exists():
+        report_dirs.insert(0, Path("/reports"))
+
+    for rd in report_dirs:
+        if rd and rd.is_dir():
+            try:
+                for item in rd.iterdir():
+                    if item.is_file():
+                        item.unlink(missing_ok=True)
+                    elif item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+            except Exception as exc:
+                logger.warning("Could not purge report dir %s: %s", rd, exc)
+
+    checkpoint_candidates = [
+        _REPO_ROOT / "data" / "scan_poll_checkpoint.json",
+        Path("data/scan_poll_checkpoint.json"),
+        Path("./data/scan_poll_checkpoint.json"),
+    ]
+    if os.name != "nt" and Path("/data").exists():
+        checkpoint_candidates.insert(0, Path("/data/scan_poll_checkpoint.json"))
+
+    for cp in checkpoint_candidates:
+        try:
+            if cp.parent.exists() or cp.exists():
+                cp.parent.mkdir(parents=True, exist_ok=True)
+                cp.write_text(json.dumps({"last_run_id": None}), encoding="utf-8")
+        except Exception:
+            pass
+
 
 def save_config(repo: str, pat: Optional[str] = None, repo_chain: Optional[list] = None) -> Tuple[str, str]:
     """
@@ -341,7 +451,16 @@ def save_config(repo: str, pat: Optional[str] = None, repo_chain: Optional[list]
     clean_repo = chain[0] if chain else normalize_repo_name(repo)
     clean_pat = pat.strip() if pat and pat.strip() else get_raw_github_pat()
 
-    payload = {"repo": clean_repo, "pat": clean_pat}
+    old_repo = get_target_repo()
+    if clean_repo and old_repo and clean_repo != old_repo:
+        logger.info("Target repository switched from %s to %s — purging cached reports & checkpoint", old_repo, clean_repo)
+        _purge_reports_and_checkpoint()
+
+    payload = {
+        "repo": clean_repo,
+        "pat": clean_pat,
+        "nightly_run_enabled": is_nightly_run_enabled(),
+    }
     if chain:
         payload["repo_chain"] = chain
 
@@ -390,3 +509,5 @@ def save_config(repo: str, pat: Optional[str] = None, repo_chain: Optional[list]
 
     logger.info("Configuration updated: repo=%s chain=%s", clean_repo, chain)
     return clean_repo, clean_pat
+
+

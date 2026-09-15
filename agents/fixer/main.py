@@ -43,7 +43,7 @@ from common.tracking_store import (
 from common.knowledge_store import make_knowledge_store
 from common.file_lock import FileLock
 from common.nightly_scheduler import sleep_until_next_run
-from common.config import get_target_repo, get_target_repos, get_github_pat
+from common.config import get_target_repo, get_target_repos, get_github_pat, is_nightly_run_enabled
 from knowledge.main import KnowledgeAgent
 from classifier.classifier import Classifier, ClassifierResult
 
@@ -90,7 +90,7 @@ def _run_server():
     report_dir  = os.environ.get("SCAN_REPORT_PATH", "/reports")
     poll_interval = int(os.environ.get("SCAN_POLL_INTERVAL", "60"))
 
-    logger.info("Fixer server mode: starting scan poller and HTTP retry server.")
+    logger.info("Fixer server mode: starting scan poller worker and HTTP retry server.")
 
     poller = ScanPoller(
         repo_full_name=github_repo,
@@ -99,16 +99,7 @@ def _run_server():
         on_new_scan_ready=_run_fresh_scan,
         poll_interval=poll_interval,
     )
-    if os.environ.get("NIGHTLY_RUN_ENABLED", "1") == "1":
-        poller_target = lambda: _run_nightly_fixer_loop(poller)
-        logger.info(
-            "Nightly mode enabled: fixer runs at %s (%s).",
-            os.environ.get("NIGHTLY_RUN_TIME", "00:00"),
-            os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata"),
-        )
-    else:
-        poller_target = poller.poll_forever
-        logger.info("Continuous scan polling enabled.")
+    poller_target = lambda: _run_fixer_poller_loop(poller)
     poller_thread = threading.Thread(target=poller_target, daemon=True, name="scan-poller")
     poller_thread.start()
 
@@ -120,17 +111,37 @@ def _run_server():
         logger.info("Fixer server shutting down.")
 
 
-def _run_nightly_fixer_loop(poller: ScanPoller) -> None:
-    """Sleep during the day and execute exactly one scan/remediation cycle nightly."""
+def _run_fixer_poller_loop(poller: ScanPoller) -> None:
+    """Dynamically handles Night Mode vs Continuous polling loop."""
     run_time = os.environ.get("NIGHTLY_RUN_TIME", "00:00")
     timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
     max_wait = int(os.environ.get("NIGHTLY_SCAN_MAX_WAIT_SECONDS", "7200"))
+
+    import time
     while True:
         try:
-            sleep_until_next_run(run_time, timezone_name)
-            poller.run_nightly(max_wait_seconds=max_wait)
+            if is_nightly_run_enabled():
+                logger.info(
+                    "Night Mode active: sleeping until %s (%s).",
+                    run_time,
+                    timezone_name,
+                )
+                completed = sleep_until_next_run(
+                    run_time,
+                    timezone_name,
+                    check_cancel_fn=lambda: not is_nightly_run_enabled(),
+                )
+                if completed:
+                    poller.run_nightly(max_wait_seconds=max_wait)
+                else:
+                    logger.info("Night Mode toggled OFF: waking up and running scan immediately.")
+                    poller.poll_once()
+            else:
+                poller.poll_once()
+                time.sleep(poller.poll_interval)
         except Exception as exc:
-            logger.error("Nightly fixer cycle failed: %s", exc, exc_info=True)
+            logger.error("Fixer poller loop error: %s", exc, exc_info=True)
+            time.sleep(10)
 
 
 def _make_retry_server(port: int, poller: Optional[ScanPoller] = None) -> HTTPServer:

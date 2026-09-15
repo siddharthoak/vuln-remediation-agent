@@ -41,11 +41,21 @@ def seconds_until_next_run(
     return max((next_run - now).total_seconds(), 0.0)
 
 
+from typing import Optional, Callable
+
+
 def sleep_until_next_run(
     run_time: str = "00:00",
     timezone_name: str = "Asia/Kolkata",
     offset_minutes: int = 0,
-) -> None:
+    check_cancel_fn: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """
+    Sleeps until the next occurrence of run_time in timezone_name.
+    Periodically checks check_cancel_fn() (e.g. every 5s) to allow early wake-up
+    if Night Mode is toggled off at runtime.
+    Returns True if full sleep completed, False if cancelled early.
+    """
     delay = seconds_until_next_run(run_time, timezone_name, offset_minutes)
     logger.info(
         "Nightly scheduler sleeping %.1f hours until %s %s.",
@@ -53,4 +63,12 @@ def sleep_until_next_run(
         timezone_name,
         run_time,
     )
-    time.sleep(delay)
+    end_time = time.time() + delay
+    while time.time() < end_time:
+        if check_cancel_fn and check_cancel_fn():
+            logger.info("Nightly sleep cancelled early (Night Mode disabled).")
+            return False
+        remaining = end_time - time.time()
+        time.sleep(min(5.0, max(0.0, remaining)))
+    return True
+

@@ -120,10 +120,13 @@ def review_dependency_diff(
 
     expected = expected_from_status
     changed_normalized = {name.replace("\\", "/") for name in changed}
-    # The manifest is already committed on a retry branch, so it need not be
-    # present in the working-tree diff; every source edit must be accounted for.
+    LOCKFILES = {
+        "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+        "pnpm-lock.yaml", "constraints.txt", "poetry.lock",
+        "Pipfile.lock", "uv.lock", "pdm.lock",
+    }
     unexpected = changed_normalized - expected
-    missing_source = (expected - {manifest_file}) - changed_normalized
+    missing_source = (expected - {manifest_file} - LOCKFILES) - changed_normalized
     if unexpected or missing_source:
         details = []
         if unexpected:

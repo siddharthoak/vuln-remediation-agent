@@ -28,8 +28,8 @@ class PackageJsonError(Exception):
     """Raised when package.json cannot be parsed, or a targeted dependency isn't found in it."""
 
 
-def _read_package_json(repo_path: Path) -> dict:
-    pj_path = repo_path / "package.json"
+def _read_package_json(repo_path: Path | str) -> dict:
+    pj_path = Path(repo_path) / "package.json"
     if not pj_path.exists():
         raise PackageJsonError(f"package.json not found at {pj_path}")
     try:
@@ -39,8 +39,8 @@ def _read_package_json(repo_path: Path) -> dict:
         raise PackageJsonError(f"Could not parse package.json at {pj_path}: {exc}") from exc
 
 
-def _write_package_json(repo_path: Path, data: dict) -> None:
-    pj_path = repo_path / "package.json"
+def _write_package_json(repo_path: Path | str, data: dict) -> None:
+    pj_path = Path(repo_path) / "package.json"
     with open(pj_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
@@ -134,18 +134,19 @@ def _fetch_newer_parent_versions(package_name: str, current_version: str) -> lis
 
 class NpmEcosystem:
     @staticmethod
-    def _package_manager(repo_path: Path) -> tuple[str, list[str]]:
+    def _package_manager(repo_path: Path | str) -> tuple[str, list[str]]:
         """Return the repository's package manager and install command."""
-        package_json = _read_package_json(repo_path)
+        path_obj = Path(repo_path)
+        package_json = _read_package_json(path_obj)
         declared = package_json.get("packageManager", "")
-        if declared.startswith("pnpm@") or (repo_path / "pnpm-lock.yaml").exists():
+        if declared.startswith("pnpm@") or (path_obj / "pnpm-lock.yaml").exists():
             return "pnpm", ["pnpm", "install", "--ignore-scripts"]
-        if declared.startswith("yarn@") or (repo_path / "yarn.lock").exists():
+        if declared.startswith("yarn@") or (path_obj / "yarn.lock").exists():
             return "yarn", ["yarn", "install", "--ignore-scripts"]
         return "npm", ["npm", "install", "--ignore-scripts"]
 
     @staticmethod
-    def _run_install(repo_path: Path, timeout: int = 300) -> subprocess.CompletedProcess:
+    def _run_install(repo_path: Path | str, timeout: int = 300) -> subprocess.CompletedProcess:
         manager, command = NpmEcosystem._package_manager(repo_path)
         safe_env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_PAT", "GOOGLE_APPLICATION_CREDENTIALS")}
         try:
@@ -156,8 +157,8 @@ class NpmEcosystem:
         except FileNotFoundError as exc:
             raise EcosystemError(f"{manager} is not installed in the fixer image.") from exc
 
-    def resolve_locality(self, repo_path: Path, component_name: str) -> DependencyLocality:
-        manager, _ = self._package_manager(Path(repo_path))
+    def resolve_locality(self, repo_path: Path | str, component_name: str) -> DependencyLocality:
+        manager, _ = self._package_manager(repo_path)
         try:
             repo_path_obj = Path(repo_path)
             if not (repo_path_obj / "node_modules").exists():
@@ -476,6 +477,9 @@ def test_repo(repo_path: Path, timeout_seconds: int = 600) -> Tuple[bool, str]:
         data = _read_package_json(repo_path)
         if "scripts" not in data or "test" not in data["scripts"]:
             return True, "npm test: no test script defined -- skipping."
+        test_script = str(data.get("scripts", {}).get("test", "")).strip().lower()
+        if "no test specified" in test_script and "exit 1" in test_script:
+            return True, "npm test: placeholder test script -- skipping."
     except Exception:
         return True, "npm test: skipped (could not read package.json)."
 

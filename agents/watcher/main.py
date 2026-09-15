@@ -30,7 +30,7 @@ from pattern_learner import PatternLearner
 
 from common.tracking_store import make_tracking_store, TrackingStatus
 from common.knowledge_store import make_knowledge_store
-from common.config import get_target_repo, get_target_repos, get_github_pat, get_watcher_sleep_seconds
+from common.config import get_target_repo, get_target_repos, get_github_pat, get_watcher_sleep_seconds, is_nightly_run_enabled
 from common.nightly_scheduler import sleep_until_next_run
 
 
@@ -59,37 +59,33 @@ def find_open_remediation_prs(repo):
 
 def main():
     daemon   = os.environ.get("WATCHER_DAEMON", "0") == "1"
-    interval = get_watcher_sleep_seconds()
+    run_time = os.environ.get("NIGHTLY_RUN_TIME", "00:00")
+    timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
 
     if daemon:
-        nightly = os.environ.get("NIGHTLY_RUN_ENABLED", "1") == "1"
-        if nightly:
-            run_time = os.environ.get("NIGHTLY_RUN_TIME", "00:00")
-            timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
-            logger.info(
-                "Watcher nightly mode enabled: runs at %s (%s).",
-                run_time,
-                timezone_name,
-            )
-        else:
-            logger.info("Watcher daemon mode: cycling every %d seconds.", interval)
+        logger.info("Watcher daemon mode started.")
         while True:
             try:
-                if nightly:
-                    sleep_until_next_run(run_time, timezone_name)
-                _run_once()
+                if is_nightly_run_enabled():
+                    logger.info("Watcher Night Mode active: sleeping until %s (%s).", run_time, timezone_name)
+                    completed = sleep_until_next_run(
+                        run_time,
+                        timezone_name,
+                        check_cancel_fn=lambda: not is_nightly_run_enabled(),
+                    )
+                    if completed or not is_nightly_run_enabled():
+                        _run_once()
+                else:
+                    _run_once()
+                    cycle_interval = get_watcher_sleep_seconds()
+                    logger.info("Watcher sleeping %d seconds until next cycle.", cycle_interval)
+                    time.sleep(cycle_interval)
             except Exception as exc:
                 logger.error("Watcher cycle error: %s", exc, exc_info=True)
-                if nightly:
-                    continue
-            if nightly:
-                continue
-            # Re-read interval each cycle in case config/.env was updated
-            cycle_interval = get_watcher_sleep_seconds()
-            logger.info("Watcher sleeping %d seconds until next cycle.", cycle_interval)
-            time.sleep(cycle_interval)
+                time.sleep(10)
     else:
         _run_once()
+
 
 
 
