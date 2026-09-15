@@ -1,10 +1,7 @@
 """PackageEcosystem protocol -- the pluggable dependency-manifest contract.
 
-Maven is the only implementation today (ecosystems/maven.py) -- this repo's
-tool prompts, build verification, and manifest handling are all Java/Maven-
-specific by design for this POC. The seam exists so a Python (pip/poetry) or
-Node (npm/yarn) ecosystem can be added later as a new PackageEcosystem
-implementation, without CodeFixer, main.py's locality-resolution loop, or
+Maven, npm, and Python (pip/poetry) implementations share this contract,
+without requiring CodeFixer, main.py's locality-resolution loop, or
 the classifier's transitive-dependency logic needing to change -- none of
 them depend on Maven directly, only on this protocol and on the
 ecosystem-agnostic locality fields already on VulnerabilityFinding
@@ -61,7 +58,7 @@ class PackageEcosystem(Protocol):
     ) -> None:
         """Pins a transitive dependency's resolved version without adding it
         as a direct dependency (Maven: <dependencyManagement>; npm: package.json
-        "overrides"; pip: a constraints file -- each ecosystem's own primitive
+        "overrides"; Python: a pinned requirement -- each ecosystem's own primitive
         for the same idea).
         """
         ...

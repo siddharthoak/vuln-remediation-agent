@@ -24,6 +24,10 @@ services:
       SCAN_POLL_INTERVAL: "60"      # seconds between GitHub Actions polls
       MAX_PARALLEL_FIXES: "2"       # Limit concurrent fixes to avoid Vertex AI rate limits
       KB_HYDRATION: "1"             # set to "0" to skip Knowledge Agent (faster local testing)
+      NIGHTLY_RUN_ENABLED: "1"      # sleep during the day; run one cycle nightly
+      NIGHTLY_RUN_TIME: "00:00"     # local time in NIGHTLY_RUN_TIMEZONE
+      NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
+      NIGHTLY_SCAN_MAX_WAIT_SECONDS: "7200"
     ports:
       - "8080:8080"
     volumes:
@@ -58,6 +62,9 @@ services:
       FIXER_RETRY_URL: http://fixer-server:8080/retry
       WATCHER_DAEMON: "1"
       WATCHER_SLEEP_SECONDS: "${WATCHER_SLEEP_SECONDS:-60}"
+      NIGHTLY_RUN_ENABLED: "1"
+      NIGHTLY_RUN_TIME: "00:00"
+      NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
 
     volumes:
       - ./data:/data

@@ -25,6 +25,7 @@ from google.genai import types as genai_types
 
 from ecosystems.maven import compile_repo, test_repo
 from ecosystems.npm import install_and_build as npm_install_and_build, test_repo as npm_test_repo
+from ecosystems.python import install_and_build as python_install_and_build, test_repo as python_test_repo
 from ecosystems.factory import get_ecosystem
 from engines.base import FixResult, EngineExecutionError
 
@@ -58,6 +59,9 @@ class AdkVertexEngine:
 
         # Detect ecosystem to provide the right build/test tools
         is_npm = (repo_path / "package.json").exists() and not (repo_path / "pom.xml").exists()
+        is_python = not is_npm and not (repo_path / "pom.xml").exists() and any(
+            (repo_path / name).exists() for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "setup.cfg")
+        )
 
         # ADK derives tool names from func.__name__. Instance methods have names
         # like "_tool_grep_files" but the prompt tells the LLM to call "grep_files".
@@ -92,6 +96,14 @@ class AdkVertexEngine:
             """Run 'npm test' with a bounded timeout."""
             return self._tool_run_npm_test()
 
+        def run_python_install() -> str:
+            """Install Python dependencies and run compileall."""
+            return self._tool_run_python_install()
+
+        def run_python_test() -> str:
+            """Run Python tests with a bounded timeout."""
+            return self._tool_run_python_test()
+
         common_tools = [
             FunctionTool(func=read_file),
             FunctionTool(func=grep_files),
@@ -102,6 +114,11 @@ class AdkVertexEngine:
             tools = common_tools + [
                 FunctionTool(func=run_npm_install),
                 FunctionTool(func=run_npm_test),
+            ]
+        elif is_python:
+            tools = common_tools + [
+                FunctionTool(func=run_python_install),
+                FunctionTool(func=run_python_test),
             ]
         else:
             tools = common_tools + [
@@ -244,13 +261,21 @@ class AdkVertexEngine:
         if not pattern:
             return "ERROR: pattern is required."
         is_npm = (self._repo_path / "package.json").exists() and not (self._repo_path / "pom.xml").exists()
+        is_python = not is_npm and not (self._repo_path / "pom.xml").exists() and any(
+            (self._repo_path / name).exists() for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "setup.cfg")
+        )
         if extensions:
             exts = set(extensions)
         elif is_npm:
             exts = {".js", ".ts", ".jsx", ".tsx", ".json", ".mjs", ".cjs", ".yml", ".yaml"}
+        elif is_python:
+            exts = {".py", ".toml", ".txt", ".yml", ".yaml", ".ini", ".cfg"}
         else:
             exts = {".java", ".xml", ".properties", ".yml", ".yaml"}
-        exclude_dirs = {"node_modules", ".next", "dist", ".nuxt"} if is_npm else {"target"}
+        exclude_dirs = (
+            {"node_modules", ".next", "dist", ".nuxt"} if is_npm
+            else ({"target"} if not is_python else {".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist"})
+        )
         try:
             compiled = re.compile(pattern)
         except re.error as exc:
@@ -331,4 +356,12 @@ class AdkVertexEngine:
     def _tool_run_npm_test(self) -> str:
         """Run 'npm test' with a bounded timeout."""
         _, message = npm_test_repo(self._repo_path)
+        return message
+
+    def _tool_run_python_install(self) -> str:
+        _, message = python_install_and_build(self._repo_path)
+        return message
+
+    def _tool_run_python_test(self) -> str:
+        _, message = python_test_repo(self._repo_path)
         return message

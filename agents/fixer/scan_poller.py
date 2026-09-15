@@ -128,9 +128,30 @@ class ScanPoller:
                 logger.error("ScanPoller: unexpected error: %s", exc, exc_info=True)
             time.sleep(self._interval)
 
+    def run_nightly(self, max_wait_seconds: int = 7200) -> None:
+        """Run one scan cycle, polling only until its completed report arrives."""
+        self._has_dispatched_initial = False
+        deadline = time.monotonic() + max_wait_seconds
+        logger.info(
+            "ScanPoller: starting nightly scan cycle (maximum wait %ds).",
+            max_wait_seconds,
+        )
+        while time.monotonic() < deadline:
+            try:
+                if self._poll_once():
+                    logger.info("ScanPoller: nightly scan cycle completed.")
+                    return
+            except Exception as exc:
+                logger.error("ScanPoller: nightly cycle error: %s", exc, exc_info=True)
+            time.sleep(min(self._interval, max(deadline - time.monotonic(), 0)))
+        logger.error(
+            "ScanPoller: nightly scan did not produce a new completed report within %ds.",
+            max_wait_seconds,
+        )
+
     # ── Poll cycle ────────────────────────────────────────────────────────────
 
-    def _poll_once(self) -> None:
+    def _poll_once(self) -> bool:
         current_repo = get_target_repo()
         current_pat = get_github_pat()
         if current_repo and current_repo != self._repo:
@@ -160,14 +181,14 @@ class ScanPoller:
         run = self._latest_completed_run()
         if run is None:
             logger.debug("ScanPoller: no completed runs found yet.")
-            return
+            return False
 
         run_id     = run["id"]
         conclusion = run.get("conclusion", "")
 
         if run_id == last_id:
             logger.debug("ScanPoller: run %d already processed.", run_id)
-            return
+            return False
 
         if conclusion in SKIP_CONCLUSIONS:
             logger.warning(
@@ -175,7 +196,7 @@ class ScanPoller:
                 run_id, conclusion,
             )
             self._save_checkpoint(run_id)
-            return
+            return False
 
         logger.info(
             "ScanPoller: new completed run %d (conclusion=%s). Downloading artifact.",
@@ -185,6 +206,7 @@ class ScanPoller:
         self._save_checkpoint(run_id)
         logger.info("ScanPoller: reports ready. Invoking fixer.")
         self._callback()
+        return True
 
     # ── GitHub helpers ────────────────────────────────────────────────────────
 

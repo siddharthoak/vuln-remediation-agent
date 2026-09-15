@@ -10,3 +10,6 @@ lxml>=4.9.0
 google-cloud-firestore>=2.16.0
 google-cloud-run>=0.10.0
 PyYAML>=6.0.1
+tzdata>=2024.1
+pipdeptree>=2.23.0
+pipenv>=2024.4.1

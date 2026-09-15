@@ -7,6 +7,7 @@ the operations testable without a real git binary and avoids PAT leakage in shel
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -93,13 +94,22 @@ def review_dependency_diff(
             untracked.append(name)
         else:
             changed.add(name)
+    expected_from_status = {str(name).replace("\\", "/") for name in expected_files if name}
+    expected_from_status.add(manifest_file)
     changed.update(name for name in diff.stdout.splitlines() if name)
-    
+    changed.update(name for name in untracked if name.replace("\\", "/") in expected_from_status)
+
     filtered_untracked = [
         f for f in untracked
         if not f.replace("\\", "/").startswith("target/")
         and not f.replace("\\", "/").startswith("build/")
         and not f.replace("\\", "/").startswith(".gradle/")
+        and "/__pycache__/" not in f.replace("\\", "/")
+        and not f.replace("\\", "/").startswith("__pycache__/")
+        and not f.replace("\\", "/").startswith(".pytest_cache/")
+        and not f.replace("\\", "/").startswith(".venv/")
+        and not f.replace("\\", "/").startswith("venv/")
+        and f.replace("\\", "/") not in expected_from_status
     ]
     
     if filtered_untracked:
@@ -108,8 +118,7 @@ def review_dependency_diff(
             tuple(sorted(changed | set(filtered_untracked))),
         )
 
-    expected = {str(name).replace("\\", "/") for name in expected_files if name}
-    expected.add(manifest_file)
+    expected = expected_from_status
     changed_normalized = {name.replace("\\", "/") for name in changed}
     # The manifest is already committed on a retry branch, so it need not be
     # present in the working-tree diff; every source edit must be accounted for.
@@ -131,6 +140,15 @@ def review_dependency_diff(
 
     target_candidates = [v.strip() for v in target_version.split(",") if v.strip()] if target_version else []
     manifest_diff_text = manifest_diff.stdout
+    for expected_file in expected - {manifest_file}:
+        extra_diff = subprocess.run(
+            ["git", "diff", "HEAD", "--", expected_file],
+            cwd=str(path), capture_output=True, text=True, timeout=30,
+        )
+        manifest_diff_text += "\n" + extra_diff.stdout
+        expected_path = path / expected_file
+        if expected_path.exists():
+            manifest_diff_text += "\n" + expected_path.read_text(encoding="utf-8")
     target_in_diff = any(
         (cand in manifest_diff_text or any(_is_version_match(word.strip("\"'<>= /+"), cand) for line in manifest_diff_text.splitlines() for word in line.split()))
         for cand in target_candidates
@@ -214,6 +232,36 @@ def review_dependency_diff(
                     f"{target_version} in package.json (found {declared_ver}).",
                     tuple(sorted(changed_normalized)),
                 )
+    elif manifest_file in {"pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "setup.cfg"}:
+        try:
+            if manifest_file == "pyproject.toml":
+                import tomllib
+                tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest_text = manifest_path.read_text(encoding="utf-8")
+            else:
+                manifest_text = manifest_path.read_text(encoding="utf-8")
+        except (ValueError, OSError) as exc:
+            return DiffReviewResult(
+                False, f"Diff review failed — {manifest_file} is invalid: {exc}",
+                tuple(sorted(changed_normalized)),
+            )
+
+        component_pattern = re.compile(
+            rf"(^|\W){re.escape(component_name)}(\W|$)", re.IGNORECASE | re.MULTILINE
+        )
+        if not component_pattern.search(manifest_text):
+            return DiffReviewResult(
+                False,
+                f"Diff review failed — {component_name} is not present in {manifest_file}.",
+                tuple(sorted(changed_normalized)),
+            )
+        clean_candidates = [c.lstrip("v^~<>= ").strip() for c in target_candidates]
+        if clean_candidates and not any(c in manifest_text for c in clean_candidates):
+            return DiffReviewResult(
+                False,
+                f"Diff review failed — {manifest_file} does not contain requested version {target_version}.",
+                tuple(sorted(changed_normalized)),
+            )
     return DiffReviewResult(True, "Diff review passed.", tuple(sorted(changed_normalized)))
 
 

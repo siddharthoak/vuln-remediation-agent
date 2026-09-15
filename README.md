@@ -378,3 +378,26 @@ On the next run with the same `(component, from_major, to_major)`, the Fixer use
 | `KB_STORE_PATH` | | `./data/kb.json` | Path to the Knowledge Store JSON file (bind-mounted into containers at `/data/kb.json`) |
 | `KB_HYDRATION` | | `0` | Set to `1` to enable the Knowledge Agent pre-hydration step before each fresh fix batch. Set to `"1"` automatically by `fixer-server` in `docker-compose.yml`. Set to `"0"` to skip hydration for faster local testing (existing playbooks still apply). |
 | `FIRESTORE_PROJECT` | | — | If set, `FirestoreKBStore` is used instead of `FileKnowledgeStore`. Set to your GCP project ID for production deployments. |
+
+## Supported dependency ecosystems
+
+The fixer supports direct and transitive remediation for:
+
+- **Maven:** `pom.xml`, including dependency-management overrides and Maven
+  transitive locality resolution.
+- **npm-compatible Node projects:** `package.json` with npm, Yarn, or pnpm
+  installation/build/test commands selected from `packageManager` or lockfiles.
+  Locality resolution uses the selected package manager's dependency-tree
+  command, including native `pnpm list` and Yarn tree output.
+- **Python:** `requirements.txt`, `requirements-dev.txt`, `pyproject.toml`,
+  `Pipfile`, and `setup.cfg`. Python locality and verification run in an
+  isolated per-repository virtual environment. Dependency manifest, constraint,
+  and lockfile updates are transactional: failed lock refreshes restore the
+  original files. Transitive pins for `pyproject.toml` and `setup.cfg` are
+  written to `constraints.txt`.
+
+Poetry, Pipenv, uv, and pdm lockfiles are refreshed when their corresponding
+CLI is available. Pipenv is included in the fixer image, and `Pipfile.lock`
+versions are used for isolated verification. If another project has a lockfile
+but its lock tool is unavailable, the finding is surfaced for triage instead of
+silently producing a stale lockfile.

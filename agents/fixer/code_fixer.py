@@ -17,7 +17,7 @@ logic; they only moved where that logic lives.
 What is UNCHANGED (verbatim from nexus-remediation-agent):
   - ChangeSummary dataclass
   - FRESH_FIX_PROMPT and RETRY_FIX_PROMPT structure
-  - pom.xml editing semantics (now in ecosystems/maven.py, not this class)
+  - ecosystem manifest editing semantics (now in ecosystems/, not this class)
   - run_fresh_fix() and run_retry_fix() public entry points
   - _execute_fix() routing and retry semantics
   - InvalidRetryError
@@ -34,9 +34,10 @@ from pathlib import Path
 from typing import Optional
 
 from common.tracking_store import TrackingStatus
-from ecosystems.factory import get_ecosystem
+from ecosystems.factory import get_ecosystem, get_manifest_file
 from ecosystems.maven import PomXMLError
 from ecosystems.npm import PackageJsonError
+from ecosystems.python import PythonManifestError
 from engines.factory import get_engine
 
 logger = logging.getLogger(__name__)
@@ -254,6 +255,38 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 ```
 """
 
+FRESH_FIX_PROMPT_PYTHON = """\
+You are a Python dependency remediation specialist. Apply only the minimal source
+changes required to upgrade {component_name} from {current_version} to {target_version}.
+
+## Repository file tree
+{file_listing}
+
+## Available tools
+- `grep_files(pattern, extensions?)`, `read_file(relative_path)`, and `apply_file_change(...)`
+- `run_python_install()` verifies dependency installation and Python compilation.
+- `run_python_test()` runs the repository tests.
+
+The dependency manifest has already been updated. Do not edit the manifest. Inspect
+the actual source before making any compatibility change, then verify install and tests.
+Return JSON with a concise rationale when complete.
+"""
+
+RETRY_FIX_PROMPT_PYTHON = """\
+You are a Python dependency remediation specialist. A previous upgrade of
+{component_name} from {current_version} to {target_version} failed CI.
+
+## CI failure
+{failure_log_excerpt}
+
+## Repository file tree
+{file_listing}
+
+Use grep_files/read_file to identify the root cause, make only the smallest required
+source edit with apply_file_change, then run_python_install and run_python_test.
+Do not edit the dependency manifest. Return JSON with a concise rationale.
+"""
+
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -310,7 +343,8 @@ class CodeFixer:
     for its security caveats before using it in production).
 
     Package ecosystem: pluggable via PackageEcosystem (ecosystems/),
-    auto-detected from repo contents (Maven/pom.xml, npm/package.json --
+    auto-detected from repo contents (Maven/pom.xml, npm/package.json, or
+    Python/pyproject.toml/requirements.txt --
     see ecosystems/factory.py). Manifest handling and prompt construction
     are engine- and ecosystem-agnostic.
     """
@@ -324,13 +358,45 @@ class CodeFixer:
     @property
     def _manifest_file(self) -> str:
         """Returns the ecosystem's manifest filename for use in ChangeSummary.files_changed."""
-        if (self._repo_path / "package.json").exists() and not (self._repo_path / "pom.xml").exists():
-            return "package.json"
-        return "pom.xml"
+        return get_manifest_file(self._repo_path)
 
     @property
     def _is_npm(self) -> bool:
         return self._manifest_file == "package.json"
+
+    @property
+    def _is_python(self) -> bool:
+        return self._manifest_file in {"pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "setup.cfg"}
+
+    def _snapshot_python_support_files(self) -> dict:
+        if self._is_npm:
+            names = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+        elif self._is_python:
+            names = ("constraints.txt", "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock")
+        else:
+            return {}
+        return {
+            name: (self._repo_path / name).read_bytes()
+            for name in names
+            if (self._repo_path / name).exists()
+        }
+
+    def _changed_python_support_files(self, before: dict) -> list:
+        if self._is_npm:
+            names = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+        elif self._is_python:
+            names = ("constraints.txt", "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock")
+        else:
+            return []
+        changed = []
+        for name in names:
+            path = self._repo_path / name
+            current = path.read_bytes() if path.exists() else None
+            if current is not None and before.get(name) != current:
+                changed.append(name)
+            elif current is not None and name not in before:
+                changed.append(name)
+        return changed
 
     # ── Public entry points (UNCHANGED) ──────────────────────────────────────
 
@@ -466,6 +532,7 @@ class CodeFixer:
         is_retry: bool = False,
     ) -> ChangeSummary:
         manifest = self._manifest_file
+        support_before = self._snapshot_python_support_files()
         bumped = False
         compile_failure = None
         try:
@@ -473,7 +540,7 @@ class CodeFixer:
                 self._repo_path, component_name, current_version, target_version
             )
             bumped = True
-        except (PomXMLError, PackageJsonError):
+        except (PomXMLError, PackageJsonError, PythonManifestError):
             if not is_retry:
                 return self._execute_transitive_fix(
                     component_name=component_name,
@@ -488,11 +555,12 @@ class CodeFixer:
         if bumped:
             compiled, compile_message = self._ecosystem.verify_build(self._repo_path)
             if compiled:
+                support_files = self._changed_python_support_files(support_before)
                 return ChangeSummary(
                     component_name=component_name,
                     old_version=current_version,
                     new_version=target_version,
-                    files_changed=[manifest],
+                    files_changed=[manifest, *support_files],
                     rationale=(
                         f"Dependency upgraded from {current_version} to {target_version} "
                         f"in {manifest}; the repository compiled successfully without source changes."
@@ -550,7 +618,8 @@ class CodeFixer:
             kb_entry=kb_entry,
         )
         result = self._engine.run_fix(self._repo_path, prompt)
-        files_changed = [manifest] + list(dict.fromkeys(result.files_changed))
+        files_changed = [manifest, *self._changed_python_support_files(support_before)]
+        files_changed += list(dict.fromkeys(result.files_changed))
         return ChangeSummary(
             component_name=component_name,
             old_version=current_version,
@@ -627,7 +696,8 @@ class CodeFixer:
         is set, regardless of why).
         """
         manifest = self._manifest_file
-        override_mechanism = "overrides" if self._is_npm else "dependencyManagement"
+        support_before = self._snapshot_python_support_files()
+        override_mechanism = "overrides" if self._is_npm else ("pinned requirement" if self._is_python else "dependencyManagement")
 
         # ── Dependency Hygiene: Try Parent-First upgrade before manifest override ──
         if introduced_by and hasattr(self._ecosystem, "try_parent_dependency_upgrade"):
@@ -648,7 +718,7 @@ class CodeFixer:
                         component_name=component_name,
                         old_version=current_version,
                         new_version=resolved_trans,
-                        files_changed=[manifest],
+                        files_changed=[manifest, *self._changed_python_support_files(support_before)],
                         rationale=(
                             f"Dependency Hygiene: Upgraded direct parent dependency {introduced_by} "
                             f"({parent_old} → {parent_new}), which cleanly resolved transitive vulnerability "
@@ -667,11 +737,12 @@ class CodeFixer:
 
         compiled, message = self._ecosystem.verify_build(self._repo_path)
         if compiled:
+            changed_files = [manifest, *self._changed_python_support_files(support_before)]
             return ChangeSummary(
                 component_name=component_name,
                 old_version=current_version,
                 new_version=target_version,
-                files_changed=[manifest],
+                files_changed=changed_files,
                 rationale=(
                     f"Transitive dependency (introduced by {introduced_by}) pinned to "
                     f"{target_version} via a {override_mechanism} override. No source "
@@ -694,7 +765,8 @@ class CodeFixer:
             failure_log_excerpt=message,
         )
         result = self._engine.run_fix(self._repo_path, prompt)
-        files_changed = [manifest] + list(dict.fromkeys(result.files_changed))
+        files_changed = [manifest, *self._changed_python_support_files(support_before)]
+        files_changed += list(dict.fromkeys(result.files_changed))
         return ChangeSummary(
             component_name=component_name,
             old_version=current_version,
@@ -724,13 +796,16 @@ class CodeFixer:
         kb_entry=None,
     ) -> str:
         """Selects and formats the appropriate FRESH_FIX or RETRY_FIX prompt
-        based on the detected ecosystem (Java/Maven or Node.js/npm). The result
+        based on the detected ecosystem (Java/Maven, Node.js/npm, or Python).
         is handed to whichever FixEngine is configured -- prompt content doesn't
         change based on which engine will run it.
         """
         if self._is_npm:
             fresh_template = FRESH_FIX_PROMPT_NODE
             retry_template = RETRY_FIX_PROMPT_NODE
+        elif self._is_python:
+            fresh_template = FRESH_FIX_PROMPT_PYTHON
+            retry_template = RETRY_FIX_PROMPT_PYTHON
         else:
             fresh_template = FRESH_FIX_PROMPT
             retry_template = RETRY_FIX_PROMPT
@@ -755,12 +830,15 @@ class CodeFixer:
 
     def _build_file_listing(self) -> str:
         """Builds a file listing for the prompt, including ecosystem-appropriate
-        file extensions: Java/XML for Maven repos, JS/TS/JSON for npm repos.
+        file extensions appropriate to the detected ecosystem.
         """
         files = []
         if self._is_npm:
             extensions = ("*.js", "*.ts", "*.jsx", "*.tsx", "*.json", "*.mjs", "*.cjs", "*.yml", "*.yaml")
             exclude_dirs = {"node_modules", ".next", "dist", "build", ".nuxt"}
+        elif self._is_python:
+            extensions = ("*.py", "*.toml", "*.txt", "*.yml", "*.yaml", "*.ini", "*.cfg")
+            exclude_dirs = {".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist"}
         else:
             extensions = ("*.java", "*.xml", "*.properties", "*.yml", "*.yaml")
             exclude_dirs = {"target"}

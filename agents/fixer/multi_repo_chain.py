@@ -26,9 +26,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from code_fixer import CodeFixer, ChangeSummary
-from ecosystems.factory import get_ecosystem
+from ecosystems.factory import get_ecosystem, get_manifest_file
 from ecosystems.base import EcosystemError
 from ecosystems.maven import PomXMLError
+from ecosystems.python import PythonManifestError
 from pr_client import PRClient, PRResult
 from repo_ops import RepoOps
 from common.tracking_store import make_fresh_record, TrackingStatus, TrackingStoreProtocol
@@ -225,7 +226,17 @@ class MultiRepoChainCoordinator:
                     ecosystem = get_ecosystem(repo._local_path)
                     files_changed = []
 
-                    # Apply change to pom.xml
+                    manifest_file = get_manifest_file(repo._local_path)
+                    support_before = {
+                        name: (Path(repo._local_path) / name).read_bytes()
+                        for name in (
+                            "package-lock.json", "npm-shrinkwrap.json",
+                            "yarn.lock", "pnpm-lock.yaml",
+                            "constraints.txt", "poetry.lock", "Pipfile.lock",
+                            "uv.lock", "pdm.lock",
+                        )
+                        if (Path(repo._local_path) / name).exists()
+                    }
                     if is_root and ecosystem.has_dependency(repo._local_path, finding.component_name):
                         # Root repo has the component directly or via BOM
                         try:
@@ -235,14 +246,16 @@ class MultiRepoChainCoordinator:
                                 finding.current_version,
                                 finding.recommended_version,
                             )
-                            files_changed.append("pom.xml")
-                        except PomXMLError:
+                            files_changed.append(manifest_file)
+                        except (PomXMLError, PythonManifestError):
                             ecosystem.add_transitive_override(
                                 repo._local_path,
                                 finding.component_name,
                                 finding.recommended_version,
                             )
-                            files_changed.append("pom.xml")
+                            files_changed.append(manifest_file)
+                            if manifest_file == "pyproject.toml" and (Path(repo._local_path) / "constraints.txt").exists():
+                                files_changed.append("constraints.txt")
                     else:
                         # Intermediate or Consumer repo: pin transitive override
                         ecosystem.add_transitive_override(
@@ -250,7 +263,9 @@ class MultiRepoChainCoordinator:
                             finding.component_name,
                             finding.recommended_version,
                         )
-                        files_changed.append("pom.xml")
+                        files_changed.append(manifest_file)
+                        if manifest_file == "pyproject.toml" and (Path(repo._local_path) / "constraints.txt").exists():
+                            files_changed.append("constraints.txt")
 
                     # Verify build & tests
                     compiled, compile_msg = ecosystem.verify_build(repo._local_path)
@@ -268,9 +283,20 @@ class MultiRepoChainCoordinator:
                     else:
                         ecosystem.verify_tests(repo._local_path)
 
+                    for name, before in support_before.items():
+                        path = Path(repo._local_path) / name
+                        if path.exists() and path.read_bytes() != before:
+                            files_changed.append(name)
+                    for name in (
+                        "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+                        "pnpm-lock.yaml", "constraints.txt", "poetry.lock",
+                        "Pipfile.lock", "uv.lock", "pdm.lock",
+                    ):
+                        if name not in support_before and (Path(repo._local_path) / name).exists():
+                            files_changed.append(name)
                     files_changed = list(dict.fromkeys(files_changed))
                     if not files_changed:
-                        files_changed = ["pom.xml"]
+                        files_changed = [manifest_file]
 
                     # Format commit message linking to all upstream PRs in the chain
                     upstream_refs = []

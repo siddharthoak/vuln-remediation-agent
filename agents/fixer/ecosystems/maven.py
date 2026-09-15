@@ -137,7 +137,7 @@ def _parse_tree(stdout: str, group_id: str, artifact_id: str) -> DependencyLocal
                     found=True,
                     is_transitive=True,
                     depth=depth,
-                    introduced_by=ancestor_at.get(depth - 1),
+                    introduced_by=ancestor_at.get(1),
                     raw_tree=stdout,
                     resolved_version=ver,
                 )
@@ -443,6 +443,7 @@ class MavenEcosystem:
         )
 
         for cand_ver in candidates[:4]:
+            succeeded = False
             try:
                 self.bump_direct_dependency(repo_path, parent_component, parent_cur_ver, cand_ver)
                 loc = self.resolve_locality(repo_path, transitive_component)
@@ -456,11 +457,13 @@ class MavenEcosystem:
                                 "which resolved transitive %s to %s!",
                                 parent_component, parent_cur_ver, cand_ver, transitive_component, loc.resolved_version,
                             )
+                            succeeded = True
                             return (parent_cur_ver, cand_ver, loc.resolved_version)
             except Exception as exc:
                 logger.debug("Candidate parent upgrade %s to %s failed verification: %s", parent_component, cand_ver, exc)
             finally:
-                pom_path.write_text(original_pom, encoding="utf-8")
+                if not succeeded:
+                    pom_path.write_text(original_pom, encoding="utf-8")
 
         return None
 
@@ -474,26 +477,35 @@ def _parse_major(version: str) -> int:
 
 def _compare_versions(v1: str, v2: str) -> int:
     """Compares two Maven version strings. Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal."""
-    def _to_parts(v: str) -> list:
-        clean = re.sub(r"[-_](RELEASE|Final|GA|\.GA)$", "", v.strip().lstrip("v"), flags=re.IGNORECASE)
-        parts = []
-        for seg in re.split(r"[.-]", clean):
-            try:
-                parts.append((0, int(seg)))
-            except ValueError:
-                parts.append((1, seg))
-        return parts
+    qualifier_order = {
+        "snapshot": -5, "alpha": -4, "a": -4, "beta": -3, "b": -3,
+        "milestone": -2, "m": -2, "rc": -1, "cr": -1,
+        "final": 0, "ga": 0, "release": 0,
+    }
 
-    p1, p2 = _to_parts(v1), _to_parts(v2)
-    for a, b in zip(p1, p2):
-        if a < b:
-            return -1
-        elif a > b:
-            return 1
-    if len(p1) < len(p2):
-        return -1
-    elif len(p1) > len(p2):
-        return 1
+    def _to_parts(v: str) -> tuple[tuple[int, ...], tuple[int, str]]:
+        clean = v.strip().lstrip("v")
+        match = re.match(r"^(\d+(?:\.\d+)*)(?:[-_.]?([A-Za-z]+)(\d*)|$)", clean)
+        if not match:
+            return (0,), (0, "")
+        numeric = tuple(int(part) for part in match.group(1).split("."))
+        qualifier = match.group(2)
+        if not qualifier:
+            return numeric, (0, "")
+        return numeric, (
+            qualifier_order.get(qualifier.lower(), -6),
+            qualifier.lower(),
+        )
+
+    numeric1, qualifier1 = _to_parts(v1)
+    numeric2, qualifier2 = _to_parts(v2)
+    max_len = max(len(numeric1), len(numeric2))
+    padded1 = numeric1 + (0,) * (max_len - len(numeric1))
+    padded2 = numeric2 + (0,) * (max_len - len(numeric2))
+    if padded1 != padded2:
+        return 1 if padded1 > padded2 else -1
+    if qualifier1 != qualifier2:
+        return 1 if qualifier1 > qualifier2 else -1
     return 0
 
 
@@ -546,7 +558,7 @@ def _fetch_newer_parent_versions(group_id: str, artifact_id: str, current_versio
         if not ver or ver in seen:
             continue
         seen.add(ver)
-        if any(kw in ver.lower() for kw in ("alpha", "beta", "rc", "m", "snapshot", "cr")):
+        if re.search(r"(?i)(?:alpha|beta|milestone|(?:^|[.\-_])(?:a|b|m|rc|cr|snapshot)(?:$|[.\-_]))", ver):
             continue
         if cur_major != -1 and _parse_major(ver) != cur_major:
             continue

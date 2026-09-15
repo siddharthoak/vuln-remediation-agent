@@ -340,7 +340,7 @@ class ScanReportClient:
     @staticmethod
     def _name_from_purl(purl: str) -> str:
         """
-        Extract package name from a Maven or npm package URL.
+        Extract package name from a Maven, npm, or PyPI package URL.
         pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1
         → org.apache.logging.log4j:log4j-core
 
@@ -349,6 +349,9 @@ class ScanReportClient:
 
         pkg:npm/%40angular/core@12.0.0
         → @angular/core
+
+        pkg:pypi/django@4.2.0
+        → django
         """
         if not purl:
             return ""
@@ -373,6 +376,13 @@ class ScanReportClient:
             except (IndexError, ValueError):
                 return ""
 
+        if purl.startswith("pkg:pypi/"):
+            try:
+                after_type = purl[len("pkg:pypi/"):]
+                return urllib.parse.unquote(after_type.split("@", 1)[0].split("?", 1)[0].split("#", 1)[0])
+            except (IndexError, ValueError):
+                return ""
+
         return ""
 
     @staticmethod
@@ -381,6 +391,10 @@ class ScanReportClient:
         if not purl:
             return "unknown-component", "unknown"
         try:
+            if purl.startswith(("pkg:maven/", "pkg:npm/", "pkg:pypi/")):
+                name = ScanReportClient._name_from_purl(purl)
+                version = purl.rsplit("@", 1)[1].split("?", 1)[0].split("#", 1)[0] if "@" in purl else "unknown"
+                return name or "unknown-component", version
             after_type = purl.split("/", 1)[1] if "/" in purl else purl
             name_version = after_type.rsplit("@", 1)
             name = name_version[0].replace("/", ":")

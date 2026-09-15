@@ -31,6 +31,7 @@ from pattern_learner import PatternLearner
 from common.tracking_store import make_tracking_store, TrackingStatus
 from common.knowledge_store import make_knowledge_store
 from common.config import get_target_repo, get_target_repos, get_github_pat, get_watcher_sleep_seconds
+from common.nightly_scheduler import sleep_until_next_run
 
 
 logging.basicConfig(
@@ -61,12 +62,28 @@ def main():
     interval = get_watcher_sleep_seconds()
 
     if daemon:
-        logger.info("Watcher daemon mode: cycling every %d seconds.", interval)
+        nightly = os.environ.get("NIGHTLY_RUN_ENABLED", "1") == "1"
+        if nightly:
+            run_time = os.environ.get("NIGHTLY_RUN_TIME", "00:00")
+            timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
+            logger.info(
+                "Watcher nightly mode enabled: runs at %s (%s).",
+                run_time,
+                timezone_name,
+            )
+        else:
+            logger.info("Watcher daemon mode: cycling every %d seconds.", interval)
         while True:
             try:
+                if nightly:
+                    sleep_until_next_run(run_time, timezone_name)
                 _run_once()
             except Exception as exc:
                 logger.error("Watcher cycle error: %s", exc, exc_info=True)
+                if nightly:
+                    continue
+            if nightly:
+                continue
             # Re-read interval each cycle in case config/.env was updated
             cycle_interval = get_watcher_sleep_seconds()
             logger.info("Watcher sleeping %d seconds until next cycle.", cycle_interval)

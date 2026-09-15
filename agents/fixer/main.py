@@ -29,10 +29,11 @@ from repo_ops import DiffReviewResult, RepoOps
 from code_fixer import CodeFixer, InvalidRetryError
 from pr_client import PRClient
 from engines.base import EngineExecutionError
-from ecosystems.factory import get_ecosystem
+from ecosystems.factory import get_ecosystem, get_manifest_file
 from ecosystems.base import EcosystemError
 from ecosystems.maven import PomXMLError
 from ecosystems.npm import PackageJsonError
+from ecosystems.python import PythonManifestError
 
 from common.tracking_store import (
     make_tracking_store,
@@ -41,6 +42,7 @@ from common.tracking_store import (
 )
 from common.knowledge_store import make_knowledge_store
 from common.file_lock import FileLock
+from common.nightly_scheduler import sleep_until_next_run
 from common.config import get_target_repo, get_target_repos, get_github_pat
 from knowledge.main import KnowledgeAgent
 from classifier.classifier import Classifier, ClassifierResult
@@ -97,7 +99,17 @@ def _run_server():
         on_new_scan_ready=_run_fresh_scan,
         poll_interval=poll_interval,
     )
-    poller_thread = threading.Thread(target=poller.poll_forever, daemon=True, name="scan-poller")
+    if os.environ.get("NIGHTLY_RUN_ENABLED", "1") == "1":
+        poller_target = lambda: _run_nightly_fixer_loop(poller)
+        logger.info(
+            "Nightly mode enabled: fixer runs at %s (%s).",
+            os.environ.get("NIGHTLY_RUN_TIME", "00:00"),
+            os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata"),
+        )
+    else:
+        poller_target = poller.poll_forever
+        logger.info("Continuous scan polling enabled.")
+    poller_thread = threading.Thread(target=poller_target, daemon=True, name="scan-poller")
     poller_thread.start()
 
     server = _make_retry_server(port=8080, poller=poller)
@@ -106,6 +118,19 @@ def _run_server():
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Fixer server shutting down.")
+
+
+def _run_nightly_fixer_loop(poller: ScanPoller) -> None:
+    """Sleep during the day and execute exactly one scan/remediation cycle nightly."""
+    run_time = os.environ.get("NIGHTLY_RUN_TIME", "00:00")
+    timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
+    max_wait = int(os.environ.get("NIGHTLY_SCAN_MAX_WAIT_SECONDS", "7200"))
+    while True:
+        try:
+            sleep_until_next_run(run_time, timezone_name)
+            poller.run_nightly(max_wait_seconds=max_wait)
+        except Exception as exc:
+            logger.error("Nightly fixer cycle failed: %s", exc, exc_info=True)
 
 
 def _make_retry_server(port: int, poller: Optional[ScanPoller] = None) -> HTTPServer:
@@ -225,7 +250,7 @@ def _fix_one_process_worker(task: dict):
                     cve_ids=finding.cve_ids,
                     kb_entry=kb_entry,
                 )
-        except (PomXMLError, PackageJsonError) as exc:
+        except (PomXMLError, PackageJsonError, PythonManifestError) as exc:
             logger.warning(
                 "Could not process dependency %s in manifest; opening triage issue: %s",
                 finding.component_name, exc,
@@ -273,7 +298,7 @@ def _fix_one_process_worker(task: dict):
             return None
 
         # Detect manifest file for diff review (ecosystem-aware)
-        manifest_file = "package.json" if (Path(repo._local_path) / "package.json").exists() and not (Path(repo._local_path) / "pom.xml").exists() else "pom.xml"
+        manifest_file = get_manifest_file(Path(repo._local_path))
 
         try:
             review = repo.review_dependency_diff(
@@ -430,7 +455,7 @@ def _do_fresh_scan():
     )
 
     # ── Locality resolution (direct vs. transitive) ───────────────────────────
-    # Ecosystem-pluggable (see ecosystems/) -- Maven and npm are supported.
+    # Ecosystem-pluggable (see ecosystems/) -- Maven, npm, and Python are supported.
     # A finding whose locality can't be determined defaults to direct.
     # A locality-tool failure is routed to triage; a clean lookup that does not
     # contain the finding is treated as a stale report and keeps the legacy
@@ -713,7 +738,7 @@ def _run_retry(tracking_id: str):
                 return
 
             # Detect manifest file for diff review (ecosystem-aware)
-            retry_manifest_file = "package.json" if (Path(repo._local_path) / "package.json").exists() and not (Path(repo._local_path) / "pom.xml").exists() else "pom.xml"
+            retry_manifest_file = get_manifest_file(Path(repo._local_path))
 
             try:
                 review = repo.review_dependency_diff(
