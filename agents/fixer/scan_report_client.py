@@ -73,43 +73,35 @@ class ScanReportClient:
         """
         findings: dict = {}  # (component_name, current_version) → VulnerabilityFinding
 
-        trivy_path = self._report_dir / self.TRIVY_FILE
-        grype_path = self._report_dir / self.GRYPE_FILE
-        owasp_path = self._report_dir / self.OWASP_FILE
+        trivy_files = list(self._report_dir.rglob(self.TRIVY_FILE))
+        grype_files = list(self._report_dir.rglob(self.GRYPE_FILE))
+        owasp_files = list(self._report_dir.rglob("dependency-check-report.json"))
 
-        if trivy_path.exists():
+        for trivy_path in trivy_files:
             for f in self._parse_trivy(trivy_path):
                 key = (f.component_name, f.current_version)
                 findings.setdefault(key, f)
-        else:
-            logger.debug("Trivy report not found at %s", trivy_path)
 
-        if grype_path.exists():
+        for grype_path in grype_files:
             for f in self._parse_grype(grype_path):
                 key = (f.component_name, f.current_version)
                 existing = findings.get(key)
                 if existing:
-                    # Merge: add CVEs not already known
                     for cve in f.cve_ids:
                         if cve not in existing.cve_ids:
                             existing.cve_ids.append(cve)
                     existing.severity = self._highest_severity([existing.severity, f.severity])
-                    # Prefer a higher concrete safe version over UNKNOWN or lower version
                     if not f.recommended_version.startswith("UNKNOWN"):
                         if existing.recommended_version.startswith("UNKNOWN") or \
                            self._parse_version_tuple(f.recommended_version) > self._parse_version_tuple(existing.recommended_version):
                             existing.recommended_version = f.recommended_version
                 else:
                     findings[key] = f
-        else:
-            logger.debug("Grype report not found at %s", grype_path)
 
-        if owasp_path.exists():
+        for owasp_path in owasp_files:
             for f in self._parse_owasp(owasp_path):
                 key = (f.component_name, f.current_version)
                 findings.setdefault(key, f)
-        else:
-            logger.debug("OWASP report not found at %s", owasp_path)
 
         if not findings:
             raise ScanReportError(

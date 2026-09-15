@@ -105,11 +105,7 @@ class ScanPoller:
         """Check if scan report files currently exist in the report directory."""
         if not self._report_dir.exists():
             return False
-        return (
-            (self._report_dir / "trivy-report.json").exists()
-            or (self._report_dir / "grype-report.json").exists()
-            or (self._report_dir / "dependency-check-report" / "dependency-check-report.json").exists()
-        )
+        return bool(list(self._report_dir.rglob("*.json")))
 
     def is_scan_running(self) -> bool:
         """Check if any security-scan run is currently queued or in-progress."""
@@ -263,13 +259,12 @@ class ScanPoller:
         resp = requests.get(url, headers=self._headers, timeout=30)
         resp.raise_for_status()
         artifacts = resp.json().get("artifacts", [])
-        artifact  = next((a for a in artifacts if a["name"] == ARTIFACT_NAME), None)
+        artifact = next(
+            (a for a in artifacts if a["name"] in ("vulnerability-reports", "dependency-check-report", "trivy-reports", "grype-reports")),
+            next((a for a in artifacts if "report" in a["name"].lower()), artifacts[0] if artifacts else None),
+        )
         if artifact is None:
-            names = [a["name"] for a in artifacts]
-            logger.warning(
-                "ScanPoller: artifact '%s' not found in run %d. Available: %s",
-                ARTIFACT_NAME, run_id, names,
-            )
+            logger.warning("ScanPoller: no artifacts found in run %d", run_id)
             return
 
         size_mb = artifact.get("size_in_bytes", 0) / 1_048_576
