@@ -35,6 +35,17 @@ COMPLEX_FRAMEWORKS = frozenset({
     "wicket-core",
     "jsf-api",
     "myfaces-impl",
+    "express",
+    "next",
+    "nuxt",
+    "react",
+    "react-dom",
+    "angular",
+    "@angular/core",
+    "vue",
+    "gatsby",
+    "nestjs",
+    "@nestjs/core",
 })
 
 
@@ -90,8 +101,8 @@ class Classifier:
             )
 
         # ── Bucket 4: transitive dependency, risky chain ──────────────────────
-        # A transitive fix means forcing Maven's version mediation via a
-        # dependencyManagement override -- higher blast radius than a direct
+        # A transitive fix means forcing version resolution via a manifest override
+        # (dependencyManagement for Maven, overrides for npm) -- higher blast radius than a direct
         # bump since it can silently affect unrelated code paths that use the
         # same transitive artifact. Escalate rather than automate when: it's
         # introduced by a complex framework (same reasoning as the bucket-4
@@ -113,7 +124,7 @@ class Classifier:
                     rationale=(
                         f"{component} is a transitive dependency (via {finding.introduced_by}) "
                         f"with a fix version ({old_ver} → {new_ver}) available, but introduced by complex framework {finding.introduced_by}. "
-                        "An automated dependencyManagement override is too risky here -- manual triage required."
+                        "An automated manifest override is too risky here -- manual triage required."
                     ),
                 )
             if deep_chain and not is_multi_repo and kb_entry is None:

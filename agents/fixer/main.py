@@ -14,6 +14,7 @@ import sys
 import multiprocessing
 import tempfile
 import threading
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json as _json
@@ -31,6 +32,7 @@ from engines.base import EngineExecutionError
 from ecosystems.factory import get_ecosystem
 from ecosystems.base import EcosystemError
 from ecosystems.maven import PomXMLError
+from ecosystems.npm import PackageJsonError
 
 from common.tracking_store import (
     make_tracking_store,
@@ -223,9 +225,9 @@ def _fix_one_process_worker(task: dict):
                     cve_ids=finding.cve_ids,
                     kb_entry=kb_entry,
                 )
-        except PomXMLError as exc:
+        except (PomXMLError, PackageJsonError) as exc:
             logger.warning(
-                "Could not process dependency %s in pom.xml; opening triage issue: %s",
+                "Could not process dependency %s in manifest; opening triage issue: %s",
                 finding.component_name, exc,
             )
             pr_client.open_triage_issue(
@@ -270,11 +272,15 @@ def _fix_one_process_worker(task: dict):
                 pass
             return None
 
+        # Detect manifest file for diff review (ecosystem-aware)
+        manifest_file = "package.json" if (Path(repo._local_path) / "package.json").exists() and not (Path(repo._local_path) / "pom.xml").exists() else "pom.xml"
+
         try:
             review = repo.review_dependency_diff(
                 component_name=finding.component_name,
                 target_version=finding.recommended_version,
                 expected_files=summary.files_changed,
+                manifest_file=manifest_file,
             )
         except Exception as exc:
             review = DiffReviewResult(False, f"Diff review could not run: {exc}")
@@ -424,8 +430,8 @@ def _do_fresh_scan():
     )
 
     # ── Locality resolution (direct vs. transitive) ───────────────────────────
-    # Ecosystem-pluggable (see ecosystems/) -- Maven-only, single-module POC
-    # scope today. A finding whose locality can't be determined defaults to
+    # Ecosystem-pluggable (see ecosystems/) -- Maven and npm are supported.
+    # A finding whose locality can't be determined defaults to direct.
     # A locality-tool failure is routed to triage; a clean lookup that does not
     # contain the finding is treated as a stale report and keeps the legacy
     # direct-dependency fallback.
@@ -706,12 +712,16 @@ def _run_retry(tracking_id: str):
                     tracking_store.update(current)
                 return
 
+            # Detect manifest file for diff review (ecosystem-aware)
+            retry_manifest_file = "package.json" if (Path(repo._local_path) / "package.json").exists() and not (Path(repo._local_path) / "pom.xml").exists() else "pom.xml"
+
             try:
                 review = repo.review_dependency_diff(
                     component_name=record.component_name,
                     target_version=record.new_version,
                     expected_files=summary.files_changed,
                     allow_manifest_already_applied=True,
+                    manifest_file=retry_manifest_file,
                 )
             except Exception as exc:
                 review = DiffReviewResult(False, f"Diff review could not run: {exc}")

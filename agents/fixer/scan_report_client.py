@@ -13,6 +13,7 @@ so fixer/main.py requires only an import-name change.
 import json
 import logging
 import os
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -339,18 +340,40 @@ class ScanReportClient:
     @staticmethod
     def _name_from_purl(purl: str) -> str:
         """
-        Extract a Maven groupId:artifactId name from a package URL.
+        Extract package name from a Maven or npm package URL.
         pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1
         → org.apache.logging.log4j:log4j-core
+
+        pkg:npm/lodash@4.17.20
+        → lodash
+
+        pkg:npm/%40angular/core@12.0.0
+        → @angular/core
         """
-        if not purl or not purl.startswith("pkg:maven/"):
+        if not purl:
             return ""
-        try:
-            after_type = purl[len("pkg:maven/"):]
-            name_part = after_type.split("@")[0]
-            return name_part.replace("/", ":")
-        except (IndexError, ValueError):
-            return ""
+
+        if purl.startswith("pkg:maven/"):
+            try:
+                after_type = purl[len("pkg:maven/"):]
+                name_part = after_type.split("@")[0]
+                return name_part.replace("/", ":")
+            except (IndexError, ValueError):
+                return ""
+
+        if purl.startswith("pkg:npm/"):
+            try:
+                after_type = purl[len("pkg:npm/"):]
+                if after_type.startswith("@"):
+                    name_part = "@" + after_type[1:].split("@")[0]
+                else:
+                    name_part = after_type.split("@")[0]
+                name_part = name_part.split("?")[0].split("#")[0]
+                return urllib.parse.unquote(name_part)
+            except (IndexError, ValueError):
+                return ""
+
+        return ""
 
     @staticmethod
     def _parse_purl(purl: str):

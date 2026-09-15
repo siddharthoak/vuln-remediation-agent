@@ -24,6 +24,8 @@ from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
 from ecosystems.maven import compile_repo, test_repo
+from ecosystems.npm import install_and_build as npm_install_and_build, test_repo as npm_test_repo
+from ecosystems.factory import get_ecosystem
 from engines.base import FixResult, EngineExecutionError
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,9 @@ class AdkVertexEngine:
         self._repo_path = repo_path
         self._applied_changes: list = []
 
+        # Detect ecosystem to provide the right build/test tools
+        is_npm = (repo_path / "package.json").exists() and not (repo_path / "pom.xml").exists()
+
         # ADK derives tool names from func.__name__. Instance methods have names
         # like "_tool_grep_files" but the prompt tells the LLM to call "grep_files".
         # Wrap each handler in a local function whose __name__ matches the prompt.
@@ -79,13 +84,30 @@ class AdkVertexEngine:
             """Run the repository tests with 'mvn -B test -q'."""
             return self._tool_run_maven_test()
 
-        tools = [
+        def run_npm_install() -> str:
+            """Run 'npm install' to install dependencies and verify the build."""
+            return self._tool_run_npm_install()
+
+        def run_npm_test() -> str:
+            """Run 'npm test' with a bounded timeout."""
+            return self._tool_run_npm_test()
+
+        common_tools = [
             FunctionTool(func=read_file),
             FunctionTool(func=grep_files),
             FunctionTool(func=apply_file_change),
-            FunctionTool(func=run_maven_compile),
-            FunctionTool(func=run_maven_test),
         ]
+
+        if is_npm:
+            tools = common_tools + [
+                FunctionTool(func=run_npm_install),
+                FunctionTool(func=run_npm_test),
+            ]
+        else:
+            tools = common_tools + [
+                FunctionTool(func=run_maven_compile),
+                FunctionTool(func=run_maven_test),
+            ]
 
         system_instruction = (
             "You are an autonomous vulnerability remediation agent. "
@@ -221,7 +243,14 @@ class AdkVertexEngine:
         """Search for a regex pattern across repository source files."""
         if not pattern:
             return "ERROR: pattern is required."
-        exts = set(extensions) if extensions else {".java", ".xml", ".properties", ".yml", ".yaml"}
+        is_npm = (self._repo_path / "package.json").exists() and not (self._repo_path / "pom.xml").exists()
+        if extensions:
+            exts = set(extensions)
+        elif is_npm:
+            exts = {".js", ".ts", ".jsx", ".tsx", ".json", ".mjs", ".cjs", ".yml", ".yaml"}
+        else:
+            exts = {".java", ".xml", ".properties", ".yml", ".yaml"}
+        exclude_dirs = {"node_modules", ".next", "dist", ".nuxt"} if is_npm else {"target"}
         try:
             compiled = re.compile(pattern)
         except re.error as exc:
@@ -229,7 +258,7 @@ class AdkVertexEngine:
 
         results = []
         for f in sorted(self._repo_path.rglob("*")):
-            if "target" in f.parts or f.suffix not in exts:
+            if exclude_dirs.intersection(f.parts) or f.suffix not in exts:
                 continue
             try:
                 lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -292,4 +321,14 @@ class AdkVertexEngine:
     def _tool_run_maven_test(self) -> str:
         """Run the repository tests with 'mvn -B test -q'."""
         _, message = test_repo(self._repo_path)
+        return message
+
+    def _tool_run_npm_install(self) -> str:
+        """Run 'npm install' to install dependencies and verify the build."""
+        _, message = npm_install_and_build(self._repo_path)
+        return message
+
+    def _tool_run_npm_test(self) -> str:
+        """Run 'npm test' with a bounded timeout."""
+        _, message = npm_test_repo(self._repo_path)
         return message

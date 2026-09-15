@@ -36,6 +36,7 @@ from typing import Optional
 from common.tracking_store import TrackingStatus
 from ecosystems.factory import get_ecosystem
 from ecosystems.maven import PomXMLError
+from ecosystems.npm import PackageJsonError
 from engines.factory import get_engine
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,98 @@ these commands; the CI test gate remains authoritative for those runs.
 ```
 """
 
+FRESH_FIX_PROMPT_NODE = """\
+You are a Node.js/npm dependency upgrade specialist. Apply the MINIMAL set of code
+changes required to upgrade a specific dependency from one version to another.
+
+## Dependency being upgraded
+- Component: {component_name}
+- Current version: {current_version}
+- Target version: {target_version}
+{kb_context}
+## Repository file tree (paths only)
+{file_listing}
+
+## Available tools
+- `grep_files(pattern, extensions?)` — regex search across file contents.
+- `read_file(relative_path)` — read a file's full content.
+- `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
+- `run_npm_install()` — run 'npm install'. Returns error output on failure.
+- `run_npm_test()` — run 'npm test' with a bounded timeout. Returns test failure output.
+
+## Your workflow
+1. Call grep_files with the import/require pattern for {component_name}
+   (e.g. for "express", search "require\\(['\"]express['\"]\\)" or "from ['\"]express['\"]").
+2. Call read_file on each affected file to inspect the actual source code.
+3. Identify which API/behavioral changes between {current_version} and {target_version}
+   require source-level changes (removed/renamed methods, config format changes).
+4. Call apply_file_change for each required edit.
+   The "find" value MUST be an exact substring of the file content from read_file — never guess.
+   Do NOT edit package.json — the version bump is already applied.
+5. Call run_npm_install to verify dependencies install cleanly.
+6. If install fails: read the error, inspect the affected files, apply corrections, install again.
+7. Call run_npm_test when installation succeeds to catch runtime/test regressions.
+8. When installation and tests succeed (or if no source changes are needed), return end_turn with JSON.
+
+## CRITICAL CONSTRAINTS
+- Only apply changes strictly required by the version upgrade.
+- Do NOT refactor, rename, reformat, or improve unrelated code.
+- Never pass a "find" value you have not verified verbatim in read_file output.
+
+```json
+{{
+  "rationale": "<key API changes between versions and summary of what was changed>"
+}}
+```
+"""
+
+RETRY_FIX_PROMPT_NODE = """\
+You are a Node.js/npm dependency upgrade specialist. A previous fix attempt for this
+dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix.
+
+## Dependency being upgraded
+- Component: {component_name}
+- Current version: {current_version}
+- Target version: {target_version}
+
+## Previous CI failure log (root cause of the failure)
+```
+{failure_log_excerpt}
+```
+
+## Repository file tree (paths only)
+{file_listing}
+
+## Available tools
+- `grep_files(pattern, extensions?)` — regex search across file contents.
+- `read_file(relative_path)` — read a file's full content.
+- `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
+- `run_npm_install()` — run 'npm install'. Returns error output on failure.
+- `run_npm_test()` — run 'npm test' with a bounded timeout. Returns test failure output.
+
+## Your workflow
+1. Analyse the CI failure log to identify the ROOT CAUSE.
+2. Use grep_files and read_file to inspect the files mentioned in the failure log.
+3. Call apply_file_change for the specific, minimal change that fixes the CI failure.
+   Do NOT repeat the same change from the previous attempt unless the log shows it was incomplete.
+4. Call run_npm_install to verify the fix installs cleanly.
+5. If installation fails: read the error, inspect affected files, apply corrections, install again.
+6. Call run_npm_test when installation succeeds to catch runtime/test regressions.
+7. When installation and tests succeed, return end_turn with JSON.
+
+## CRITICAL CONSTRAINTS
+- Fix only what the CI failure log tells you is broken.
+- Do NOT refactor, rename, reformat, or improve unrelated code.
+- Do NOT edit package.json.
+- Never pass a "find" value you have not verified verbatim in read_file output.
+
+```json
+{{
+  "rationale": "<diagnosis of the CI failure and summary of what was changed>"
+}}
+```
+"""
+
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -217,7 +310,7 @@ class CodeFixer:
     for its security caveats before using it in production).
 
     Package ecosystem: pluggable via PackageEcosystem (ecosystems/),
-    auto-detected from repo contents (Maven/pom.xml only in this POC --
+    auto-detected from repo contents (Maven/pom.xml, npm/package.json --
     see ecosystems/factory.py). Manifest handling and prompt construction
     are engine- and ecosystem-agnostic.
     """
@@ -227,6 +320,17 @@ class CodeFixer:
         self._max_attempts = int(os.environ.get("MAX_RETRY_ATTEMPTS", "3"))
         self._engine = get_engine(model_deployment_name=model_deployment_name)
         self._ecosystem = get_ecosystem(self._repo_path)
+
+    @property
+    def _manifest_file(self) -> str:
+        """Returns the ecosystem's manifest filename for use in ChangeSummary.files_changed."""
+        if (self._repo_path / "package.json").exists() and not (self._repo_path / "pom.xml").exists():
+            return "package.json"
+        return "pom.xml"
+
+    @property
+    def _is_npm(self) -> bool:
+        return self._manifest_file == "package.json"
 
     # ── Public entry points (UNCHANGED) ──────────────────────────────────────
 
@@ -361,6 +465,7 @@ class CodeFixer:
         kb_entry=None,
         is_retry: bool = False,
     ) -> ChangeSummary:
+        manifest = self._manifest_file
         bumped = False
         compile_failure = None
         try:
@@ -368,7 +473,7 @@ class CodeFixer:
                 self._repo_path, component_name, current_version, target_version
             )
             bumped = True
-        except PomXMLError:
+        except (PomXMLError, PackageJsonError):
             if not is_retry:
                 return self._execute_transitive_fix(
                     component_name=component_name,
@@ -387,10 +492,10 @@ class CodeFixer:
                     component_name=component_name,
                     old_version=current_version,
                     new_version=target_version,
-                    files_changed=["pom.xml"],
+                    files_changed=[manifest],
                     rationale=(
                         f"Dependency upgraded from {current_version} to {target_version} "
-                        "in pom.xml; the repository compiled successfully without source changes."
+                        f"in {manifest}; the repository compiled successfully without source changes."
                     ),
                     cve_ids=cve_ids,
                 )
@@ -405,7 +510,7 @@ class CodeFixer:
         if compile_failure:
             prompt_failure = (
                 f"{failure_log_excerpt}\n\n" if failure_log_excerpt else ""
-            ) + "Compile verification after the pom.xml bump failed:\n" + compile_failure
+            ) + f"Compile verification after the {manifest} bump failed:\n" + compile_failure
 
         # Handle the known Struts 2.5+ package move deterministically before
         # asking an LLM to diagnose it. This is a compile-only compatibility
@@ -422,7 +527,7 @@ class CodeFixer:
                     component_name=component_name,
                     old_version=current_version,
                     new_version=target_version,
-                    files_changed=["pom.xml", *known_files],
+                    files_changed=[manifest, *known_files],
                     rationale=(
                         f"Dependency upgraded from {current_version} to {target_version}; "
                         "updated the Struts filter package for the upgraded API."
@@ -445,7 +550,7 @@ class CodeFixer:
             kb_entry=kb_entry,
         )
         result = self._engine.run_fix(self._repo_path, prompt)
-        files_changed = ["pom.xml"] + list(dict.fromkeys(result.files_changed))
+        files_changed = [manifest] + list(dict.fromkeys(result.files_changed))
         return ChangeSummary(
             component_name=component_name,
             old_version=current_version,
@@ -508,20 +613,23 @@ class CodeFixer:
         cve_ids: list,
     ) -> ChangeSummary:
         """Deterministic path for a transitive-dependency finding: pins the
-        resolved version via a <dependencyManagement> override (see
-        _add_dependency_management_override) -- no LLM call, no source
-        changes, no prompt_tokens/completion_tokens (None, not 0 -- see
+        resolved version via a manifest override (dependencyManagement for Maven,
+        overrides for npm) -- no LLM call, no source changes, no
+        prompt_tokens/completion_tokens (None, not 0 -- see
         engines.base.FixResult on why 0 would misrepresent "no LLM used" as
         "confirmed zero cost").
 
         Verified by compiling. If the version bump itself breaks the build --
-        version-mediation fallout, not something a pom.xml-only edit can fix
+        version-mediation fallout, not something a manifest-only edit can fix
         further -- falls back to the FixEngine with the compile failure as
         context, reusing the exact same RETRY_FIX_PROMPT path a CI-failure
         retry would use (_build_prompt selects it whenever failure_log_excerpt
         is set, regardless of why).
         """
-        # ── Dependency Hygiene: Try Parent-First upgrade before <dependencyManagement> ──
+        manifest = self._manifest_file
+        override_mechanism = "overrides" if self._is_npm else "dependencyManagement"
+
+        # ── Dependency Hygiene: Try Parent-First upgrade before manifest override ──
         if introduced_by and hasattr(self._ecosystem, "try_parent_dependency_upgrade"):
             try:
                 parent_upgrade = self._ecosystem.try_parent_dependency_upgrade(
@@ -540,19 +648,19 @@ class CodeFixer:
                         component_name=component_name,
                         old_version=current_version,
                         new_version=resolved_trans,
-                        files_changed=["pom.xml"],
+                        files_changed=[manifest],
                         rationale=(
                             f"Dependency Hygiene: Upgraded direct parent dependency {introduced_by} "
                             f"({parent_old} → {parent_new}), which cleanly resolved transitive vulnerability "
                             f"in {component_name} ({current_version} → {resolved_trans}) without requiring "
-                            "an artificial <dependencyManagement> override."
+                            f"an artificial {override_mechanism} override."
                         ),
                         cve_ids=cve_ids,
                     )
             except Exception as e:
                 logger.warning(
-                    "Parent-first upgrade attempt for %s via %s encountered an error: %s -- falling back to dependencyManagement.",
-                    component_name, introduced_by, e,
+                    "Parent-first upgrade attempt for %s via %s encountered an error: %s -- falling back to %s.",
+                    component_name, introduced_by, e, override_mechanism,
                 )
 
         self._ecosystem.add_transitive_override(self._repo_path, component_name, target_version)
@@ -563,19 +671,19 @@ class CodeFixer:
                 component_name=component_name,
                 old_version=current_version,
                 new_version=target_version,
-                files_changed=["pom.xml"],
+                files_changed=[manifest],
                 rationale=(
                     f"Transitive dependency (introduced by {introduced_by}) pinned to "
-                    f"{target_version} via a dependencyManagement override. No source "
+                    f"{target_version} via a {override_mechanism} override. No source "
                     "changes required."
                 ),
                 cve_ids=cve_ids,
             )
 
         logger.warning(
-            "%s: dependencyManagement override to %s did not compile cleanly -- "
+            "%s: %s override to %s did not compile cleanly -- "
             "falling back to FixEngine with the compile failure as context. %s",
-            component_name, target_version, message[:200],
+            component_name, override_mechanism, target_version, message[:200],
         )
         file_listing = self._build_file_listing()
         prompt = self._build_prompt(
@@ -586,7 +694,7 @@ class CodeFixer:
             failure_log_excerpt=message,
         )
         result = self._engine.run_fix(self._repo_path, prompt)
-        files_changed = ["pom.xml"] + list(dict.fromkeys(result.files_changed))
+        files_changed = [manifest] + list(dict.fromkeys(result.files_changed))
         return ChangeSummary(
             component_name=component_name,
             old_version=current_version,
@@ -594,7 +702,7 @@ class CodeFixer:
             files_changed=files_changed,
             rationale=(
                 f"Transitive dependency (introduced by {introduced_by}) pinned to "
-                f"{target_version} via a dependencyManagement override; that broke "
+                f"{target_version} via a {override_mechanism} override; that broke "
                 f"compilation, so the FixEngine applied a corrective source fix. "
                 f"{result.rationale}"
             ),
@@ -615,19 +723,27 @@ class CodeFixer:
         failure_log_excerpt: Optional[str],
         kb_entry=None,
     ) -> str:
-        """Selects and formats FRESH_FIX_PROMPT or RETRY_FIX_PROMPT. The result is
-        handed to whichever FixEngine is configured -- prompt content doesn't
+        """Selects and formats the appropriate FRESH_FIX or RETRY_FIX prompt
+        based on the detected ecosystem (Java/Maven or Node.js/npm). The result
+        is handed to whichever FixEngine is configured -- prompt content doesn't
         change based on which engine will run it.
         """
+        if self._is_npm:
+            fresh_template = FRESH_FIX_PROMPT_NODE
+            retry_template = RETRY_FIX_PROMPT_NODE
+        else:
+            fresh_template = FRESH_FIX_PROMPT
+            retry_template = RETRY_FIX_PROMPT
+
         if failure_log_excerpt:
-            return RETRY_FIX_PROMPT.format(
+            return retry_template.format(
                 component_name=component_name,
                 current_version=current_version,
                 target_version=target_version,
                 failure_log_excerpt=failure_log_excerpt[:6000],
                 file_listing=file_listing,
             )
-        return FRESH_FIX_PROMPT.format(
+        return fresh_template.format(
             component_name=component_name,
             current_version=current_version,
             target_version=target_version,
@@ -635,12 +751,21 @@ class CodeFixer:
             kb_context=_render_kb_context(kb_entry),
         )
 
-    # ── File listing (UNCHANGED) ──────────────────────────────────────────────
+    # ── File listing ──────────────────────────────────────────────────────────
 
     def _build_file_listing(self) -> str:
+        """Builds a file listing for the prompt, including ecosystem-appropriate
+        file extensions: Java/XML for Maven repos, JS/TS/JSON for npm repos.
+        """
         files = []
-        for ext in ("*.java", "*.xml", "*.properties", "*.yml", "*.yaml"):
+        if self._is_npm:
+            extensions = ("*.js", "*.ts", "*.jsx", "*.tsx", "*.json", "*.mjs", "*.cjs", "*.yml", "*.yaml")
+            exclude_dirs = {"node_modules", ".next", "dist", "build", ".nuxt"}
+        else:
+            extensions = ("*.java", "*.xml", "*.properties", "*.yml", "*.yaml")
+            exclude_dirs = {"target"}
+        for ext in extensions:
             for f in self._repo_path.rglob(ext):
-                if "target" not in f.parts:
+                if not exclude_dirs.intersection(f.parts):
                     files.append(str(f.relative_to(self._repo_path)))
         return "\n".join(sorted(files)[:200])
