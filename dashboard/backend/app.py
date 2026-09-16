@@ -829,17 +829,22 @@ def partial_retry_lineage(request: Request, pr_number: str = ""):
 def partial_metrics(request: Request):
     records = _records_as_dicts()
 
-    latest_by_pr = {}
-    for r in sorted(records, key=lambda r: r.get("attempt_number") or 0):
-        if r.get("pr_number") is not None:
-            latest_by_pr[r["pr_number"]] = r
-    latest = list(latest_by_pr.values())
+    # Count distinct PRs opened
+    unique_prs = {r["pr_number"] for r in records if r.get("pr_number") is not None}
+    total_prs = len(unique_prs)
 
-    total_prs = len(latest)
+    # Compute latest status per component/vulnerability (avoids collapsing batched combined PRs)
+    latest_by_component = {}
+    for r in sorted(records, key=lambda x: (x.get("created_at") or "", x.get("attempt_number") or 0)):
+        key = (r.get("repo"), r.get("component_name") or r.get("vulnerability_id"))
+        latest_by_component[key] = r
+    latest = list(latest_by_component.values())
+
+    total_findings = len(latest)
     resolved = sum(1 for r in latest if r["status"] == TrackingStatus.CI_PASSED.value)
     escalated = sum(1 for r in latest if r["status"] in _ESCALATED_STATUSES)
-    in_progress = total_prs - resolved - escalated
-    resolution_rate = (resolved / total_prs * 100) if total_prs else 0.0
+    in_progress = max(0, total_findings - resolved - escalated)
+    resolution_rate = (resolved / total_findings * 100) if total_findings else 0.0
 
     eval_set = latest if latest else records
     transitive_count = sum(1 for r in eval_set if r.get("is_transitive"))

@@ -243,6 +243,12 @@ def review_dependency_diff(
                 manifest_text = manifest_path.read_text(encoding="utf-8")
             else:
                 manifest_text = manifest_path.read_text(encoding="utf-8")
+            constraints_path = manifest_path.parent / "constraints.txt"
+            if constraints_path.exists():
+                try:
+                    manifest_text += "\n" + constraints_path.read_text(encoding="utf-8")
+                except Exception:
+                    pass
         except (ValueError, OSError) as exc:
             return DiffReviewResult(
                 False, f"Diff review failed — {manifest_file} is invalid: {exc}",

@@ -111,6 +111,60 @@ class PythonEcosystemTests(unittest.TestCase):
             self.assertEqual(locality.depth, 2)
             self.assertEqual(locality.introduced_by, "requests")
 
+    def test_pipdeptree_modern_format_and_project_root(self):
+        # Newer pipdeptree returns nodes directly without "package" wrapper,
+        # and pip install . installs the project itself at root
+        tree = json.dumps([{
+            "key": "test-python",
+            "package_name": "test-python",
+            "installed_version": "0.1.0",
+            "dependencies": [
+                {
+                    "key": "botocore",
+                    "package_name": "botocore",
+                    "installed_version": "1.20.0",
+                    "dependencies": [
+                        {
+                            "key": "urllib3",
+                            "package_name": "urllib3",
+                            "installed_version": "1.26.4",
+                            "dependencies": [],
+                        }
+                    ],
+                },
+                {
+                    "key": "flask",
+                    "package_name": "Flask",
+                    "installed_version": "3.0.3",
+                    "dependencies": [],
+                }
+            ],
+        }])
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "pyproject.toml").write_text(
+                '[project]\nname = "test-python"\nversion = "0.1.0"\ndependencies = ["flask==3.0.3", "botocore==1.20.0"]\n',
+                encoding="utf-8",
+            )
+            ecosystem = PythonEcosystem()
+            with patch(
+                "ecosystems.python.PythonEcosystem._ensure_environment",
+                return_value=Path(sys.executable),
+            ), patch(
+                "ecosystems.python.subprocess.run",
+                return_value=CompletedProcess([], 0, tree, ""),
+            ):
+                urllib3_loc = ecosystem.resolve_locality(repo, "urllib3")
+                flask_loc = ecosystem.resolve_locality(repo, "flask")
+
+            self.assertTrue(urllib3_loc.is_transitive)
+            self.assertEqual(urllib3_loc.depth, 2)
+            self.assertEqual(urllib3_loc.introduced_by, "botocore")
+
+            self.assertFalse(flask_loc.is_transitive)
+            self.assertEqual(flask_loc.depth, 1)
+            self.assertIsNone(flask_loc.introduced_by)
+
 
 class NpmEcosystemTests(unittest.TestCase):
     def test_semver_prerelease_is_lower_than_release(self):

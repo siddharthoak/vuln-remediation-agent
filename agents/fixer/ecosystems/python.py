@@ -129,15 +129,20 @@ class PythonEcosystem:
         signature = signature_builder.hexdigest()
         marker_matches = marker.exists() and marker.read_text(encoding="utf-8").strip() == signature
         if not marker_matches:
+            if env.exists():
+                import shutil
+                shutil.rmtree(env, ignore_errors=True)
+            venv.EnvBuilder(with_pip=True, clear=False).create(env)
             self._run_pip(python, repo_path, ["install", "pipdeptree"])
             if self._manifest_name(repo_path) == "Pipfile":
-                requirements = self._locked_pipfile_requirements(repo_path)
+                requirements = self._pipfile_requirements(repo_path)
                 install_args = ["install", *requirements]
                 if (repo_path / "constraints.txt").exists():
                     install_args.extend(["-c", "constraints.txt"])
             else:
                 install_args = self._install_args(repo_path)
-            self._run_pip(python, repo_path, install_args)
+            if install_args:
+                self._run_pip(python, repo_path, install_args)
             marker.write_text(signature, encoding="utf-8")
         return python
 
@@ -252,8 +257,19 @@ class PythonEcosystem:
         target = _normalise(component_name)
         try:
             result = subprocess.run(
-                [str(self._ensure_environment(repo_path)), "-m", "pipdeptree", "--json-tree"],
-                cwd=str(repo_path), capture_output=True, text=True, timeout=120,
+                [
+                    str(self._ensure_environment(repo_path)),
+                    "-m",
+                    "pipdeptree",
+                    "--exclude",
+                    "pipdeptree,pip,setuptools,wheel",
+                    "--exclude-dependencies",
+                    "--json-tree",
+                ],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=120,
             )
         except FileNotFoundError as exc:
             raise EcosystemError("Python executable not found.") from exc
@@ -271,27 +287,65 @@ class PythonEcosystem:
         except json.JSONDecodeError as exc:
             raise EcosystemError(f"pipdeptree output could not be parsed as JSON: {exc}") from exc
 
-        def walk(nodes: list, depth: int = 0, parent: Optional[str] = None):
-            for node in nodes:
-                package = node.get("package", {})
-                name = package.get("key") or package.get("package_name") or ""
-                version = package.get("version")
-                if _normalise(name) == target:
-                    yield depth, parent, version
-                for child in node.get("dependencies", []):
-                    yield from walk([child], depth + 1, name)
+        # If explicitly declared in any primary manifest, it is a direct dependency
+        if self.has_dependency(repo_path, component_name):
+            def find_ver(nodes):
+                for n in nodes:
+                    p = n.get("package") if isinstance(n.get("package"), dict) else n
+                    nm = p.get("key") or p.get("package_name") or ""
+                    if _normalise(nm) == target:
+                        return p.get("installed_version") or p.get("version")
+                    cv = find_ver(n.get("dependencies", []))
+                    if cv:
+                        return cv
+                return None
 
-        matches = list(walk(tree))
+            return DependencyLocality(
+                found=True,
+                is_transitive=False,
+                depth=1,
+                introduced_by=None,
+                raw_tree=result.stdout,
+                resolved_version=find_ver(tree),
+            )
+
+        project_coords = self.get_project_coordinates(repo_path)
+        norm_proj = _normalise(project_coords.get("name", ""))
+
+        roots = []
+        for node in tree:
+            pkg = node.get("package") if isinstance(node.get("package"), dict) else node
+            name = pkg.get("key") or pkg.get("package_name") or ""
+            if norm_proj and _normalise(name) == norm_proj:
+                roots.extend(node.get("dependencies", []))
+            else:
+                roots.append(node)
+
+        if len(tree) == 1 and not roots:
+            top = tree[0]
+            roots = top.get("dependencies", [])
+
+        def walk(nodes: list, depth: int = 1, direct_parent: Optional[str] = None):
+            for node in nodes:
+                package = node.get("package") if isinstance(node.get("package"), dict) else node
+                name = package.get("key") or package.get("package_name") or ""
+                version = package.get("installed_version") or package.get("version")
+                current_direct = name if depth == 1 else direct_parent
+                if _normalise(name) == target:
+                    yield depth, (None if depth == 1 else current_direct), version
+                for child in node.get("dependencies", []):
+                    yield from walk([child], depth + 1, current_direct)
+
+        matches = list(walk(roots))
         if not matches:
             return DependencyLocality(found=False, is_transitive=False, depth=-1, raw_tree=result.stdout)
 
-        raw_depth, parent, version = min(matches, key=lambda item: item[0])
-        depth = raw_depth + 1
+        min_depth, parent, version = min(matches, key=lambda item: item[0])
         return DependencyLocality(
             found=True,
-            is_transitive=depth > 1,
-            depth=depth,
-            introduced_by=parent if depth > 0 else None,
+            is_transitive=min_depth > 1,
+            depth=min_depth,
+            introduced_by=parent,
             raw_tree=result.stdout,
             resolved_version=version,
         )
@@ -464,13 +518,17 @@ class PythonEcosystem:
         return {}
 
     def has_dependency(self, repo_path: Path, component_name: str) -> bool:
-        try:
-            self._set_repo(repo_path)
-            manifest = Path(repo_path) / self._manifest_name(Path(repo_path))
-            content = _read(manifest)
-            return bool(re.search(rf"(^|\W){re.escape(component_name)}(\W|$)", content, re.IGNORECASE | re.MULTILINE))
-        except PythonManifestError:
-            return False
+        repo_path = Path(repo_path)
+        for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "setup.cfg"):
+            manifest = repo_path / name
+            if manifest.exists():
+                try:
+                    content = _read(manifest)
+                    if re.search(rf"(^|\W){re.escape(component_name)}(\W|$)", content, re.IGNORECASE | re.MULTILINE):
+                        return True
+                except Exception:
+                    pass
+        return False
 
 
 def _safe_env() -> dict:
