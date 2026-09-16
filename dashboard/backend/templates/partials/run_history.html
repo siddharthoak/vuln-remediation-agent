@@ -113,7 +113,7 @@
 
                 <p><small>Tracking ID: <code>{{ r.tracking_id }}</code>
                   {% if r.parent_tracking_id %} &nbsp;|&nbsp; Parent attempt: <code>{{ r.parent_tracking_id[:8] }}&hellip;</code>{% endif %}
-                  &nbsp;|&nbsp; Last updated: {{ r.updated_at[:16] if r.updated_at else "—" }}</small></p>
+                  &nbsp;|&nbsp; Last updated: {{ r.updated_at_local or (r.updated_at[:16].replace("T", " ") if r.updated_at else "—") }}</small></p>
 
                 {% if r.failure_log_excerpt %}
                   <p><strong>CI failure excerpt passed to retry prompt:</strong></p>

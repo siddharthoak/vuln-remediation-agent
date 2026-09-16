@@ -28,6 +28,7 @@ import urllib.request
 import zipfile
 from dataclasses import asdict
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "agents"))
@@ -61,6 +62,36 @@ app = FastAPI(title="OSS Remediation Agent Dashboard")
 BASE_DIR = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
+
+
+def _to_local_str(iso_str: str | None, tz_name: str | None = None) -> str:
+    """Convert an ISO-8601 UTC timestamp string to a formatted local time string.
+
+    Defaults to NIGHTLY_RUN_TIMEZONE (or 'Asia/Kolkata') if tz_name is not provided.
+    Returns format 'YYYY-MM-DD HH:MM'.
+    """
+    if not iso_str:
+        return ""
+    try:
+        target_tz_name = tz_name or os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
+        try:
+            tz = ZoneInfo(target_tz_name)
+        except (ZoneInfoNotFoundError, ValueError):
+            tz = datetime.now().astimezone().tzinfo or timezone.utc
+
+        s = str(iso_str).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
+    except Exception as e:
+        logger.warning("Failed to convert timestamp %r to local time: %s", iso_str, e)
+        return str(iso_str)[:16].replace("T", " ")
+
+
+templates.env.filters["localtime"] = _to_local_str
 
 TRACKING_PATH = Path(os.environ.get("TRACKING_STORE_PATH", "./data/tracking.json"))
 DATA_DIR = TRACKING_PATH.parent
@@ -294,6 +325,8 @@ def _records_as_dicts() -> list:
         d["total_tokens"] = prompt_tokens + completion_tokens
         d["status_icon"] = STATUS_ICONS.get(d["status"], "•")
         d["status_class"] = _status_class(d["status"])
+        d["created_at_local"] = _to_local_str(d.get("created_at"))
+        d["updated_at_local"] = _to_local_str(d.get("updated_at"))
 
         d["pr_state"] = None
         d["pr_badge_label"] = None
@@ -743,7 +776,7 @@ def _group_by_run(view: list) -> list:
     groups: dict = {}
     order: list = []
     for r in view:
-        minute = (r.get("created_at") or "")[:16]
+        minute = r.get("created_at_local") or _to_local_str(r.get("created_at"))
         key = (r.get("repo", ""), minute)
         if key not in groups:
             groups[key] = []
@@ -756,7 +789,7 @@ def _group_by_run(view: list) -> list:
         repo, minute = key
         result.append({
             "repo": repo,
-            "run_label": minute.replace("T", " ") if minute else "unknown time",
+            "run_label": minute if minute else "unknown time",
             "records": recs,
             "count": len(recs),
             "ok_count": sum(1 for r in recs if r["status_class"] == "ok"),

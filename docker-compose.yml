@@ -93,6 +93,8 @@ services:
       TRACKING_STORE_PATH: /data/tracking.json
       KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
+      TZ: "Asia/Kolkata"
+      NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
     ports:
       - "8501:8000"
     volumes:
