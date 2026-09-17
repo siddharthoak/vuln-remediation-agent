@@ -220,7 +220,11 @@ class MultiRepoChainCoordinator:
                                 except Exception:
                                     pass
 
-                    repo.create_branch(self._branch_name, skip_if_exists=True)
+                    repo.create_branch(
+                        self._branch_name,
+                        skip_if_exists=True,
+                        base_branch=self._base_branch,
+                    )
                     repo._repo.git.checkout(self._branch_name)
 
                     ecosystem = get_ecosystem(repo._local_path)

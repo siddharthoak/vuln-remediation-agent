@@ -605,7 +605,11 @@ def _do_fresh_scan():
     # Create the shared branch once before threads start
     with RepoOps() as init_repo:
         init_repo.clone(github_repo_url, github_pat)
-        branch_created = init_repo.create_branch(branch_name, skip_if_exists=True)
+        branch_created = init_repo.create_branch(
+            branch_name,
+            skip_if_exists=True,
+            base_branch=base_branch,
+        )
         if not branch_created:
             existing_open_pr = pr_client._find_open_pr(branch_name, base_branch)
             if existing_open_pr:
@@ -633,7 +637,7 @@ def _do_fresh_scan():
                     logger.warning("Could not delete stale remote branch: %s", del_err)
 
                 # Recreate branch from fresh base_branch
-                init_repo._repo.git.checkout(base_branch)
+                init_repo.checkout_base_branch(base_branch)
                 try:
                     init_repo._repo.git.pull('origin', base_branch)
                 except Exception:
@@ -643,7 +647,11 @@ def _do_fresh_scan():
                         init_repo._repo.git.branch('-D', branch_name)
                     except Exception:
                         pass
-                init_repo.create_branch(branch_name, skip_if_exists=False)
+                init_repo.create_branch(
+                    branch_name,
+                    skip_if_exists=False,
+                    base_branch=base_branch,
+                )
 
         # push the initial branch so workers can pull from it
         init_repo.push_branch(branch_name)

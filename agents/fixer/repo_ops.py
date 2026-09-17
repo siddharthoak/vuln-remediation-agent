@@ -324,6 +324,7 @@ class RepoOps:
         self._repo_url = remote_url
         logger.info("Local clone from %s to %s", source_path, self._local_path)
         self._repo = git.Repo.clone_from(source_path, self._local_path)
+        self.ensure_valid_head()
         # After a local clone, origin points to the source path — re-point to GitHub.
         authenticated_url = self._build_authenticated_url(remote_url, github_pat)
         self._repo.remotes.origin.set_url(authenticated_url)
@@ -356,6 +357,7 @@ class RepoOps:
                 self._repo.git.add(A=True)
                 if not self._repo.heads:
                     self._repo.index.commit("Initial commit from local repository archive")
+            self.ensure_valid_head()
             logger.info("Local clone complete: %s", self._local_path)
             return self._local_path
 
@@ -369,6 +371,7 @@ class RepoOps:
             self._local_path,
             env={"GIT_TERMINAL_PROMPT": "0"},
         )
+        self.ensure_valid_head()
         # Store PAT for subsequent pushes via a credential helper in the local config.
         # This avoids re-embedding the PAT at push time.
         self._configure_credential_helper(github_pat, repo_url)
@@ -376,7 +379,12 @@ class RepoOps:
         logger.info("Clone complete: %s", self._local_path)
         return self._local_path
 
-    def create_branch(self, branch_name: str, skip_if_exists: bool = True) -> bool:
+    def create_branch(
+        self,
+        branch_name: str,
+        skip_if_exists: bool = True,
+        base_branch: Optional[str] = None,
+    ) -> bool:
         """
         Create and check out `branch_name` off the current default branch.
 
@@ -388,6 +396,10 @@ class RepoOps:
         Returns True if the branch was newly created, False if it already existed.
         """
         self._require_repo()
+        if base_branch:
+            self.checkout_base_branch(base_branch)
+        else:
+            self.ensure_valid_head()
 
         has_origin = False
         try:
@@ -424,6 +436,59 @@ class RepoOps:
         new_branch.checkout()
         logger.info("Created and checked out branch: %s", branch_name)
         return True
+
+    def ensure_valid_head(self) -> str:
+        """Return HEAD's commit hash or fail with an actionable checkout error."""
+        self._require_repo()
+        try:
+            head = self._repo.git.rev_parse("--verify", "HEAD").strip()
+        except (git.exc.GitCommandError, ValueError) as exc:
+            raise RuntimeError(
+                "Repository checkout has no valid HEAD commit. "
+                "The clone may be empty, incomplete, or pointed at the wrong ref."
+            ) from exc
+        if not head:
+            raise RuntimeError(
+                "Repository checkout has no valid HEAD commit. "
+                "The clone may be empty, incomplete, or pointed at the wrong ref."
+            )
+        return head
+
+    def checkout_base_branch(self, base_branch: str) -> str:
+        """
+        Check out the requested base branch from origin before branch creation.
+
+        This prevents branch creation from depending on an unborn or stale HEAD in
+        a temporary clone.
+        """
+        self._require_repo()
+        if not base_branch:
+            raise ValueError("Base branch must not be empty.")
+
+        has_origin = "origin" in [remote.name for remote in self._repo.remotes]
+        if has_origin:
+            try:
+                self._repo.remotes.origin.fetch()
+                remote_ref = f"origin/{base_branch}"
+                if remote_ref not in {ref.name for ref in self._repo.remotes.origin.refs}:
+                    raise RuntimeError(
+                        f"Base branch '{base_branch}' was not found on origin."
+                    )
+                self._repo.git.checkout("-B", base_branch, remote_ref)
+            except (git.exc.GitCommandError, OSError) as exc:
+                raise RuntimeError(
+                    f"Could not check out base branch '{base_branch}' from origin."
+                ) from exc
+        else:
+            try:
+                self._repo.git.checkout(base_branch)
+            except git.exc.GitCommandError as exc:
+                raise RuntimeError(
+                    f"Repository has no origin and base branch '{base_branch}' "
+                    "could not be checked out."
+                ) from exc
+
+        return self.ensure_valid_head()
 
     def commit_changes(self, message: str, files: Optional[list] = None) -> str:
         """
