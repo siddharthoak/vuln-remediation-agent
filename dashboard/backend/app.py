@@ -51,6 +51,9 @@ from common.config import (  # noqa: E402
     resolve_repo_source,
     is_nightly_run_enabled,
     set_nightly_run_enabled,
+    get_nightly_run_time,
+    get_nightly_scan_max_wait_seconds,
+    set_nightly_schedule,
 )
 from common.github_auth import get_auth_mode  # noqa: E402
 from common.reset_ops import reset_repository_state  # noqa: E402
@@ -455,6 +458,9 @@ def _repo_config_context(notice: dict = None) -> dict:
             "is_github_app": auth_info["mode"] == "github_app",
             "app_id": auth_info.get("app_id"),
             "nightly_run_enabled": is_nightly_run_enabled(),
+            "nightly_run_time": get_nightly_run_time(),
+            "nightly_duration_hours": get_nightly_scan_max_wait_seconds() // 3600,
+            "nightly_timezone": os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata"),
         },
         "notice": notice,
     }
@@ -488,9 +494,17 @@ async def api_save_config(request: Request):
     form_data = urllib.parse.parse_qs(body.decode("utf-8", errors="ignore"))
     repo_val = form_data.get("repo", [""])[0].strip()
     pat_val = form_data.get("pat", [""])[0].strip()
+    run_time = form_data.get("nightly_run_time", [get_nightly_run_time()])[0].strip()
+    duration_value = form_data.get("nightly_duration_hours", [str(get_nightly_scan_max_wait_seconds() // 3600)])[0].strip()
 
     if not repo_val:
         ctx = _repo_config_context(notice={"type": "err", "message": "Repository cannot be empty."})
+        return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
+    try:
+        duration_hours = int(duration_value)
+        set_nightly_schedule(run_time, duration_hours)
+    except ValueError as exc:
+        ctx = _repo_config_context(notice={"type": "err", "message": str(exc)})
         return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
 
     # Check if multiple repos were supplied (e.g. Repo A, Repo B, Repo C)
@@ -727,7 +741,7 @@ async def api_toggle_night_mode(request: Request):
     set_nightly_run_enabled(new_state)
 
     if new_state:
-        msg = "Night Mode ENABLED: Agent scheduled to run once daily at 12:00 AM (Asia/Kolkata)."
+        msg = f"Night Mode ENABLED: Agent scheduled daily at {get_nightly_run_time()} ({os.environ.get('NIGHTLY_RUN_TIMEZONE', 'Asia/Kolkata')}) for up to {get_nightly_scan_max_wait_seconds() // 3600} hour(s)."
     else:
         msg = "Night Mode DISABLED: Agent switched to Immediate Execution mode!"
         # Attempt to dispatch immediate scan call to fixer server

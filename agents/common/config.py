@@ -356,6 +356,103 @@ def is_nightly_run_enabled() -> bool:
     return os.environ.get("NIGHTLY_RUN_ENABLED", "0") in ("1", "true", "True")
 
 
+def _read_config_value(key: str):
+    """Read a shared runtime setting from data/config.json, then env files."""
+    for p in CONFIG_JSON_CANDIDATES:
+        try:
+            if p.exists():
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if key in data:
+                    return data[key]
+        except Exception:
+            pass
+
+    env_key = {
+        "nightly_run_time": "NIGHTLY_RUN_TIME",
+        "nightly_scan_max_wait_seconds": "NIGHTLY_SCAN_MAX_WAIT_SECONDS",
+    }.get(key)
+    if env_key:
+        for p in ENV_FILE_CANDIDATES:
+            try:
+                if p.exists():
+                    for line in p.read_text(encoding="utf-8").splitlines():
+                        line = line.strip()
+                        if line.startswith(f"{env_key}="):
+                            return line.split("=", 1)[1].strip().strip('"').strip("'")
+            except Exception:
+                pass
+        return os.environ.get(env_key)
+    return None
+
+
+def get_nightly_run_time() -> str:
+    """Return the configured daily start time in HH:MM format."""
+    value = _read_config_value("nightly_run_time") or "00:00"
+    return str(value)
+
+
+def get_nightly_scan_max_wait_seconds() -> int:
+    """Return the configured maximum nightly execution window in seconds."""
+    value = _read_config_value("nightly_scan_max_wait_seconds")
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = 7200
+    return max(3600, min(seconds, 86400))
+
+
+def set_nightly_schedule(run_time: str, duration_hours: int) -> tuple[str, int]:
+    """Persist and export the daily start time and execution window."""
+    try:
+        hour, minute = (int(part) for part in run_time.split(":", 1))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("Start time must be in HH:MM format.") from exc
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError("Start time must be in HH:MM format.")
+    if not 1 <= duration_hours <= 24:
+        raise ValueError("Duration must be between 1 and 24 hours.")
+
+    normalized_time = f"{hour:02d}:{minute:02d}"
+    max_wait_seconds = duration_hours * 3600
+    for p in CONFIG_JSON_CANDIDATES:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data["nightly_run_time"] = normalized_time
+            data["nightly_scan_max_wait_seconds"] = max_wait_seconds
+            p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            break
+        except Exception as exc:
+            logger.warning("Could not write nightly schedule to %s: %s", p, exc)
+
+    for p in ENV_FILE_CANDIDATES:
+        try:
+            if p.exists():
+                content = p.read_text(encoding="utf-8")
+                values = {
+                    "NIGHTLY_RUN_TIME": normalized_time,
+                    "NIGHTLY_SCAN_MAX_WAIT_SECONDS": str(max_wait_seconds),
+                }
+                for env_key, env_value in values.items():
+                    if re.search(rf"^{env_key}=.*$", content, flags=re.MULTILINE):
+                        content = re.sub(rf"^{env_key}=.*$", f"{env_key}={env_value}", content, flags=re.MULTILINE)
+                    else:
+                        content += f"\n{env_key}={env_value}"
+                p.write_text(content, encoding="utf-8")
+                break
+        except Exception as exc:
+            logger.warning("Could not update nightly schedule in %s: %s", p, exc)
+
+    os.environ["NIGHTLY_RUN_TIME"] = normalized_time
+    os.environ["NIGHTLY_SCAN_MAX_WAIT_SECONDS"] = str(max_wait_seconds)
+    return normalized_time, max_wait_seconds
+
+
 def set_nightly_run_enabled(enabled: bool) -> bool:
     """Updates Night Mode toggle state across data/config.json, config/.env, and os.environ."""
     val_str = "1" if enabled else "0"
@@ -371,6 +468,8 @@ def set_nightly_run_enabled(enabled: bool) -> bool:
                 except Exception:
                     data = {}
             data["nightly_run_enabled"] = enabled
+            data["nightly_run_time"] = get_nightly_run_time()
+            data["nightly_scan_max_wait_seconds"] = get_nightly_scan_max_wait_seconds()
             p.write_text(json.dumps(data, indent=2), encoding="utf-8")
             break
         except Exception as exc:
@@ -460,6 +559,8 @@ def save_config(repo: str, pat: Optional[str] = None, repo_chain: Optional[list]
         "repo": clean_repo,
         "pat": clean_pat,
         "nightly_run_enabled": is_nightly_run_enabled(),
+        "nightly_run_time": get_nightly_run_time(),
+        "nightly_scan_max_wait_seconds": get_nightly_scan_max_wait_seconds(),
     }
     if chain:
         payload["repo_chain"] = chain
@@ -509,5 +610,4 @@ def save_config(repo: str, pat: Optional[str] = None, repo_chain: Optional[list]
 
     logger.info("Configuration updated: repo=%s chain=%s", clean_repo, chain)
     return clean_repo, clean_pat
-
 

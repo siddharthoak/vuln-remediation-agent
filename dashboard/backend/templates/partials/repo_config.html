@@ -69,6 +69,35 @@
       </div>
     {% endif %}
 
+    <div class="form-group">
+      <label class="form-label" for="nightly-run-time">Nightly Start Time</label>
+      <input
+        type="time"
+        id="nightly-run-time"
+        name="nightly_run_time"
+        class="form-input"
+        value="{{ config.nightly_run_time }}"
+        required
+      />
+      <small class="form-help">Daily start time in {{ config.nightly_timezone }}.</small>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="nightly-duration-hours">Nightly Run Duration (hours)</label>
+      <input
+        type="number"
+        id="nightly-duration-hours"
+        name="nightly_duration_hours"
+        class="form-input"
+        min="1"
+        max="24"
+        step="1"
+        value="{{ config.nightly_duration_hours }}"
+        required
+      />
+      <small class="form-help">Maximum time allowed for the nightly scan and remediation cycle.</small>
+    </div>
+
     <div class="btn-stack">
       <div class="btn-row">
         <button type="submit" class="btn btn-primary" title="Save repository chain and PAT configuration">
@@ -80,10 +109,10 @@
           hx-post="/api/toggle-night-mode"
           hx-target="#repo-config-card"
           hx-swap="outerHTML"
-          title="Toggle Night Mode (Run at 12:00 AM vs Run Immediately)"
+          title="Toggle Night Mode (scheduled vs immediate execution)"
         >
           {% if config.nightly_run_enabled %}
-            &#127769; Night Mode: ON (12:00 AM)
+            &#127769; Night Mode: ON ({{ config.nightly_run_time }})
           {% else %}
             &#9889; Night Mode: OFF (Run Immediately)
           {% endif %}

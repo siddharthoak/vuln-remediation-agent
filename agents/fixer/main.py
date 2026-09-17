@@ -43,7 +43,14 @@ from common.tracking_store import (
 from common.knowledge_store import make_knowledge_store
 from common.file_lock import FileLock
 from common.nightly_scheduler import sleep_until_next_run
-from common.config import get_target_repo, get_target_repos, get_github_pat, is_nightly_run_enabled
+from common.config import (
+    get_target_repo,
+    get_target_repos,
+    get_github_pat,
+    is_nightly_run_enabled,
+    get_nightly_run_time,
+    get_nightly_scan_max_wait_seconds,
+)
 from knowledge.main import KnowledgeAgent
 from classifier.classifier import Classifier, ClassifierResult
 
@@ -113,14 +120,14 @@ def _run_server():
 
 def _run_fixer_poller_loop(poller: ScanPoller) -> None:
     """Dynamically handles Night Mode vs Continuous polling loop."""
-    run_time = os.environ.get("NIGHTLY_RUN_TIME", "00:00")
     timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
-    max_wait = int(os.environ.get("NIGHTLY_SCAN_MAX_WAIT_SECONDS", "7200"))
 
     import time
     while True:
         try:
             if is_nightly_run_enabled():
+                run_time = get_nightly_run_time()
+                max_wait = get_nightly_scan_max_wait_seconds()
                 logger.info(
                     "Night Mode active: sleeping until %s (%s).",
                     run_time,
