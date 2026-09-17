@@ -419,8 +419,10 @@ class RepoOps:
                         logger.warning(message + " Skipping this remediation run.")
                         return False
                     raise RepoBranchExistsError(message)
-            except Exception as exc:
-                logger.debug("Could not fetch remote origin: %s", exc)
+            except (git.exc.GitCommandError, OSError) as exc:
+                raise RuntimeError(
+                    f"Could not fetch origin before creating branch '{branch_name}'."
+                ) from exc
 
         # Check local branches
         if branch_name in [h.name for h in self._repo.heads]:

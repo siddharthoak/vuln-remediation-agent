@@ -87,8 +87,9 @@ class MultiRepoChainCoordinator:
             try:
                 with RepoOps() as ops:
                     ops.clone(source_path, self._github_pat)
-                    ecosystem = get_ecosystem(ops._local_path)
-                    coords = ecosystem.get_project_coordinates(ops._local_path)
+                    repo_path = Path(ops._local_path)
+                    ecosystem = get_ecosystem(repo_path)
+                    coords = ecosystem.get_project_coordinates(repo_path)
                     node.group_id = coords.get("group_id", "")
                     node.artifact_id = coords.get("artifact_id", "")
                     node.version = coords.get("version", "")
@@ -103,10 +104,11 @@ class MultiRepoChainCoordinator:
             try:
                 with RepoOps() as ops:
                     ops.clone(node1.github_url, self._github_pat)
-                    ecosystem = get_ecosystem(ops._local_path)
+                    repo_path = Path(ops._local_path)
+                    ecosystem = get_ecosystem(repo_path)
                     for r2, node2 in nodes.items():
                         if r1 != r2 and node2.component_name:
-                            if ecosystem.has_dependency(ops._local_path, node2.component_name):
+                            if ecosystem.has_dependency(repo_path, node2.component_name):
                                 node1.depends_on.append(r2)
                                 logger.info("%s directly depends on %s (%s)", r1, r2, node2.component_name)
             except Exception as exc:
@@ -205,6 +207,7 @@ class MultiRepoChainCoordinator:
             try:
                 with RepoOps() as repo:
                     repo.clone(source_path, self._github_pat)
+                    repo_path = Path(repo._local_path)
                     if not is_local and pr_client:
                         open_pr = pr_client._find_open_pr(self._branch_name, self._base_branch)
                         if not open_pr:
@@ -227,25 +230,25 @@ class MultiRepoChainCoordinator:
                     )
                     repo._repo.git.checkout(self._branch_name)
 
-                    ecosystem = get_ecosystem(repo._local_path)
+                    ecosystem = get_ecosystem(repo_path)
                     files_changed = []
 
-                    manifest_file = get_manifest_file(repo._local_path)
+                    manifest_file = get_manifest_file(repo_path)
                     support_before = {
-                        name: (Path(repo._local_path) / name).read_bytes()
+                        name: (repo_path / name).read_bytes()
                         for name in (
                             "package-lock.json", "npm-shrinkwrap.json",
                             "yarn.lock", "pnpm-lock.yaml",
                             "constraints.txt", "poetry.lock", "Pipfile.lock",
                             "uv.lock", "pdm.lock",
                         )
-                        if (Path(repo._local_path) / name).exists()
+                        if (repo_path / name).exists()
                     }
-                    if is_root and ecosystem.has_dependency(repo._local_path, finding.component_name):
+                    if is_root and ecosystem.has_dependency(repo_path, finding.component_name):
                         # Root repo has the component directly or via BOM
                         try:
                             ecosystem.bump_direct_dependency(
-                                repo._local_path,
+                                repo_path,
                                 finding.component_name,
                                 finding.current_version,
                                 finding.recommended_version,
@@ -253,7 +256,7 @@ class MultiRepoChainCoordinator:
                             files_changed.append(manifest_file)
                         except (PomXMLError, PythonManifestError):
                             ecosystem.add_transitive_override(
-                                repo._local_path,
+                                repo_path,
                                 finding.component_name,
                                 finding.recommended_version,
                             )
@@ -263,32 +266,32 @@ class MultiRepoChainCoordinator:
                     else:
                         # Intermediate or Consumer repo: pin transitive override
                         ecosystem.add_transitive_override(
-                            repo._local_path,
+                            repo_path,
                             finding.component_name,
                             finding.recommended_version,
                         )
                         files_changed.append(manifest_file)
-                        if manifest_file == "pyproject.toml" and (Path(repo._local_path) / "constraints.txt").exists():
+                        if manifest_file == "pyproject.toml" and (repo_path / "constraints.txt").exists():
                             files_changed.append("constraints.txt")
 
                     # Verify build & tests
-                    compiled, compile_msg = ecosystem.verify_build(repo._local_path)
+                    compiled, compile_msg = ecosystem.verify_build(repo_path)
                     if not compiled:
                         logger.warning(
                             "%s: compile failed after pom update -- running CodeFixer fallback: %s",
                             repo_name, compile_msg[:200],
                         )
-                        fixer = CodeFixer(repo_path=repo._local_path)
+                        fixer = CodeFixer(repo_path=repo_path)
                         summary = fixer.run_retry_fix(
                             tracking_id=record.tracking_id,
                             tracking_store=self._tracking_store,
                         )
                         files_changed.extend(summary.files_changed)
                     else:
-                        ecosystem.verify_tests(repo._local_path)
+                        ecosystem.verify_tests(repo_path)
 
                     for name, before in support_before.items():
-                        path = Path(repo._local_path) / name
+                        path = repo_path / name
                         if path.exists() and path.read_bytes() != before:
                             files_changed.append(name)
                     for name in (
@@ -296,7 +299,7 @@ class MultiRepoChainCoordinator:
                         "pnpm-lock.yaml", "constraints.txt", "poetry.lock",
                         "Pipfile.lock", "uv.lock", "pdm.lock",
                     ):
-                        if name not in support_before and (Path(repo._local_path) / name).exists():
+                        if name not in support_before and (repo_path / name).exists():
                             files_changed.append(name)
                     files_changed = list(dict.fromkeys(files_changed))
                     if not files_changed:
