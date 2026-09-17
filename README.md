@@ -371,7 +371,8 @@ On the next run with the same `(component, from_major, to_major)`, the Fixer use
 | `CI_POLL_INTERVAL` | | `30` | Seconds between CI status checks |
 | `CI_TIMEOUT_SECONDS` | | `1800` | Max wait for CI (30 min) |
 | `SCAN_REPORT_PATH` | | `/reports` | Directory containing scanner JSON files |
-| `TRACKING_STORE_PATH` | | `/data/tracking.json` | State file path inside container |
+| `TRACKING_STORE_PATH` | | `./data/tracking.json` locally, `/data/tracking.json` in Docker | Shared tracking state file read by the dashboard |
+| `TRACKING_STORE_BACKEND` | | — | Set to `memory` only for isolated tests; otherwise the local file store is used automatically |
 | `FIXER_RETRY_URL` | | — | HTTP endpoint for retry invocation (set to `http://fixer-server:8080/retry` by the watcher service) |
 | `AUTO_FETCH_SCAN` | | `0` | Set to `1` on one-shot fixer runs to trigger + download the scan workflow before fixing (alternative to ScanPoller for manual use) |
 | `RETRY_TRACKING_ID` | | — | Set by Watcher for retry runs, or pass manually to the one-shot fixer |

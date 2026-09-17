@@ -12,7 +12,7 @@ What is UNCHANGED (verbatim):
   - TrackingRecord dataclass and all fields
   - TrackingStatus enum and full state machine
   - make_fresh_record() and make_retry_record() factory functions
-  - InMemoryTrackingStore (testing / local dev)
+  - InMemoryTrackingStore (explicit testing backend)
   - TrackingStoreProtocol
 """
 
@@ -23,6 +23,7 @@ import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Optional, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
@@ -403,15 +404,19 @@ def make_tracking_store():
 
     FIRESTORE_PROJECT set    → FirestoreTrackingStore  (production GCP)
     TRACKING_STORE_PATH set  → FileTrackingStore       (local Docker / dev)
-    Neither set              → InMemoryTrackingStore   (unit tests only)
+    TRACKING_STORE_BACKEND=memory → InMemoryTrackingStore (explicit tests)
+    Neither set              → FileTrackingStore       (local project default)
+
+    The local default must be persistent: the dashboard is a separate process
+    and reads the same data file after a one-shot fixer run.
     """
     if os.environ.get("FIRESTORE_PROJECT"):
         return FirestoreTrackingStore()
-    if os.environ.get("TRACKING_STORE_PATH"):
-        logger.info("Using FileTrackingStore at %s", os.environ["TRACKING_STORE_PATH"])
-        return FileTrackingStore()
-    logger.warning(
-        "No store configured — using InMemoryTrackingStore (state lost on container exit). "
-        "Set TRACKING_STORE_PATH to persist state across Docker runs."
-    )
-    return InMemoryTrackingStore()
+    if os.environ.get("TRACKING_STORE_BACKEND", "").lower() == "memory":
+        logger.info("Using InMemoryTrackingStore (explicitly requested).")
+        return InMemoryTrackingStore()
+
+    default_path = Path(__file__).resolve().parents[2] / "data" / "tracking.json"
+    path = os.environ.get("TRACKING_STORE_PATH") or str(default_path)
+    logger.info("Using FileTrackingStore at %s", path)
+    return FileTrackingStore(path)

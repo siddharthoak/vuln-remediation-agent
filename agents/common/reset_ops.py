@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from common.config import get_target_repo, get_target_repos, get_github_pat
+from common.config import get_target_repo, get_target_repos, get_github_pat, set_scan_requested
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +48,11 @@ def _github_api_get(url: str, headers: dict) -> list:
     return results
 
 
-def reset_repository_state(
+def _reset_single_repository_state(
     repo: Optional[str] = None,
     pat: Optional[str] = None,
     keep_kb: bool = True,
+    _clear_local: bool = True,
 ) -> dict:
     """
     Performs full environment reset for the target repo:
@@ -165,6 +166,11 @@ def reset_repository_state(
             summary["errors"].append(f"GitHub API query failed for {target_repo}: {e}")
     else:
         summary["errors"].append("No GitHub PAT provided; skipped GitHub remote cleanup.")
+
+    # Multi-repository resets perform this shared cleanup exactly once, after
+    # the GitHub cleanup for the first repository.
+    if not _clear_local:
+        return summary
 
     # 2. Reset tracking.json (checks repo root first, then container / env paths)
     tracking_candidates = [
@@ -295,3 +301,49 @@ def reset_repository_state(
 
     return summary
 
+
+def reset_repository_state(
+    repo: Optional[str] = None,
+    pat: Optional[str] = None,
+    keep_kb: bool = True,
+) -> dict:
+    """Reset one repository, or every configured repository when ``repo`` is omitted.
+
+    GitHub cleanup is performed per repository. Tracking, checkpoints, reports,
+    and uploads/downloads are shared local state and are therefore cleared once.
+    The aggregate retains the legacy summary keys for callers that reset one
+    repository at a time.
+    """
+    set_scan_requested(False)
+    targets = [repo] if repo else get_target_repos()
+    targets = [r for r in targets if r]
+    if not targets:
+        return _reset_single_repository_state(repo=repo, pat=pat, keep_kb=keep_kb)
+
+    summaries = []
+    for index, target in enumerate(targets):
+        target_pat = pat if repo else get_github_pat(target)
+        summaries.append(
+            _reset_single_repository_state(
+                repo=target,
+                pat=target_pat,
+                keep_kb=keep_kb,
+                _clear_local=(index == 0),
+            )
+        )
+
+    # Preserve the existing response shape while aggregating per-repository
+    # GitHub results for the dashboard and script callers.
+    aggregate = dict(summaries[0])
+    aggregate["repo"] = targets[0]
+    aggregate["repos"] = targets
+    for key in ("prs_closed", "branches_deleted", "triage_issues_closed", "reports_deleted", "errors"):
+        aggregate[key] = [
+            item
+            for summary in summaries
+            for item in summary.get(key, [])
+        ]
+    aggregate["tracking_cleared"] = any(s["tracking_cleared"] for s in summaries)
+    aggregate["checkpoint_cleared"] = any(s["checkpoint_cleared"] for s in summaries)
+    aggregate["kb_preserved"] = all(s["kb_preserved"] for s in summaries)
+    return aggregate

@@ -51,6 +51,7 @@ from common.config import (  # noqa: E402
     resolve_repo_source,
     is_nightly_run_enabled,
     set_nightly_run_enabled,
+    set_scan_requested,
     get_nightly_run_time,
     get_nightly_scan_max_wait_seconds,
     set_nightly_schedule,
@@ -665,23 +666,29 @@ def download_remediated_zip(repo_name: str):
 
 @app.post("/api/reset")
 async def api_reset(request: Request):
-    repo = get_target_repo()
-    pat = get_github_pat(repo=repo)
+    repos = get_target_repos()
+    repo = repos[0] if repos else get_target_repo()
 
     if not repo:
         ctx = _repo_config_context(notice={"type": "err", "message": "No target repository configured."})
         return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
 
     try:
-        res = reset_repository_state(repo=repo, pat=pat, keep_kb=True)
+        res = reset_repository_state(
+            repo=None if repos else repo,
+            keep_kb=True,
+        )
         _PR_STATE_CACHE.clear()
 
-        msg_parts = [f"Reset complete for {repo}!"]
+        reset_repos = res.get("repos", repos or [repo])
+        msg_parts = [f"Reset complete for all configured repositories: {', '.join(reset_repos)}."]
         if res["prs_closed"]:
             msg_parts.append(f"Closed PR(s): {', '.join(map(str, res['prs_closed']))}.")
         if res["branches_deleted"]:
             msg_parts.append(f"Deleted branch(es): {', '.join(res['branches_deleted'])}.")
-        msg_parts.append("Tracking state & scan reports cleared.")
+        if res["triage_issues_closed"]:
+            msg_parts.append(f"Closed triage issue(s): {', '.join(map(str, res['triage_issues_closed']))}.")
+        msg_parts.append("Shared tracking state, checkpoints, and scan reports cleared once.")
         msg_parts.append("Knowledge Base (kb.json) preserved!")
         if res["errors"]:
             msg_parts.append(f"Warnings: {'; '.join(res['errors'])}")
@@ -718,17 +725,22 @@ async def api_trigger_scan(request: Request):
         method="POST",
     )
     try:
+        set_scan_requested(True)
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status in (200, 204):
+                set_scan_requested(False)
                 msg = f"Dispatched security-scan.yml on GitHub Actions for '{repo}' (ref: main)! ScanPoller will detect it once complete."
                 ctx = _repo_config_context(notice={"type": "ok", "message": msg})
             else:
+                set_scan_requested(False)
                 ctx = _repo_config_context(notice={"type": "warn", "message": f"Workflow dispatch returned status {resp.status}."})
     except urllib.error.HTTPError as he:
+        set_scan_requested(False)
         err_body = he.read().decode("utf-8", errors="ignore")
         msg = f"Failed to trigger scan workflow (HTTP {he.code}): {he.reason}. {err_body}"
         ctx = _repo_config_context(notice={"type": "err", "message": msg})
     except Exception as exc:
+        set_scan_requested(False)
         ctx = _repo_config_context(notice={"type": "err", "message": f"Failed to trigger workflow: {exc}"})
 
     return templates.TemplateResponse(request, "partials/repo_config.html", ctx)

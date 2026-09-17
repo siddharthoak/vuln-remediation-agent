@@ -50,6 +50,7 @@ from common.config import (
     is_nightly_run_enabled,
     get_nightly_run_time,
     get_nightly_scan_max_wait_seconds,
+    set_scan_requested,
 )
 from knowledge.main import KnowledgeAgent
 from classifier.classifier import Classifier, ClassifierResult
@@ -139,6 +140,7 @@ def _run_fixer_poller_loop(poller: ScanPoller) -> None:
                     check_cancel_fn=lambda: not is_nightly_run_enabled(),
                 )
                 if completed:
+                    set_scan_requested(True)
                     poller.run_nightly(max_wait_seconds=max_wait)
                 else:
                     logger.info("Night Mode toggled OFF: waking up and running scan immediately.")
@@ -480,10 +482,26 @@ def _do_fresh_scan():
     # direct-dependency fallback.
     ecosystem = get_ecosystem(source_path)
     locality_failures = {}
+    multi_repo_chain = len(target_repos) > 1
     for finding in findings:
         try:
             locality = ecosystem.resolve_locality(source_path, finding.component_name)
         except EcosystemError as exc:
+            if multi_repo_chain:
+                # The scanner already resolved the dependency graph across the
+                # configured repositories. A local dependency-tree failure must
+                # not suppress the chain coordinator or turn the finding into
+                # manual triage before each repository can be inspected.
+                finding.is_transitive = True
+                finding.introduced_by = None
+                finding.transitive_depth = len(target_repos)
+                logger.warning(
+                    "Locality resolution failed for %s in a multi-repository chain; "
+                    "continuing with scanner-confirmed chain metadata: %s",
+                    finding.component_name,
+                    exc,
+                )
+                continue
             rationale = (
                 f"Could not resolve dependency locality for {finding.component_name}: "
                 f"{str(exc)[:1000]}. Manual triage required."

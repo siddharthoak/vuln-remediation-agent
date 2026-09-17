@@ -21,7 +21,7 @@ from typing import Callable, Optional
 
 import requests
 
-from common.config import get_target_repo, get_github_pat
+from common.config import get_target_repo, get_github_pat, is_scan_requested, set_scan_requested
 
 logger = logging.getLogger(__name__)
 
@@ -193,13 +193,14 @@ class ScanPoller:
 
         # If auto-dispatch is enabled, or if no reports exist yet:
         # Check if a scan is running; if not, trigger a new scan automatically!
-        if (self._auto_dispatch or not self.has_reports()) and not self._has_dispatched_initial:
+        if is_scan_requested() and (self._auto_dispatch or not self.has_reports()) and not self._has_dispatched_initial:
             if not self.is_scan_running():
                 logger.info(
                     "ScanPoller: auto_dispatch=%s, has_reports=%s — automatically dispatching %s",
                     self._auto_dispatch, self.has_reports(), WORKFLOW_FILE,
                 )
-                self.dispatch_scan()
+                if self.dispatch_scan():
+                    set_scan_requested(False)
             else:
                 logger.info("ScanPoller: workflow %s is already in progress/queued.", WORKFLOW_FILE)
             self._has_dispatched_initial = True

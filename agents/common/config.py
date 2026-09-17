@@ -401,6 +401,36 @@ def get_nightly_scan_max_wait_seconds() -> int:
     return max(3600, min(seconds, 86400))
 
 
+def is_scan_requested() -> bool:
+    """Return whether the next scan cycle is allowed to dispatch a workflow."""
+    value = _read_config_value("scan_requested")
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes")
+
+
+def set_scan_requested(requested: bool) -> bool:
+    """Persist the user's explicit request to start a scan."""
+    for p in CONFIG_JSON_CANDIDATES:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+            if p.exists():
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+            data["scan_requested"] = requested
+            p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            break
+        except Exception as exc:
+            logger.warning("Could not write scan_requested to %s: %s", p, exc)
+    os.environ["SCAN_REQUESTED"] = "1" if requested else "0"
+    return requested
+
+
 def set_nightly_schedule(run_time: str, duration_hours: int) -> tuple[str, int]:
     """Persist and export the daily start time and execution window."""
     try:
@@ -561,6 +591,7 @@ def save_config(repo: str, pat: Optional[str] = None, repo_chain: Optional[list]
         "nightly_run_enabled": is_nightly_run_enabled(),
         "nightly_run_time": get_nightly_run_time(),
         "nightly_scan_max_wait_seconds": get_nightly_scan_max_wait_seconds(),
+        "scan_requested": is_scan_requested(),
     }
     if chain:
         payload["repo_chain"] = chain
@@ -610,4 +641,3 @@ def save_config(repo: str, pat: Optional[str] = None, repo_chain: Optional[list]
 
     logger.info("Configuration updated: repo=%s chain=%s", clean_repo, chain)
     return clean_repo, clean_pat
-
