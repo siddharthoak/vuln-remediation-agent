@@ -30,6 +30,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
+from typing import Optional, Dict, Any, List
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "agents"))
 
@@ -103,10 +104,40 @@ DATA_DIR = TRACKING_PATH.parent
 CHECKPOINT_PATH = DATA_DIR / "scan_poll_checkpoint.json"
 SCAN_DIR = Path(os.environ.get("SCAN_REPORT_PATH", "./scan-reports"))
 
+
+def _resolve_report_file(label: str) -> Optional[Path]:
+    """Locate a scanner report JSON file whether placed directly in SCAN_DIR or a nested subfolder."""
+    if label == "Trivy":
+        candidates = [SCAN_DIR / "trivy-report.json", SCAN_DIR / "trivy" / "trivy-report.json"]
+    elif label == "Grype":
+        candidates = [SCAN_DIR / "grype-report.json", SCAN_DIR / "grype" / "grype-report.json"]
+    elif label == "OWASP":
+        candidates = [
+            SCAN_DIR / "dependency-check-report.json",
+            SCAN_DIR / "dependency-check-report" / "dependency-check-report.json",
+        ]
+    else:
+        candidates = []
+    for c in candidates:
+        if c.exists():
+            return c
+    target_names = {
+        "Trivy": "trivy-report.json",
+        "Grype": "grype-report.json",
+        "OWASP": "dependency-check-report.json",
+    }
+    target = target_names.get(label)
+    if target and SCAN_DIR.exists():
+        found = list(SCAN_DIR.rglob(target))
+        if found:
+            return found[0]
+    return candidates[0] if candidates else None
+
+
 REPORT_FILES = {
     "Trivy": SCAN_DIR / "trivy-report.json",
     "Grype": SCAN_DIR / "grype-report.json",
-    "OWASP": SCAN_DIR / "dependency-check-report" / "dependency-check-report.json",
+    "OWASP": SCAN_DIR / "dependency-check-report.json",
 }
 
 STATUS_ICONS = {
@@ -350,19 +381,27 @@ def _fixer_active() -> bool:
 
 def _scan_finding_count() -> int:
     count = 0
-    trivy = REPORT_FILES.get("Trivy")
+    trivy = _resolve_report_file("Trivy")
     if trivy and trivy.exists():
         try:
-            data = json.loads(trivy.read_text())
+            data = json.loads(trivy.read_text(encoding="utf-8"))
             for result in data.get("Results", []):
                 count += len(result.get("Vulnerabilities") or [])
         except Exception:
             pass
-    grype = REPORT_FILES.get("Grype")
+    grype = _resolve_report_file("Grype")
     if grype and grype.exists():
         try:
-            data = json.loads(grype.read_text())
+            data = json.loads(grype.read_text(encoding="utf-8"))
             count = max(count, len(data.get("matches", [])))
+        except Exception:
+            pass
+    owasp = _resolve_report_file("OWASP")
+    if owasp and owasp.exists():
+        try:
+            data = json.loads(owasp.read_text(encoding="utf-8"))
+            owasp_count = sum(len(dep.get("vulnerabilities", [])) for dep in data.get("dependencies", []))
+            count = max(count, owasp_count)
         except Exception:
             pass
     return count
@@ -459,8 +498,9 @@ def _sidebar_status() -> dict:
         checkpoint = {"age_seconds": age_s, "last_run_id": last_run_id, "stale": age_s >= 120}
 
     reports = {}
-    for label, path in REPORT_FILES.items():
-        if path.exists():
+    for label in ["Trivy", "Grype", "OWASP"]:
+        path = _resolve_report_file(label)
+        if path and path.exists():
             mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
             age_m = (datetime.now(tz=timezone.utc) - mtime).total_seconds() / 60
             reports[label] = {"present": True, "age_minutes": round(age_m)}
