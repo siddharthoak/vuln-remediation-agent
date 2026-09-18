@@ -21,6 +21,7 @@
 5. [End-to-End System Architecture](#5-end-to-end-system-architecture)
    - [High-Level Architectural Diagram](#high-level-architectural-diagram)
    - [Service Topography in Podman / Docker Compose](#service-topography-in-podman--docker-compose)
+   - [Dashboard Controls, Buttons & Live Views](#dashboard-controls-buttons--live-views)
 6. [Repository & Component Layout](#6-repository--component-layout)
 7. [The Five-Stage Remediation Pipeline](#7-the-five-stage-remediation-pipeline)
    - [Stage 1: Ingestion & Scan Polling](#stage-1-ingestion--scan-polling)
@@ -351,6 +352,103 @@ The application is fully containerized in `docker-compose.yml` into three always
    - Read-only bind-mount of `/data` and `/reports`—observes pipeline state without interfering with agents.
 4. **`fixer` (Manual Profile):**
    - Defined under profile `manual`. Allows running one-shot fresh scans (`podman compose --profile manual run --rm fixer`) or targeted tracking retries.
+
+### Dashboard Controls, Buttons & Live Views
+
+The dashboard is a server-rendered FastAPI application using Jinja2 templates and HTMX.
+Buttons do not run browser-side remediation logic. Each button sends an HTTP request to
+the dashboard, the dashboard updates shared configuration or dispatches an agent action,
+and the returned HTML fragment replaces the relevant card. This means the dashboard is
+an operator control plane and observation surface; the `fixer-server` and `watcher`
+remain responsible for the actual background work.
+
+#### Target Repository card
+
+| Control | Request | Detailed behavior |
+| :--- | :--- | :--- |
+| **Repository / Chain input** | Form field | Accepts one repository or multiple repositories separated by commas, semicolons, or newlines. Names are normalized, duplicates are removed from uploaded chains, and a multi-repository chain is stored in the configured order. The multi-repository coordinator later resolves the dependency graph and processes repositories bottom-up rather than blindly using the text order. |
+| **GitHub PAT field** | Form field | Supplies or replaces the GitHub credential when a GitHub App is not configured. When a GitHub App is active, leaving this field empty preserves App-based authentication; stored PAT values are masked in the UI. |
+| **Nightly Start Time** | Form field | Sets the daily `HH:MM` start time interpreted in `NIGHTLY_RUN_TIMEZONE` (default `Asia/Kolkata`). The value is validated before it is persisted. |
+| **Nightly Run Duration** | Form field | Sets the maximum scan-wait window for a scheduled cycle, from 1 to 24 hours. It is stored as seconds and applies to the scan poller's bounded nightly wait; it is not a guarantee that all remediation work will finish within that period. |
+| **Save & Switch** | `POST /api/config` | Validates and persists the repository chain, optional PAT, start time, and duration. It refreshes the dashboard configuration card and clears cached GitHub PR state. Saving a repository change is not the same as triggering a scan; the operator must use **Trigger Scan** or wait for the next scheduled cycle. |
+| **Night Mode: ON / OFF** | `POST /api/toggle-night-mode` | Toggles the shared `nightly_run_enabled` flag. ON places the fixer and watcher into scheduled execution; OFF returns them to immediate/continuous execution. When switched OFF, the dashboard also attempts to dispatch an immediate fixer scan so a sleeping system can wake without waiting for the former schedule. |
+| **Trigger Scan** | `POST /api/trigger-scan` | Calls GitHub Actions `security-scan.yml` with `ref: main`. It does not perform the scan inside the dashboard and does not wait for the workflow to finish. Once GitHub completes the workflow, `ScanPoller` discovers the completed run, downloads the `vulnerability-reports` artifact, and starts the remediation pipeline. |
+| **Reset** | `POST /api/reset` | Requires confirmation because it is destructive to operational state. For every configured repository it closes agent remediation PRs and triage issues, deletes remote `fix/*` branches, clears tracking/checkpoint/report state, and preserves the Knowledge Base (`data/kb.json`). It does not delete learned migration patterns. |
+
+The main content area contains four live views:
+
+| View | Purpose and refresh behavior |
+| :--- | :--- |
+| **Run History** | Groups tracking records by repository and scan-trigger minute, then shows finding, old/new versions, locality, classifier bucket, status, PR, token usage, and elapsed resolution time. Filters can narrow by status, component, repository, or locality. The view refreshes approximately every 30 seconds. |
+| **Retry Lineage** | Shows the parent fresh attempt and child `RETRY_REQUESTED` attempts for a selected PR, including attempt numbers and failure excerpts. This explains why a corrective commit was created and whether the retry budget is being consumed. |
+| **Metrics** | Presents aggregate counts and timing/token measurements derived from tracking records. It is empty until the system has produced run data and refreshes approximately every 30 seconds. |
+| **Knowledge Base** | Lists learned, playbook, and knowledge-agent entries. Entries can be filtered by source and refresh approximately every 60 seconds. A `tier1_learned` entry is only created after a remediation PR reaches `CI_PASSED`. |
+
+#### What the operator sees after a button press
+
+The UI returns an inline notice rather than redirecting to a separate page. A successful
+configuration save reports the active repository or chain; a scan dispatch reports that
+GitHub accepted the workflow request; a reset reports the repositories, PRs, branches,
+and issues affected; and validation or GitHub errors are shown as an error notice. A
+successful button response therefore means that the requested control-plane action was
+accepted, not that the complete vulnerability remediation has already finished. Progress
+must be followed in Run History, GitHub Actions, the PR, or service logs.
+
+### Detailed Runtime Sequence: From Operator Action to Verified PR
+
+The complete process is asynchronous. The dashboard starts an action, GitHub Actions
+produces scan evidence, and the long-running agents continue independently. The normal
+sequence is:
+
+1. **Configure the target.** The operator enters one repository or a chain, credentials,
+   and optional schedule, then selects **Save & Switch**. The dashboard persists shared
+   settings in `data/config.json` (and updates the configured environment file when
+   present). No vulnerability scan is started by this step.
+2. **Start or wait for scanning.** The operator selects **Trigger Scan**, or Night Mode
+   reaches its configured time. GitHub dispatches `security-scan.yml` on `main`. The
+   workflow runs the configured scanners and uploads the `vulnerability-reports`
+   artifact. The dashboard's scan state can show that work is active, but it does not
+   own the GitHub workflow.
+3. **Detect exactly one completed run.** The fixer `ScanPoller` checks workflow runs at
+   `SCAN_POLL_INTERVAL` (normally 60 seconds). It ignores queued/in-progress runs,
+   skips unsuccessful conclusions, downloads only a run newer than
+   `data/scan_poll_checkpoint.json`, and records the processed run ID. The checkpoint
+   prevents a service restart or duplicate poll from reprocessing the same artifact.
+4. **Parse and normalize findings.** The report client extracts Trivy, Grype, and OWASP
+   Dependency-Check JSON, deduplicates matching component/version pairs, chooses the
+   highest severity, and selects the best available safe version. Invalid or unsupported
+   report data is surfaced as an error rather than silently becoming a successful run.
+5. **Resolve dependency locality.** The fixer clones the repository and determines
+   whether each finding is direct or transitive. Maven uses `dependency:tree`; npm and
+   Python use their ecosystem-specific dependency commands. Parent-first remediation is
+   attempted where supported, and unsafe deep transitive findings are routed to triage.
+6. **Hydrate and select migration knowledge.** Missing knowledge can be fetched from
+   OSV.dev and GitHub release information. The Knowledge Store then selects the most
+   specific available entry, preferring proven Tier 1 patterns, then human-authored
+   Tier 2 playbooks, then unverified knowledge-agent output.
+7. **Classify each finding.** The pure-Python classifier assigns bucket 1–4. Bucket 1
+   (no safe version) and bucket 4 (risky major/complex or deep transitive change) open
+   triage issues without invoking the LLM. Buckets 2 and 3 continue into remediation.
+8. **Create isolated fix work.** Bucket 2/3 findings are processed in bounded parallel
+   workers. Each worker uses a deterministic branch/record identity, updates the
+   manifest through an ecosystem parser, and records `CREATED` before making further
+   progress.
+9. **Use the fast path first.** The updated manifest is compiled and tested. If the
+   dependency bump alone succeeds, the LLM is skipped. If it fails, the LLM receives
+   compiler output and knowledge context and uses only sandboxed grep/read/exact-edit/
+   build tools for a bounded correction loop.
+10. **Review and publish.** Tests, allowed-file checks, expected manifest-version checks,
+    and deterministic diff review run before commit. A valid change is pushed to the
+    remediation branch and an idempotent GitHub PR is opened. The tracking record moves
+    through `PR_OPENED` and `CI_PENDING`.
+11. **Watch the PR.** The watcher periodically finds open `fix/*` PRs, waits for GitHub
+    Actions checks, and does not modify source code itself. A pass changes records to
+    `CI_PASSED` and invokes PatternLearner. A failure is sent to RetryGate, which either
+    creates a bounded retry request or marks the attempt exhausted and escalates it.
+12. **Learn or escalate.** A green PR produces a Tier 1 Knowledge Base entry from the
+    successful diff. A failed or unsafe attempt remains visible in the tracking store and
+    receives a triage/escalation path. Human review and merge are always required; the
+    system never merges the PR automatically.
 
 ---
 
@@ -698,9 +796,97 @@ $$\text{Repo C (Upstream Core)} \longrightarrow \text{Repo B (Internal Service)}
 
 ### Night Mode Scheduled Execution
 Running LLMs and build pipelines during peak hours can exhaust API rate limits or consume expensive CI runner minutes.
-- **`is_nightly_run_enabled()`:** Reads the night mode toggle from `data/config.json` or `.env`.
-- **`sleep_until_next_run()` (`agents/common/nightly_scheduler.py`):** Calculates the exact duration until the configured run time (default: `00:00` in `Asia/Kolkata` timezone).
-- Wakes up dynamically if the user disables Night Mode from the Dashboard UI, triggering immediate remediation.
+
+Night Mode is a shared runtime mode used independently by both long-running services:
+the fixer controls scan discovery and execution, while the watcher controls CI/PR
+observation. The mode does not pause an already-running build, LLM call, GitHub workflow,
+or CI job. It controls when the next daemon cycle is allowed to begin.
+
+#### Configuration and persistence
+
+- **`is_nightly_run_enabled()`:** Reads the toggle from `data/config.json`, then the
+  configured environment file, then the process environment. The dashboard writes the
+  selected value back to shared configuration so the daemon processes observe the same
+  state.
+- **`get_nightly_run_time()`:** Reads the daily `HH:MM` start time, defaulting to
+  `00:00`.
+- **`get_nightly_scan_max_wait_seconds()`:** Converts the dashboard duration from hours
+  to a bounded scan window of 3,600–86,400 seconds. This is the maximum time the
+  nightly `ScanPoller.run_nightly()` waits for a completed scan report.
+- **`NIGHTLY_RUN_TIMEZONE`:** Interprets the configured time as an IANA timezone, default
+  `Asia/Kolkata`. Invalid timezone names or invalid `HH:MM` values are reported as
+  configuration errors.
+
+#### Sleep state and wake-up behavior
+
+When Night Mode is enabled, each daemon calculates the next occurrence of the configured
+time. If the configured time has already passed today, the next occurrence is tomorrow;
+the sleep is therefore a daily schedule, not a fixed number of hours from the moment the
+toggle was enabled.
+
+`sleep_until_next_run()` does not call one long, uninterruptible `sleep()`. It checks the
+shared mode flag about every five seconds:
+
+```text
+Night Mode ON
+    |
+    v
+Calculate next HH:MM in configured timezone
+    |
+    v
+SLEEPING_UNTIL_SCHEDULE
+    |  every ~5 seconds: check whether Night Mode is still ON
+    |
+    +-- disabled --> return False --> leave sleep immediately
+    |
+    +-- scheduled time reached --> return True --> start scheduled cycle
+```
+
+This sleep state means the daemon is alive but intentionally not dispatching a new scan
+or watcher cycle. It is not a crashed process, and it does not terminate containers.
+The dashboard may continue to show the last known checkpoint or service health while the
+daemon sleeps; that timestamp should not be interpreted as a newly completed scan.
+Service logs are the authoritative source for the exact sleep/wake message.
+
+#### Scheduled fixer cycle
+
+At the scheduled time, the fixer:
+
+1. Calls `ScanPoller.run_nightly(max_wait_seconds=...)`.
+2. Polls GitHub for a completed `security-scan.yml` run.
+3. Dispatches the workflow when a scan has been explicitly requested or when automatic
+   dispatch is enabled and no report is available.
+4. Waits only until the configured maximum window. If no completed report arrives before
+   the deadline, it logs an error and ends that nightly scan window; it does not pretend
+   that remediation succeeded.
+5. When a new artifact arrives, invokes the normal fresh-scan pipeline. The schedule
+   governs scan discovery; remediation, PR creation, and CI verification may continue
+   asynchronously after the scan window ends.
+
+#### Scheduled watcher cycle
+
+At the same scheduled time, the watcher wakes and runs one PR/CI cycle. It checks open
+remediation PRs, waits for their CI result within `CI_TIMEOUT_SECONDS`, learns from
+green PRs, or sends failures through RetryGate. After that cycle completes, it returns
+to the next daily sleep. The watcher's schedule therefore affects observation cadence,
+not the lifetime of an already-open PR.
+
+#### Disabling Night Mode while sleeping
+
+When the operator presses **Night Mode: ON** and changes it to OFF:
+
+1. The dashboard persists `nightly_run_enabled=false` and updates the UI to
+   **Night Mode: OFF (Run Immediately)**.
+2. The five-second scheduler check detects the change and cancels the pending sleep.
+3. The fixer leaves scheduled mode and polls immediately; the dashboard also attempts
+   `POST /scan` to the fixer server so an explicit scan can start without waiting for a
+   normal poll interval.
+4. The watcher runs its normal immediate cycle and then sleeps for
+   `WATCHER_SLEEP_SECONDS` between cycles.
+
+If the scheduled cycle has already started, toggling OFF does not kill that in-progress
+cycle. It changes the next scheduling decision; the current GitHub scan, local build,
+or retry continues under its own timeout and error handling.
 
 ### Clean-Slate Environment Reset with Knowledge Preservation
 During testing and local verification, engineers need to reset test repositories back to a clean state.
