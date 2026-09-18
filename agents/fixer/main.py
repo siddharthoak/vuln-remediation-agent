@@ -42,7 +42,13 @@ from common.tracking_store import (
 )
 from common.knowledge_store import make_knowledge_store
 from common.file_lock import FileLock
-from common.nightly_scheduler import sleep_until_next_run
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from common.nightly_scheduler import (
+    get_active_window_status,
+    sleep_until_active_window,
+    sleep_until_next_run,
+)
 from common.config import (
     get_target_repo,
     get_target_repos,
@@ -120,32 +126,67 @@ def _run_server():
 
 
 def _run_fixer_poller_loop(poller: ScanPoller) -> None:
-    """Dynamically handles Night Mode vs Continuous polling loop."""
+    """Dynamically handles Night Mode active window vs Continuous polling loop."""
     timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
+    last_window_date = None
 
     import time
     while True:
         try:
             if is_nightly_run_enabled():
                 run_time = get_nightly_run_time()
-                max_wait = get_nightly_scan_max_wait_seconds()
-                logger.info(
-                    "Night Mode active: sleeping until %s (%s).",
-                    run_time,
-                    timezone_name,
+                duration_seconds = get_nightly_scan_max_wait_seconds()
+
+                is_active, remaining_seconds, seconds_until_next = get_active_window_status(
+                    run_time=run_time,
+                    duration_seconds=duration_seconds,
+                    timezone_name=timezone_name,
                 )
-                completed = sleep_until_next_run(
-                    run_time,
-                    timezone_name,
-                    check_cancel_fn=lambda: not is_nightly_run_enabled(),
-                )
-                if completed:
+
+                if not is_active:
+                    logger.info(
+                        "Night Mode: outside active window. Sleeping until %s %s (%.1f hours).",
+                        timezone_name,
+                        run_time,
+                        seconds_until_next / 3600.0,
+                    )
+                    became_active = sleep_until_active_window(
+                        timezone_name=timezone_name,
+                        check_cancel_fn=lambda: not is_nightly_run_enabled(),
+                    )
+                    if not became_active:
+                        logger.info("Night Mode toggled OFF: waking up and running scan immediately.")
+                        poller.poll_once()
+                        continue
+                    # Recompute window status upon waking
+                    is_active, remaining_seconds, _ = get_active_window_status(
+                        run_time=get_nightly_run_time(),
+                        duration_seconds=get_nightly_scan_max_wait_seconds(),
+                        timezone_name=timezone_name,
+                    )
+
+                # Active window is in progress
+                current_date = datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
+                if last_window_date != current_date:
+                    last_window_date = current_date
+                    logger.info(
+                        "Starting active window for %s (%s %s for %dh). Requesting scan.",
+                        current_date,
+                        timezone_name,
+                        run_time,
+                        duration_seconds // 3600,
+                    )
                     set_scan_requested(True)
-                    poller.run_nightly(max_wait_seconds=max_wait)
-                else:
-                    logger.info("Night Mode toggled OFF: waking up and running scan immediately.")
-                    poller.poll_once()
+                    poller.reset_window_dispatch()
+
+                logger.info(
+                    "Night Mode active window in progress (%.1f minutes remaining). Polling...",
+                    remaining_seconds / 60.0,
+                )
+                poller.poll_once()
+                time.sleep(poller.poll_interval)
             else:
+                last_window_date = None
                 poller.poll_once()
                 time.sleep(poller.poll_interval)
         except Exception as exc:

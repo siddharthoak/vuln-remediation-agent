@@ -80,6 +80,10 @@ class ScanPoller:
     def poll_interval(self) -> int:
         return self._interval
 
+    def reset_window_dispatch(self) -> None:
+        """Allow a new scan to be dispatched for a new active window."""
+        self._has_dispatched_initial = False
+
     def clear_reports_and_checkpoint(self) -> None:
         """Purge all report files and reset checkpoint file."""
         import shutil

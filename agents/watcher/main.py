@@ -37,8 +37,13 @@ from common.config import (
     get_watcher_sleep_seconds,
     is_nightly_run_enabled,
     get_nightly_run_time,
+    get_nightly_scan_max_wait_seconds,
 )
-from common.nightly_scheduler import sleep_until_next_run
+from common.nightly_scheduler import (
+    get_active_window_status,
+    sleep_until_active_window,
+    sleep_until_next_run,
+)
 
 
 logging.basicConfig(
@@ -74,14 +79,43 @@ def main():
             try:
                 if is_nightly_run_enabled():
                     run_time = get_nightly_run_time()
-                    logger.info("Watcher Night Mode active: sleeping until %s (%s).", run_time, timezone_name)
-                    completed = sleep_until_next_run(
-                        run_time,
-                        timezone_name,
-                        check_cancel_fn=lambda: not is_nightly_run_enabled(),
+                    duration_seconds = get_nightly_scan_max_wait_seconds()
+
+                    is_active, remaining_seconds, seconds_until_next = get_active_window_status(
+                        run_time=run_time,
+                        duration_seconds=duration_seconds,
+                        timezone_name=timezone_name,
                     )
-                    if completed or not is_nightly_run_enabled():
-                        _run_once()
+
+                    if not is_active:
+                        logger.info(
+                            "Watcher Night Mode: outside active window. Sleeping until %s %s (%.1f hours).",
+                            timezone_name,
+                            run_time,
+                            seconds_until_next / 3600.0,
+                        )
+                        became_active = sleep_until_active_window(
+                            timezone_name=timezone_name,
+                            check_cancel_fn=lambda: not is_nightly_run_enabled(),
+                        )
+                        if not became_active:
+                            logger.info("Night Mode toggled OFF: running watcher immediately.")
+                            _run_once()
+                            continue
+                        # Recompute window status upon waking
+                        is_active, remaining_seconds, _ = get_active_window_status(
+                            run_time=get_nightly_run_time(),
+                            duration_seconds=get_nightly_scan_max_wait_seconds(),
+                            timezone_name=timezone_name,
+                        )
+
+                    logger.info(
+                        "Watcher Night Mode active window (%.1f minutes remaining). Checking PR CI status...",
+                        remaining_seconds / 60.0,
+                    )
+                    _run_once()
+                    cycle_interval = get_watcher_sleep_seconds()
+                    time.sleep(cycle_interval)
                 else:
                     _run_once()
                     cycle_interval = get_watcher_sleep_seconds()

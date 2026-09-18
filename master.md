@@ -369,9 +369,9 @@ remain responsible for the actual background work.
 | **Repository / Chain input** | Form field | Accepts one repository or multiple repositories separated by commas, semicolons, or newlines. Names are normalized, duplicates are removed from uploaded chains, and a multi-repository chain is stored in the configured order. The multi-repository coordinator later resolves the dependency graph and processes repositories bottom-up rather than blindly using the text order. |
 | **GitHub PAT field** | Form field | Supplies or replaces the GitHub credential when a GitHub App is not configured. When a GitHub App is active, leaving this field empty preserves App-based authentication; stored PAT values are masked in the UI. |
 | **Nightly Start Time** | Form field | Sets the daily `HH:MM` start time interpreted in `NIGHTLY_RUN_TIMEZONE` (default `Asia/Kolkata`). The value is validated before it is persisted. |
-| **Nightly Run Duration** | Form field | Sets the maximum scan-wait window for a scheduled cycle, from 1 to 24 hours. It is stored as seconds and applies to the scan poller's bounded nightly wait; it is not a guarantee that all remediation work will finish within that period. |
-| **Save & Switch** | `POST /api/config` | Validates and persists the repository chain, optional PAT, start time, and duration. It refreshes the dashboard configuration card and clears cached GitHub PR state. Saving a repository change is not the same as triggering a scan; the operator must use **Trigger Scan** or wait for the next scheduled cycle. |
-| **Night Mode: ON / OFF** | `POST /api/toggle-night-mode` | Toggles the shared `nightly_run_enabled` flag. ON places the fixer and watcher into scheduled execution; OFF returns them to immediate/continuous execution. When switched OFF, the dashboard also attempts to dispatch an immediate fixer scan so a sleeping system can wake without waiting for the former schedule. |
+| **Nightly Run Duration** | Form field | Sets the daily active operating window (1 to 24 hours). When Night Mode is enabled, both the fixer and watcher stay continuously active and polling throughout this window. |
+| **Save & Switch** | `POST /api/config` | Validates and persists the repository chain, optional PAT, start time, and duration. It refreshes the dashboard configuration card and clears cached GitHub PR state. Saving a repository change is not the same as triggering a scan; the operator must use **Trigger Scan** or wait for the next scheduled cycle. Changes to the schedule are detected dynamically by running daemons without requiring container restarts. |
+| **Night Mode: ON / OFF** | `POST /api/toggle-night-mode` | Toggles the shared `nightly_run_enabled` flag. ON places the fixer and watcher into scheduled active window execution; OFF returns them to immediate 24/7 continuous execution. When switched OFF, the dashboard also attempts to dispatch an immediate fixer scan so a sleeping system can wake without waiting for the former schedule. |
 | **Trigger Scan** | `POST /api/trigger-scan` | Calls GitHub Actions `security-scan.yml` with `ref: main`. It does not perform the scan inside the dashboard and does not wait for the workflow to finish. Once GitHub completes the workflow, `ScanPoller` discovers the completed run, downloads the `vulnerability-reports` artifact, and starts the remediation pipeline. |
 | **Reset** | `POST /api/reset` | Requires confirmation because it is destructive to operational state. For every configured repository it closes agent remediation PRs and triage issues, deletes remote `fix/*` branches, clears tracking/checkpoint/report state, and preserves the Knowledge Base (`data/kb.json`). It does not delete learned migration patterns. |
 
@@ -470,7 +470,7 @@ vuln-remediation-agent/
 │   │   ├── file_lock.py              # OS-level O_CREAT|O_EXCL atomic file lock
 │   │   ├── github_auth.py            # GitHub App RS256 JWT & Installation token generator
 │   │   ├── knowledge_store.py        # 3-Tier KB data model, scoring, and file/Firestore backends
-│   │   ├── nightly_scheduler.py      # Off-peak night mode sleep and cancellation logic
+│   │   ├── nightly_scheduler.py      # Active window evaluation, timezone scheduler & dynamic cancellation
 │   │   ├── reset_ops.py              # Shared environment reset implementation
 │   │   └── tracking_store.py         # State machine, audit records, and File/Firestore stores
 │   │
@@ -797,96 +797,101 @@ $$\text{Repo C (Upstream Core)} \longrightarrow \text{Repo B (Internal Service)}
 ### Night Mode Scheduled Execution
 Running LLMs and build pipelines during peak hours can exhaust API rate limits or consume expensive CI runner minutes.
 
-Night Mode is a shared runtime mode used independently by both long-running services:
-the fixer controls scan discovery and execution, while the watcher controls CI/PR
-observation. The mode does not pause an already-running build, LLM call, GitHub workflow,
-or CI job. It controls when the next daemon cycle is allowed to begin.
+Night Mode is a shared runtime mode used by both long-running daemon services:
+`fixer-server` controls scan discovery, auto-dispatch, and vulnerability remediation,
+while `watcher` controls PR observation and CI status verification. When Night Mode
+is enabled, both services operate within a scheduled **daily active window**
+`[start_time, start_time + duration)`.
 
 #### Configuration and persistence
 
 - **`is_nightly_run_enabled()`:** Reads the toggle from `data/config.json`, then the
   configured environment file, then the process environment. The dashboard writes the
-  selected value back to shared configuration so the daemon processes observe the same
-  state.
-- **`get_nightly_run_time()`:** Reads the daily `HH:MM` start time, defaulting to
-  `00:00`.
+  selected value back to shared configuration so all daemon containers observe the same state.
+- **`get_nightly_run_time()`:** Reads the daily `HH:MM` start time, defaulting to `00:00`.
 - **`get_nightly_scan_max_wait_seconds()`:** Converts the dashboard duration from hours
-  to a bounded scan window of 3,600–86,400 seconds. This is the maximum time the
-  nightly `ScanPoller.run_nightly()` waits for a completed scan report.
-- **`NIGHTLY_RUN_TIMEZONE`:** Interprets the configured time as an IANA timezone, default
-  `Asia/Kolkata`. Invalid timezone names or invalid `HH:MM` values are reported as
-  configuration errors.
+  to an active window of 3,600–86,400 seconds (1 to 24 hours). This defines the duration
+  the daemons stay actively running and polling each day.
+- **`NIGHTLY_RUN_TIMEZONE`:** Interprets the configured start time as an IANA timezone, default
+  `Asia/Kolkata`.
 
-#### Sleep state and wake-up behavior
+#### Active Window Model and Dynamic Wake-Up Behavior
 
-When Night Mode is enabled, each daemon calculates the next occurrence of the configured
-time. If the configured time has already passed today, the next occurrence is tomorrow;
-the sleep is therefore a daily schedule, not a fixed number of hours from the moment the
-toggle was enabled.
-
-`sleep_until_next_run()` does not call one long, uninterruptible `sleep()`. It checks the
-shared mode flag about every five seconds:
+The active window is defined as `[start_time, start_time + duration)` evaluated in
+`NIGHTLY_RUN_TIMEZONE`. The scheduler (`get_active_window_status()`) handles both single-day
+windows (e.g., 15:39 for 2 hours ends at 17:39) and overnight windows spanning midnight
+(e.g., 23:00 for 4 hours ends at 03:00).
 
 ```text
 Night Mode ON
     |
     v
-Calculate next HH:MM in configured timezone
+Evaluate current time against [start_time, start_time + duration)
     |
-    v
-SLEEPING_UNTIL_SCHEDULE
-    |  every ~5 seconds: check whether Night Mode is still ON
+    +-- Inside Window --> [ACTIVE EXECUTION]
+    |       |
+    |       +-- fixer-server: polls every poll_interval (60s), auto-dispatches scan, remediates
+    |       +-- watcher: checks PR CI status every cycle_interval (60s), retries / resolves
+    |       +-- repeats until window duration expires
     |
-    +-- disabled --> return False --> leave sleep immediately
-    |
-    +-- scheduled time reached --> return True --> start scheduled cycle
+    +-- Outside Window --> [SLEEPING UNTIL NEXT WINDOW]
+            |
+            | every ~5s: check if Night Mode is toggled OFF
+            | every ~5s: check if schedule/duration changed in config
+            | every ~5s: check if current time entered active window
+            |
+            +-- disabled --> wake up immediately into continuous mode
+            +-- schedule changed --> re-evaluate window immediately
+            +-- start time reached --> enter ACTIVE EXECUTION
 ```
 
-This sleep state means the daemon is alive but intentionally not dispatching a new scan
-or watcher cycle. It is not a crashed process, and it does not terminate containers.
-The dashboard may continue to show the last known checkpoint or service health while the
-daemon sleeps; that timestamp should not be interpreted as a newly completed scan.
-Service logs are the authoritative source for the exact sleep/wake message.
+Key operational behaviors:
+1. **Startup inside the active window:** If containers start or restart when the current
+   time is already inside the active window (e.g., started at 16:01 with a window of 15:39–17:39),
+   they immediately enter active execution for the remaining window duration without waiting
+   for tomorrow.
+2. **Dynamic reconfiguration:** `sleep_until_active_window()` evaluates config state every
+   5 seconds. Changing the start time or duration in the dashboard wakes the sleep loop
+   immediately without requiring container restarts.
+3. **Outside-window sleep state:** When outside the window, daemons sleep until the next
+   window start. They remain healthy and alive; sleep is an intentional scheduling wait.
 
-#### Scheduled fixer cycle
+#### Fixer Server Behavior in the Active Window
 
-At the scheduled time, the fixer:
+When inside the active window:
+1. **Auto-Scan Dispatch:** At the start of each daily window, the fixer automatically marks
+   a scan request and resets the dispatch latch (`set_scan_requested(True)` and
+   `poller.reset_window_dispatch()`).
+2. **Continuous Polling:** The fixer continuously executes `poller.poll_once()` every
+   `poll_interval` (default 60 seconds).
+3. **Artifact Processing:** Once GitHub Actions finishes `security-scan.yml`, the fixer
+   downloads `vulnerability-reports`, runs classification, LLM reasoning, code modifications,
+   and pushes remediation PRs.
+4. **Retry Listener:** The fixer's HTTP server (`:8080`) remains active throughout to receive
+   POST `/retry` requests from the watcher and process corrective attempts.
+5. **Window Expiration:** Once the configured duration elapsed, the fixer transitions to
+   sleep until the next scheduled window.
 
-1. Calls `ScanPoller.run_nightly(max_wait_seconds=...)`.
-2. Polls GitHub for a completed `security-scan.yml` run.
-3. Dispatches the workflow when a scan has been explicitly requested or when automatic
-   dispatch is enabled and no report is available.
-4. Waits only until the configured maximum window. If no completed report arrives before
-   the deadline, it logs an error and ends that nightly scan window; it does not pretend
-   that remediation succeeded.
-5. When a new artifact arrives, invokes the normal fresh-scan pipeline. The schedule
-   governs scan discovery; remediation, PR creation, and CI verification may continue
-   asynchronously after the scan window ends.
+#### Watcher Behavior in the Active Window
 
-#### Scheduled watcher cycle
+When inside the active window:
+1. **Continuous PR Tracking:** The watcher runs observation cycles every `WATCHER_SLEEP_SECONDS`
+   (default 60s) rather than a single cycle.
+2. **CI Evaluation:** It inspects all open `fix/*` PRs in configured target repositories.
+   - On CI pass: Marks tracking record `CI_PASSED` and updates the Knowledge Base.
+   - On CI fail: Dispatches `POST /retry` to `http://fixer-server:8080/retry`.
+3. **Window Expiration:** Once the active window ends, the watcher sleeps until the next
+   window.
 
-At the same scheduled time, the watcher wakes and runs one PR/CI cycle. It checks open
-remediation PRs, waits for their CI result within `CI_TIMEOUT_SECONDS`, learns from
-green PRs, or sends failures through RetryGate. After that cycle completes, it returns
-to the next daily sleep. The watcher's schedule therefore affects observation cadence,
-not the lifetime of an already-open PR.
+#### Disabling Night Mode (Switching to 24/7 Continuous Mode)
 
-#### Disabling Night Mode while sleeping
-
-When the operator presses **Night Mode: ON** and changes it to OFF:
-
-1. The dashboard persists `nightly_run_enabled=false` and updates the UI to
-   **Night Mode: OFF (Run Immediately)**.
-2. The five-second scheduler check detects the change and cancels the pending sleep.
-3. The fixer leaves scheduled mode and polls immediately; the dashboard also attempts
-   `POST /scan` to the fixer server so an explicit scan can start without waiting for a
-   normal poll interval.
-4. The watcher runs its normal immediate cycle and then sleeps for
-   `WATCHER_SLEEP_SECONDS` between cycles.
-
-If the scheduled cycle has already started, toggling OFF does not kill that in-progress
-cycle. It changes the next scheduling decision; the current GitHub scan, local build,
-or retry continues under its own timeout and error handling.
+When the operator toggles Night Mode OFF in the dashboard:
+1. The dashboard persists `nightly_run_enabled=false`.
+2. The 5-second check immediately detects the toggle and breaks out of the sleep loop.
+3. Both `fixer-server` and `watcher` switch to continuous immediate polling (24/7), running
+   cycles every 60 seconds around the clock.
+4. Switching back to Night Mode ON immediately calculates whether the current time is inside
+   or outside the configured window and behaves accordingly.
 
 ### Clean-Slate Environment Reset with Knowledge Preservation
 During testing and local verification, engineers need to reset test repositories back to a clean state.
