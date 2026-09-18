@@ -370,6 +370,7 @@ def _read_config_value(key: str):
     env_key = {
         "nightly_run_time": "NIGHTLY_RUN_TIME",
         "nightly_scan_max_wait_seconds": "NIGHTLY_SCAN_MAX_WAIT_SECONDS",
+        "nightly_duration_minutes": "NIGHTLY_DURATION_MINUTES",
     }.get(key)
     if env_key:
         for p in ENV_FILE_CANDIDATES:
@@ -394,11 +395,23 @@ def get_nightly_run_time() -> str:
 def get_nightly_scan_max_wait_seconds() -> int:
     """Return the configured maximum nightly execution window in seconds."""
     value = _read_config_value("nightly_scan_max_wait_seconds")
+    if value is None:
+        min_val = _read_config_value("nightly_duration_minutes")
+        if min_val is not None:
+            try:
+                return max(60, min(int(min_val) * 60, 86400))
+            except (TypeError, ValueError):
+                pass
     try:
         seconds = int(value)
     except (TypeError, ValueError):
         seconds = 7200
-    return max(3600, min(seconds, 86400))
+    return max(60, min(seconds, 86400))
+
+
+def get_nightly_duration_minutes() -> int:
+    """Return the configured nightly active window in minutes."""
+    return get_nightly_scan_max_wait_seconds() // 60
 
 
 def is_scan_requested() -> bool:
@@ -431,7 +444,11 @@ def set_scan_requested(requested: bool) -> bool:
     return requested
 
 
-def set_nightly_schedule(run_time: str, duration_hours: int) -> tuple[str, int]:
+def set_nightly_schedule(
+    run_time: str,
+    duration_minutes: Optional[int] = None,
+    duration_hours: Optional[int] = None,
+) -> tuple[str, int]:
     """Persist and export the daily start time and execution window."""
     try:
         hour, minute = (int(part) for part in run_time.split(":", 1))
@@ -439,11 +456,18 @@ def set_nightly_schedule(run_time: str, duration_hours: int) -> tuple[str, int]:
         raise ValueError("Start time must be in HH:MM format.") from exc
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         raise ValueError("Start time must be in HH:MM format.")
-    if not 1 <= duration_hours <= 24:
-        raise ValueError("Duration must be between 1 and 24 hours.")
+
+    if duration_minutes is None:
+        if duration_hours is not None:
+            duration_minutes = duration_hours * 60
+        else:
+            duration_minutes = 120
+
+    if not 1 <= duration_minutes <= 1440:
+        raise ValueError("Duration must be between 1 and 1440 minutes (up to 24 hours).")
 
     normalized_time = f"{hour:02d}:{minute:02d}"
-    max_wait_seconds = duration_hours * 3600
+    max_wait_seconds = duration_minutes * 60
     for p in CONFIG_JSON_CANDIDATES:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -455,6 +479,7 @@ def set_nightly_schedule(run_time: str, duration_hours: int) -> tuple[str, int]:
                     data = {}
             data["nightly_run_time"] = normalized_time
             data["nightly_scan_max_wait_seconds"] = max_wait_seconds
+            data["nightly_duration_minutes"] = duration_minutes
             p.write_text(json.dumps(data, indent=2), encoding="utf-8")
             break
         except Exception as exc:
@@ -467,6 +492,7 @@ def set_nightly_schedule(run_time: str, duration_hours: int) -> tuple[str, int]:
                 values = {
                     "NIGHTLY_RUN_TIME": normalized_time,
                     "NIGHTLY_SCAN_MAX_WAIT_SECONDS": str(max_wait_seconds),
+                    "NIGHTLY_DURATION_MINUTES": str(duration_minutes),
                 }
                 for env_key, env_value in values.items():
                     if re.search(rf"^{env_key}=.*$", content, flags=re.MULTILINE):
@@ -480,7 +506,8 @@ def set_nightly_schedule(run_time: str, duration_hours: int) -> tuple[str, int]:
 
     os.environ["NIGHTLY_RUN_TIME"] = normalized_time
     os.environ["NIGHTLY_SCAN_MAX_WAIT_SECONDS"] = str(max_wait_seconds)
-    return normalized_time, max_wait_seconds
+    os.environ["NIGHTLY_DURATION_MINUTES"] = str(duration_minutes)
+    return normalized_time, duration_minutes
 
 
 def set_nightly_run_enabled(enabled: bool) -> bool:

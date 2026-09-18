@@ -369,7 +369,7 @@ remain responsible for the actual background work.
 | **Repository / Chain input** | Form field | Accepts one repository or multiple repositories separated by commas, semicolons, or newlines. Names are normalized, duplicates are removed from uploaded chains, and a multi-repository chain is stored in the configured order. The multi-repository coordinator later resolves the dependency graph and processes repositories bottom-up rather than blindly using the text order. |
 | **GitHub PAT field** | Form field | Supplies or replaces the GitHub credential when a GitHub App is not configured. When a GitHub App is active, leaving this field empty preserves App-based authentication; stored PAT values are masked in the UI. |
 | **Nightly Start Time** | Form field | Sets the daily `HH:MM` start time interpreted in `NIGHTLY_RUN_TIMEZONE` (default `Asia/Kolkata`). The value is validated before it is persisted. |
-| **Nightly Run Duration** | Form field | Sets the daily active operating window (1 to 24 hours). When Night Mode is enabled, both the fixer and watcher stay continuously active and polling throughout this window. |
+| **Nightly Run Duration** | Form field | Sets the daily active operating window in minutes (1 to 1440 minutes / up to 24 hours). When Night Mode is enabled, both the fixer and watcher stay continuously active and polling throughout this window. |
 | **Save & Switch** | `POST /api/config` | Validates and persists the repository chain, optional PAT, start time, and duration. It refreshes the dashboard configuration card and clears cached GitHub PR state. Saving a repository change is not the same as triggering a scan; the operator must use **Trigger Scan** or wait for the next scheduled cycle. Changes to the schedule are detected dynamically by running daemons without requiring container restarts. |
 | **Night Mode: ON / OFF** | `POST /api/toggle-night-mode` | Toggles the shared `nightly_run_enabled` flag. ON places the fixer and watcher into scheduled active window execution; OFF returns them to immediate 24/7 continuous execution. When switched OFF, the dashboard also attempts to dispatch an immediate fixer scan so a sleeping system can wake without waiting for the former schedule. |
 | **Trigger Scan** | `POST /api/trigger-scan` | Calls GitHub Actions `security-scan.yml` with `ref: main`. It does not perform the scan inside the dashboard and does not wait for the workflow to finish. Once GitHub completes the workflow, `ScanPoller` discovers the completed run, downloads the `vulnerability-reports` artifact, and starts the remediation pipeline. |
@@ -809,9 +809,9 @@ is enabled, both services operate within a scheduled **daily active window**
   configured environment file, then the process environment. The dashboard writes the
   selected value back to shared configuration so all daemon containers observe the same state.
 - **`get_nightly_run_time()`:** Reads the daily `HH:MM` start time, defaulting to `00:00`.
-- **`get_nightly_scan_max_wait_seconds()`:** Converts the dashboard duration from hours
-  to an active window of 3,600–86,400 seconds (1 to 24 hours). This defines the duration
-  the daemons stay actively running and polling each day.
+- **`get_nightly_scan_max_wait_seconds()` / `get_nightly_duration_minutes()`:** Converts
+  the dashboard duration from minutes to an active window of 60–86,400 seconds (1 to 1440 minutes /
+  up to 24 hours). This defines the exact duration the daemons stay actively running and polling each day.
 - **`NIGHTLY_RUN_TIMEZONE`:** Interprets the configured start time as an IANA timezone, default
   `Asia/Kolkata`.
 

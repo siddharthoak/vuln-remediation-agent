@@ -58,6 +58,7 @@ from common.config import (  # noqa: E402
 )
 from common.github_auth import get_auth_mode  # noqa: E402
 from common.reset_ops import reset_repository_state  # noqa: E402
+from common.nightly_scheduler import get_active_window_status, format_duration  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -282,16 +283,69 @@ def _get_kb_store():
     return make_knowledge_store()
 
 
-def _fixer_active() -> bool:
+def _fixer_status_info() -> dict:
+    tz_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
+    night_enabled = is_nightly_run_enabled()
+    run_time = get_nightly_run_time()
+    duration_s = get_nightly_scan_max_wait_seconds()
+
+    recent_touch = False
     for p in (CHECKPOINT_PATH, TRACKING_PATH):
         try:
             if p.exists():
                 age = (datetime.now(tz=timezone.utc) - datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)).total_seconds()
                 if age < 300:
-                    return True
+                    recent_touch = True
+                    break
         except OSError:
             pass
-    return False
+
+    if night_enabled:
+        try:
+            is_active, rem_s, sec_until_next = get_active_window_status(
+                run_time=run_time,
+                duration_seconds=duration_s,
+                timezone_name=tz_name,
+            )
+        except Exception:
+            is_active = False
+            rem_s = 0.0
+
+        if is_active:
+            rem_min = max(1, round(rem_s / 60))
+            return {
+                "state": "active",
+                "label": f"active ({rem_min}m remaining)",
+                "badge_class": "ok",
+                "detail": f"Night Mode active window ({format_duration(duration_s)})",
+            }
+        else:
+            return {
+                "state": "sleeping",
+                "label": f"sleeping (wakes at {run_time})",
+                "badge_class": "warn",
+                "detail": f"Night Mode scheduled at {run_time} {tz_name}",
+            }
+    else:
+        if recent_touch:
+            return {
+                "state": "polling",
+                "label": "polling",
+                "badge_class": "ok",
+                "detail": "Continuous polling mode",
+            }
+        else:
+            return {
+                "state": "idle",
+                "label": "idle / no checkpoint",
+                "badge_class": "warn",
+                "detail": "No recent activity",
+            }
+
+
+def _fixer_active() -> bool:
+    return _fixer_status_info()["badge_class"] == "ok"
+
 
 
 def _scan_finding_count() -> int:
@@ -413,10 +467,12 @@ def _sidebar_status() -> dict:
         else:
             reports[label] = {"present": False, "age_minutes": None}
 
+    fixer_status = _fixer_status_info()
     return {
         "checkpoint": checkpoint,
         "reports": reports,
-        "fixer_active": _fixer_active(),
+        "fixer_active": fixer_status["badge_class"] == "ok",
+        "fixer_status": fixer_status,
         "scan_finding_count": _scan_finding_count(),
         "tracking_path": str(TRACKING_PATH),
     }
@@ -460,6 +516,7 @@ def _repo_config_context(notice: dict = None) -> dict:
             "app_id": auth_info.get("app_id"),
             "nightly_run_enabled": is_nightly_run_enabled(),
             "nightly_run_time": get_nightly_run_time(),
+            "nightly_duration_minutes": get_nightly_scan_max_wait_seconds() // 60,
             "nightly_duration_hours": get_nightly_scan_max_wait_seconds() // 3600,
             "nightly_timezone": os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata"),
         },
@@ -496,14 +553,17 @@ async def api_save_config(request: Request):
     repo_val = form_data.get("repo", [""])[0].strip()
     pat_val = form_data.get("pat", [""])[0].strip()
     run_time = form_data.get("nightly_run_time", [get_nightly_run_time()])[0].strip()
-    duration_value = form_data.get("nightly_duration_hours", [str(get_nightly_scan_max_wait_seconds() // 3600)])[0].strip()
+    duration_value = form_data.get(
+        "nightly_duration_minutes",
+        form_data.get("nightly_duration_hours", [str(get_nightly_scan_max_wait_seconds() // 60)])
+    )[0].strip()
 
     if not repo_val:
         ctx = _repo_config_context(notice={"type": "err", "message": "Repository cannot be empty."})
         return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
     try:
-        duration_hours = int(duration_value)
-        set_nightly_schedule(run_time, duration_hours)
+        duration_minutes = int(duration_value)
+        set_nightly_schedule(run_time, duration_minutes=duration_minutes)
     except ValueError as exc:
         ctx = _repo_config_context(notice={"type": "err", "message": str(exc)})
         return templates.TemplateResponse(request, "partials/repo_config.html", ctx)
@@ -753,7 +813,7 @@ async def api_toggle_night_mode(request: Request):
     set_nightly_run_enabled(new_state)
 
     if new_state:
-        msg = f"Night Mode ENABLED: Agent scheduled daily at {get_nightly_run_time()} ({os.environ.get('NIGHTLY_RUN_TIMEZONE', 'Asia/Kolkata')}) for up to {get_nightly_scan_max_wait_seconds() // 3600} hour(s)."
+        msg = f"Night Mode ENABLED: Agent scheduled daily at {get_nightly_run_time()} ({os.environ.get('NIGHTLY_RUN_TIMEZONE', 'Asia/Kolkata')}) for {get_nightly_scan_max_wait_seconds() // 60} minute(s)."
     else:
         msg = "Night Mode DISABLED: Agent switched to Immediate Execution mode!"
         # Attempt to dispatch immediate scan call to fixer server

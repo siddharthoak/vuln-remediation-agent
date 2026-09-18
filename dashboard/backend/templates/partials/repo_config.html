@@ -83,19 +83,19 @@
     </div>
 
     <div class="form-group">
-      <label class="form-label" for="nightly-duration-hours">Nightly Run Duration (hours)</label>
+      <label class="form-label" for="nightly-duration-minutes">Nightly Run Duration (minutes)</label>
       <input
         type="number"
-        id="nightly-duration-hours"
-        name="nightly_duration_hours"
+        id="nightly-duration-minutes"
+        name="nightly_duration_minutes"
         class="form-input"
         min="1"
-        max="24"
+        max="1440"
         step="1"
-        value="{{ config.nightly_duration_hours }}"
+        value="{{ config.nightly_duration_minutes }}"
         required
       />
-      <small class="form-help">Maximum time allowed for the nightly scan and remediation cycle.</small>
+      <small class="form-help">Number of minutes the agent remains active each day (1 to 1440).</small>
     </div>
 
     <div class="btn-stack">

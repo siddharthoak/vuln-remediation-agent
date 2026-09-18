@@ -57,11 +57,26 @@ class TestNightlyScheduler(unittest.TestCase):
         with patch("common.nightly_scheduler.datetime") as mock_dt:
             mock_dt.now.return_value = fake_now
             mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
+    def test_format_duration(self):
+        from common.nightly_scheduler import format_duration
+        self.assertEqual(format_duration(60), "1m")
+        self.assertEqual(format_duration(300), "5m")
+        self.assertEqual(format_duration(3600), "1h")
+        self.assertEqual(format_duration(5400), "1h 30m")
+        self.assertEqual(format_duration(7200), "2h")
+
+    def test_minutes_window(self):
+        tz = ZoneInfo("Asia/Kolkata")
+        fake_now = datetime(2026, 9, 18, 15, 45, 0, tzinfo=tz)  # 15:45
+        with patch("common.nightly_scheduler.datetime") as mock_dt:
+            mock_dt.now.return_value = fake_now
+            mock_dt.side_effect = lambda *args, **kw: datetime(*args, **kw)
+            # 15:39 with 15 minutes window (ends at 15:54)
             is_active, rem, until_next = get_active_window_status(
-                run_time="23:00", duration_seconds=14400, timezone_name="Asia/Kolkata"
+                run_time="15:39", duration_seconds=15 * 60, timezone_name="Asia/Kolkata"
             )
             self.assertTrue(is_active)
-            self.assertEqual(rem, 5400.0)  # 1.5 hours remaining = 5400s
+            self.assertEqual(rem, 9 * 60.0)  # 15:54 - 15:45 = 9m = 540s
             self.assertEqual(until_next, 0.0)
 
 

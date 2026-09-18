@@ -48,6 +48,7 @@ from common.nightly_scheduler import (
     get_active_window_status,
     sleep_until_active_window,
     sleep_until_next_run,
+    format_duration,
 )
 from common.config import (
     get_target_repo,
@@ -170,11 +171,11 @@ def _run_fixer_poller_loop(poller: ScanPoller) -> None:
                 if last_window_date != current_date:
                     last_window_date = current_date
                     logger.info(
-                        "Starting active window for %s (%s %s for %dh). Requesting scan.",
+                        "Starting active window for %s (%s %s for %s). Requesting scan.",
                         current_date,
                         timezone_name,
                         run_time,
-                        duration_seconds // 3600,
+                        format_duration(duration_seconds),
                     )
                     set_scan_requested(True)
                     poller.reset_window_dispatch()

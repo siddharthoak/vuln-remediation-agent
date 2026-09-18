@@ -94,6 +94,16 @@ from common.config import (
 )
 
 
+def format_duration(seconds: int) -> str:
+    """Format duration in seconds into a friendly minutes/hours string."""
+    total_minutes = max(1, round(seconds / 60))
+    if total_minutes < 60:
+        return f"{total_minutes}m"
+    hours = total_minutes // 60
+    rem_min = total_minutes % 60
+    return f"{hours}h {rem_min}m" if rem_min else f"{hours}h"
+
+
 def sleep_until_active_window(
     timezone_name: str = "Asia/Kolkata",
     offset_minutes: int = 0,
@@ -125,21 +135,21 @@ def sleep_until_active_window(
 
         if is_active:
             logger.info(
-                "Entered active window (%s %s for %d hours). Waking up!",
+                "Entered active window (%s %s for %s). Waking up!",
                 timezone_name,
                 run_time,
-                duration_seconds // 3600,
+                format_duration(duration_seconds),
             )
             return True
 
         current_hour_int = int(seconds_until_next // 3600)
         if last_logged_hour != current_hour_int:
             logger.info(
-                "Nightly scheduler sleeping %.1f hours until %s %s (window duration %dh).",
+                "Nightly scheduler sleeping %.1f hours until %s %s (window duration %s).",
                 seconds_until_next / 3600.0,
                 timezone_name,
                 run_time,
-                duration_seconds // 3600,
+                format_duration(duration_seconds),
             )
             last_logged_hour = current_hour_int
 
