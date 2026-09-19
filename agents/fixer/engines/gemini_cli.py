@@ -8,9 +8,11 @@ the hand-rolled FunctionTools AdkVertexEngine wires up.
 Safety posture for an unattended CVE-remediation pipeline:
   - Shell execution is meant to be disabled via a per-run .gemini/settings.json
     tool exclusion (_write_settings below), rather than trusting --yolo alone.
-    `mvn compile` verification stays out of this engine entirely -- CodeFixer/
-    the CI-driven Watcher retry loop is the compile gate, not a model-invoked
-    shell command.
+    `mvn compile` and `mvn test` verification stay out of this engine entirely --
+    CodeFixer/the CI-driven Watcher retry loop is the authoritative build/test
+    gate, not a model-invoked shell command. The ADK engine exposes these
+    commands as local FunctionTools; Gemini CLI intentionally cannot support
+    them while shell execution is disabled.
   - ** UNVERIFIED -- DO NOT TREAT AS A PROVEN SECURITY BOUNDARY YET **
     The {"tools": {"exclude": [...]}} settings.json mechanism and exact key
     name have not been confirmed against the installed gemini-cli version's
@@ -131,6 +133,9 @@ class GeminiCliEngine:
                 "Install: npm install -g @google/gemini-cli"
             )
 
+        settings_path = repo_path / ".gemini" / "settings.json"
+        had_settings = settings_path.exists()
+        previous_settings = settings_path.read_bytes() if had_settings else None
         _write_settings(repo_path)
 
         args = [CLI_BINARY, "-p", prompt, "--yolo", "--skip-trust", "--output-format", "json"]
@@ -143,6 +148,15 @@ class GeminiCliEngine:
             )
         except EngineTimeoutError as exc:
             raise EngineExecutionError(str(exc)) from exc
+        finally:
+            if had_settings:
+                settings_path.write_bytes(previous_settings)
+            else:
+                try:
+                    settings_path.unlink()
+                    settings_path.parent.rmdir()
+                except OSError:
+                    pass
 
         if returncode != 0 and not stdout.strip():
             raise EngineExecutionError(

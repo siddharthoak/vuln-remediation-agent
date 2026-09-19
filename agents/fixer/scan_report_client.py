@@ -13,6 +13,7 @@ so fixer/main.py requires only an import-name change.
 import json
 import logging
 import os
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -72,41 +73,35 @@ class ScanReportClient:
         """
         findings: dict = {}  # (component_name, current_version) → VulnerabilityFinding
 
-        trivy_path = self._report_dir / self.TRIVY_FILE
-        grype_path = self._report_dir / self.GRYPE_FILE
-        owasp_path = self._report_dir / self.OWASP_FILE
+        trivy_files = list(self._report_dir.rglob(self.TRIVY_FILE))
+        grype_files = list(self._report_dir.rglob(self.GRYPE_FILE))
+        owasp_files = list(self._report_dir.rglob("dependency-check-report.json"))
 
-        if trivy_path.exists():
+        for trivy_path in trivy_files:
             for f in self._parse_trivy(trivy_path):
                 key = (f.component_name, f.current_version)
                 findings.setdefault(key, f)
-        else:
-            logger.debug("Trivy report not found at %s", trivy_path)
 
-        if grype_path.exists():
+        for grype_path in grype_files:
             for f in self._parse_grype(grype_path):
                 key = (f.component_name, f.current_version)
                 existing = findings.get(key)
                 if existing:
-                    # Merge: add CVEs not already known
                     for cve in f.cve_ids:
                         if cve not in existing.cve_ids:
                             existing.cve_ids.append(cve)
-                    # Prefer a concrete safe version over UNKNOWN
-                    if existing.recommended_version.startswith("UNKNOWN") and \
-                       not f.recommended_version.startswith("UNKNOWN"):
-                        existing.recommended_version = f.recommended_version
+                    existing.severity = self._highest_severity([existing.severity, f.severity])
+                    if not f.recommended_version.startswith("UNKNOWN"):
+                        if existing.recommended_version.startswith("UNKNOWN") or \
+                           self._parse_version_tuple(f.recommended_version) > self._parse_version_tuple(existing.recommended_version):
+                            existing.recommended_version = f.recommended_version
                 else:
                     findings[key] = f
-        else:
-            logger.debug("Grype report not found at %s", grype_path)
 
-        if owasp_path.exists():
+        for owasp_path in owasp_files:
             for f in self._parse_owasp(owasp_path):
                 key = (f.component_name, f.current_version)
                 findings.setdefault(key, f)
-        else:
-            logger.debug("OWASP report not found at %s", owasp_path)
 
         if not findings:
             raise ScanReportError(
@@ -143,8 +138,9 @@ class ScanReportClient:
             for vuln in result.get("Vulnerabilities") or []:
                 cve_id    = vuln.get("VulnerabilityID", "")
                 severity  = vuln.get("Severity", "UNKNOWN").lower()
-                fixed_ver = vuln.get("FixedVersion", "")
                 installed = vuln.get("InstalledVersion", "unknown")
+                fixed_ver_raw = vuln.get("FixedVersion", "")
+                fixed_ver = self._select_best_fixed_version(fixed_ver_raw, installed)
 
                 # Resolve component name from PURL or PkgName
                 purl = (vuln.get("PkgIdentifier") or {}).get("PURL", "")
@@ -162,6 +158,11 @@ class ScanReportClient:
                 else:
                     if cve_id and cve_id not in findings[key].cve_ids:
                         findings[key].cve_ids.append(cve_id)
+                    findings[key].severity = self._highest_severity([findings[key].severity, severity])
+                    if fixed_ver and not fixed_ver.startswith("UNKNOWN"):
+                        cur_rec = findings[key].recommended_version
+                        if cur_rec.startswith("UNKNOWN") or self._parse_version_tuple(fixed_ver) > self._parse_version_tuple(cur_rec):
+                            findings[key].recommended_version = fixed_ver
 
         return list(findings.values())
 
@@ -197,13 +198,14 @@ class ScanReportClient:
 
             cve_id    = vuln.get("id", "")
             severity  = vuln.get("severity", "UNKNOWN").lower()
-            fix_info  = vuln.get("fix", {})
-            fix_vers  = fix_info.get("versions", [])
-            fixed_ver = fix_vers[0] if fix_vers else "UNKNOWN — check Grype fix.versions"
-
             purl      = artifact.get("purl", "")
             name      = self._name_from_purl(purl) or artifact.get("name", "unknown")
             installed = artifact.get("version", "unknown")
+
+            fix_info  = vuln.get("fix", {})
+            fix_vers  = fix_info.get("versions", [])
+            fixed_ver_raw = ", ".join(fix_vers) if fix_vers else ""
+            fixed_ver = self._select_best_fixed_version(fixed_ver_raw, installed) if fixed_ver_raw else "UNKNOWN — check Grype fix.versions"
 
             key = (name, installed)
             if key not in findings:
@@ -217,6 +219,11 @@ class ScanReportClient:
             else:
                 if cve_id and cve_id not in findings[key].cve_ids:
                     findings[key].cve_ids.append(cve_id)
+                findings[key].severity = self._highest_severity([findings[key].severity, severity])
+                if fixed_ver and not fixed_ver.startswith("UNKNOWN"):
+                    cur_rec = findings[key].recommended_version
+                    if cur_rec.startswith("UNKNOWN") or self._parse_version_tuple(fixed_ver) > self._parse_version_tuple(cur_rec):
+                        findings[key].recommended_version = fixed_ver
 
         return list(findings.values())
 
@@ -270,20 +277,105 @@ class ScanReportClient:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
+    def _parse_version_tuple(v: str) -> tuple:
+        if not v or v.startswith("UNKNOWN"):
+            return (-1,)
+        clean = v.strip().lstrip("v")
+        for suffix in [".RELEASE", "-RELEASE", ".Final", "-Final", ".GA", "-GA", ".jre", "-jre", ".android", "-android"]:
+            if clean.endswith(suffix):
+                clean = clean[:-len(suffix)]
+        clean = clean.split("-")[0]
+        parts = []
+        for p in clean.split("."):
+            try:
+                parts.append(int(p))
+            except ValueError:
+                break
+        return tuple(parts) if parts else (0,)
+
+    @classmethod
+    def _select_best_fixed_version(cls, fixed_ver_str: str, installed_ver: str) -> str:
+        if not fixed_ver_str or fixed_ver_str.startswith("UNKNOWN"):
+            return fixed_ver_str
+        candidates = [v.strip() for v in fixed_ver_str.split(",") if v.strip()]
+        if not candidates:
+            return fixed_ver_str
+        if len(candidates) == 1:
+            return candidates[0]
+
+        inst_tuple = cls._parse_version_tuple(installed_ver)
+        # Filter to candidates that are upgrades (>= installed_ver)
+        upgrades = [c for c in candidates if cls._parse_version_tuple(c) >= inst_tuple]
+        valid_candidates = upgrades if upgrades else candidates
+
+        inst_parts = installed_ver.strip().lstrip("v").split(".")
+        # 1. Match same major and minor version if possible
+        for cand in valid_candidates:
+            cand_parts = cand.strip().lstrip("v").split(".")
+            if len(inst_parts) >= 2 and len(cand_parts) >= 2 and inst_parts[0] == cand_parts[0] and inst_parts[1] == cand_parts[1]:
+                return cand
+        # 2. Match same major version (smallest upgrade on that major)
+        same_major = []
+        for cand in valid_candidates:
+            cand_parts = cand.strip().lstrip("v").split(".")
+            if len(inst_parts) >= 1 and len(cand_parts) >= 1 and inst_parts[0] == cand_parts[0]:
+                same_major.append(cand)
+        if same_major:
+            same_major.sort(key=cls._parse_version_tuple)
+            return same_major[0]
+
+        valid_candidates.sort(key=cls._parse_version_tuple)
+        return valid_candidates[0]
+
+
+
+    @staticmethod
     def _name_from_purl(purl: str) -> str:
         """
-        Extract a Maven groupId:artifactId name from a package URL.
+        Extract package name from a Maven, npm, or PyPI package URL.
         pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1
         → org.apache.logging.log4j:log4j-core
+
+        pkg:npm/lodash@4.17.20
+        → lodash
+
+        pkg:npm/%40angular/core@12.0.0
+        → @angular/core
+
+        pkg:pypi/django@4.2.0
+        → django
         """
-        if not purl or not purl.startswith("pkg:maven/"):
+        if not purl:
             return ""
-        try:
-            after_type = purl[len("pkg:maven/"):]
-            name_part = after_type.split("@")[0]
-            return name_part.replace("/", ":")
-        except (IndexError, ValueError):
-            return ""
+
+        if purl.startswith("pkg:maven/"):
+            try:
+                after_type = purl[len("pkg:maven/"):]
+                name_part = after_type.split("@")[0]
+                return name_part.replace("/", ":")
+            except (IndexError, ValueError):
+                return ""
+
+        if purl.startswith("pkg:npm/"):
+            try:
+                after_type = purl[len("pkg:npm/"):]
+                if after_type.startswith("@"):
+                    name_part = "@" + after_type[1:].split("@")[0]
+                else:
+                    name_part = after_type.split("@")[0]
+                name_part = name_part.split("?")[0].split("#")[0]
+                return urllib.parse.unquote(name_part)
+            except (IndexError, ValueError):
+                return ""
+
+        if purl.startswith("pkg:pypi/"):
+            try:
+                after_type = purl[len("pkg:pypi/"):]
+                return urllib.parse.unquote(after_type.split("@", 1)[0].split("?", 1)[0].split("#", 1)[0])
+            except (IndexError, ValueError):
+                return ""
+
+        return ""
 
     @staticmethod
     def _parse_purl(purl: str):
@@ -291,6 +383,10 @@ class ScanReportClient:
         if not purl:
             return "unknown-component", "unknown"
         try:
+            if purl.startswith(("pkg:maven/", "pkg:npm/", "pkg:pypi/")):
+                name = ScanReportClient._name_from_purl(purl)
+                version = purl.rsplit("@", 1)[1].split("?", 1)[0].split("#", 1)[0] if "@" in purl else "unknown"
+                return name or "unknown-component", version
             after_type = purl.split("/", 1)[1] if "/" in purl else purl
             name_version = after_type.rsplit("@", 1)
             name = name_version[0].replace("/", ":")

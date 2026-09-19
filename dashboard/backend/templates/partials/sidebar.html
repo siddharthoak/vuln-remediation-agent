@@ -1,7 +1,9 @@
 <div id="sidebar" hx-get="/partials/sidebar" hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML">
   <div class="card">
     <strong>Fixer status</strong><br>
-    {% if sidebar.fixer_active %}
+    {% if sidebar.fixer_status %}
+      <span class="{{ sidebar.fixer_status.badge_class }}">&#9679; {{ sidebar.fixer_status.label }}</span>
+    {% elif sidebar.fixer_active %}
       <span class="ok">&#9679; polling</span>
     {% else %}
       <span class="warn">&#9679; idle / no checkpoint</span>

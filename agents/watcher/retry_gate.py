@@ -53,7 +53,6 @@ class RetryGate:
         terminal_statuses = {
             TrackingStatus.FAILED_MAX_RETRIES.value,
             TrackingStatus.ESCALATED.value,
-            TrackingStatus.ENGINE_ERROR.value,
         }
         if current_tracking_record.status in terminal_statuses:
             logger.error(
@@ -122,9 +121,21 @@ class RetryGate:
         except Exception:
             resolution_seconds = None
 
-        record.status = TrackingStatus.FAILED_MAX_RETRIES.value
-        record.time_to_resolution_seconds = resolution_seconds
-        self._store.update(record)
+        all_records = (
+            self._store.get_all_for_pr(pr_number)
+            if hasattr(self._store, "get_all_for_pr")
+            else [record]
+        )
+        for rec in all_records:
+            if rec.status not in {
+                TrackingStatus.CI_PASSED.value,
+                TrackingStatus.FAILED_MAX_RETRIES.value,
+                TrackingStatus.ESCALATED.value,
+            }:
+                rec.status = TrackingStatus.FAILED_MAX_RETRIES.value
+                rec.time_to_resolution_seconds = resolution_seconds
+                self._store.update(rec)
+
 
         self._post_escalation_comment(
             pr_number,

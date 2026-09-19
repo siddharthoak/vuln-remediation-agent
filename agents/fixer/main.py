@@ -11,22 +11,30 @@ tracking record lifecycle, and PR creation are all UNCHANGED.
 import logging
 import os
 import sys
+import multiprocessing
+import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import json as _json
+from types import SimpleNamespace
+from typing import Optional
 
 from github import Github
 from scan_report_client import ScanReportClient, ScanReportError
 from scan_fetcher import ScanFetcher, ScanFetchError
 from scan_poller import ScanPoller
-from repo_ops import RepoOps
+from repo_ops import DiffReviewResult, RepoOps
 from code_fixer import CodeFixer, InvalidRetryError
 from pr_client import PRClient
 from engines.base import EngineExecutionError
-from ecosystems.factory import get_ecosystem
+from ecosystems.factory import get_ecosystem, get_manifest_file
 from ecosystems.base import EcosystemError
+from ecosystems.maven import PomXMLError
+from ecosystems.npm import PackageJsonError
+from ecosystems.python import PythonManifestError
 
 from common.tracking_store import (
     make_tracking_store,
@@ -34,9 +42,32 @@ from common.tracking_store import (
     TrackingStatus,
 )
 from common.knowledge_store import make_knowledge_store
-from knowledge.main import KnowledgeAgent
-from classifier.classifier import Classifier
-from demo_scan_reports import write_demo_reports
+from common.file_lock import FileLock
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from common.nightly_scheduler import (
+    get_active_window_status,
+    sleep_until_active_window,
+    sleep_until_next_run,
+    format_duration,
+)
+from common.config import (
+    get_target_repo,
+    get_target_repos,
+    get_github_pat,
+    is_nightly_run_enabled,
+    get_nightly_run_time,
+    get_nightly_scan_max_wait_seconds,
+    set_scan_requested,
+)
+from classifier.classifier import Classifier, ClassifierResult
+try:
+    from demo_scan_reports import write_demo_reports
+except ImportError:
+    try:
+        from scripts.generate_demo_scan_reports import write_demo_reports
+    except ImportError:
+        write_demo_reports = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +76,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fixer.main")
 
-MAX_PARALLEL_FIXES = int(os.environ.get("MAX_PARALLEL_FIXES", "5"))
+MAX_PARALLEL_FIXES = int(os.environ.get("MAX_PARALLEL_FIXES", "2"))
 AUTO_FETCH_SCAN    = os.environ.get("AUTO_FETCH_SCAN", "0") == "1"
 
 # Prevents concurrent fresh-scan runs if the poller fires while one is in progress.
@@ -100,12 +131,12 @@ def _run_server():
       2. HTTP server on :8080 — accepts POST /retry from the Watcher and
          invokes _run_retry() for CI-failure re-fix attempts.
     """
-    github_repo = os.environ["GITHUB_REPO_TARGET"]
-    github_pat  = os.environ["GITHUB_PAT"]
+    github_repo = get_target_repo()
+    github_pat  = get_github_pat()
     report_dir  = os.environ.get("SCAN_REPORT_PATH", "/reports")
     poll_interval = int(os.environ.get("SCAN_POLL_INTERVAL", "60"))
 
-    logger.info("Fixer server mode: starting scan poller and HTTP retry server.")
+    logger.info("Fixer server mode: starting scan poller worker and HTTP retry server.")
 
     poller = ScanPoller(
         repo_full_name=github_repo,
@@ -114,15 +145,85 @@ def _run_server():
         on_new_scan_ready=_run_fresh_scan,
         poll_interval=poll_interval,
     )
-    poller_thread = threading.Thread(target=poller.poll_forever, daemon=True, name="scan-poller")
+    poller_target = lambda: _run_fixer_poller_loop(poller)
+    poller_thread = threading.Thread(target=poller_target, daemon=True, name="scan-poller")
     poller_thread.start()
 
-    server = _make_retry_server(port=8080)
+    server = _make_retry_server(port=8080, poller=poller)
     logger.info("Fixer HTTP server listening on :8080")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Fixer server shutting down.")
+
+
+def _run_fixer_poller_loop(poller: ScanPoller) -> None:
+    """Dynamically handles Night Mode active window vs Continuous polling loop."""
+    timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
+    last_window_date = None
+
+    import time
+    while True:
+        try:
+            if is_nightly_run_enabled():
+                run_time = get_nightly_run_time()
+                duration_seconds = get_nightly_scan_max_wait_seconds()
+
+                is_active, remaining_seconds, seconds_until_next = get_active_window_status(
+                    run_time=run_time,
+                    duration_seconds=duration_seconds,
+                    timezone_name=timezone_name,
+                )
+
+                if not is_active:
+                    logger.info(
+                        "Night Mode: outside active window. Sleeping until %s %s (%.1f hours).",
+                        timezone_name,
+                        run_time,
+                        seconds_until_next / 3600.0,
+                    )
+                    became_active = sleep_until_active_window(
+                        timezone_name=timezone_name,
+                        check_cancel_fn=lambda: not is_nightly_run_enabled(),
+                    )
+                    if not became_active:
+                        logger.info("Night Mode toggled OFF: waking up and running scan immediately.")
+                        poller.poll_once()
+                        continue
+                    # Recompute window status upon waking
+                    is_active, remaining_seconds, _ = get_active_window_status(
+                        run_time=get_nightly_run_time(),
+                        duration_seconds=get_nightly_scan_max_wait_seconds(),
+                        timezone_name=timezone_name,
+                    )
+
+                # Active window is in progress
+                current_date = datetime.now(ZoneInfo(timezone_name)).strftime("%Y-%m-%d")
+                if last_window_date != current_date:
+                    last_window_date = current_date
+                    logger.info(
+                        "Starting active window for %s (%s %s for %s). Requesting scan.",
+                        current_date,
+                        timezone_name,
+                        run_time,
+                        format_duration(duration_seconds),
+                    )
+                    set_scan_requested(True)
+                    poller.reset_window_dispatch()
+
+                logger.info(
+                    "Night Mode active window in progress (%.1f minutes remaining). Polling...",
+                    remaining_seconds / 60.0,
+                )
+                poller.poll_once()
+                time.sleep(poller.poll_interval)
+            else:
+                last_window_date = None
+                poller.poll_once()
+                time.sleep(poller.poll_interval)
+        except Exception as exc:
+            logger.error("Fixer poller loop error: %s", exc, exc_info=True)
+            time.sleep(10)
 
 
 def _run_kb_import():
@@ -187,14 +288,7 @@ def _run_scan_fetch():
 def _findings_preview() -> list:
     """Read-only preview for GET /findings -- parses scan reports and runs
     the classifier, WITHOUT hydrating the KB, resolving locality, or fixing
-    anything. Deliberately skips locality resolution (that needs a real repo
-    clone) -- a finding's is_transitive here is always its default (False),
-    so a bucket-3/4 call on a transitive dependency may look slightly more
-    optimistic here than what _do_fresh_scan() would actually decide once it
-    has a clone to inspect. That tradeoff (fast, read-only preview vs. a
-    perfectly accurate one) is intentional: this endpoint exists so an
-    audience can see "what's out there" before/without spending a fix cycle
-    on it, not to duplicate _do_fresh_scan()'s full decision pipeline.
+    anything.
     """
     report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
     scanner = ScanReportClient(report_dir=report_dir)
@@ -218,8 +312,31 @@ def _findings_preview() -> list:
     return out
 
 
-def _make_retry_server(port: int) -> HTTPServer:
+def _make_retry_server(port: int, poller: Optional[ScanPoller] = None) -> HTTPServer:
     class RetryHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path in ("/", "/status"):
+                payload = {
+                    "status": "ok",
+                    "service": "fixer-server",
+                    "scan_running": poller.is_scan_running() if poller else False,
+                    "has_reports": poller.has_reports() if poller else False,
+                }
+                self._send_json(200, payload)
+            elif self.path == "/import-kb/status":
+                self._send_json(200, _kb_import_state)
+            elif self.path == "/scan/live/status":
+                self._send_json(200, _scan_state)
+            elif self.path == "/fix/status":
+                self._send_json(200, _fix_state)
+            elif self.path == "/findings":
+                try:
+                    self._send_json(200, {"findings": _findings_preview()})
+                except ScanReportError as exc:
+                    self._send_json(200, {"findings": [], "error": str(exc)})
+            else:
+                self.send_error(404)
+
         def do_POST(self):
             if self.path == "/retry":
                 self._handle_retry()
@@ -233,21 +350,14 @@ def _make_retry_server(port: int) -> HTTPServer:
                 self._handle_fix_trigger()
             elif self.path == "/reset":
                 self._handle_reset()
-            else:
-                self.send_error(404)
-
-        def do_GET(self):
-            if self.path == "/import-kb/status":
-                self._send_json(200, _kb_import_state)
-            elif self.path == "/scan/live/status":
-                self._send_json(200, _scan_state)
-            elif self.path == "/fix/status":
-                self._send_json(200, _fix_state)
-            elif self.path == "/findings":
-                try:
-                    self._send_json(200, {"findings": _findings_preview()})
-                except ScanReportError as exc:
-                    self._send_json(200, {"findings": [], "error": str(exc)})
+            elif self.path == "/scan":
+                dispatched = False
+                if poller:
+                    dispatched = poller.dispatch_scan()
+                self._send_json(202 if dispatched else 500, {
+                    "status": "dispatched" if dispatched else "failed_or_no_poller",
+                    "workflow": "security-scan.yml",
+                })
             else:
                 self.send_error(404)
 
@@ -272,13 +382,13 @@ def _make_retry_server(port: int) -> HTTPServer:
             self.send_response(202)
             self.end_headers()
 
-            threading.Thread(
+            multiprocessing.Process(
                 target=_run_retry,
                 args=(tracking_id,),
                 daemon=True,
                 name=f"retry-{tracking_id[:8]}",
             ).start()
-            logger.info("Retry accepted for tracking_id=%s", tracking_id[:8])
+            logger.info("Retry accepted for tracking_id=%s (spawned process)", tracking_id[:8])
 
         def _handle_import_kb(self):
             if not _kb_import_lock.acquire(blocking=False):
@@ -414,6 +524,195 @@ def _make_retry_server(port: int) -> HTTPServer:
     return HTTPServer(("0.0.0.0", port), RetryHandler)
 
 
+# ── Multiprocessing worker for parallel remediation ──────────────────────────
+
+def _fix_one_process_worker(task: dict):
+    """
+    Worker executed in an independent OS process via ProcessPoolExecutor.
+    Bypasses Python's Global Interpreter Lock (GIL) for true process-level parallelism.
+    """
+    finding = task["finding"]
+    record = task["record"]
+    kb_entry = task["kb_entry"]
+    source_path = task["source_path"]
+    branch_name = task["branch_name"]
+    github_repo = task["github_repo"]
+    github_repo_url = task["github_repo_url"]
+    github_pat = task["github_pat"]
+
+    logger.info(
+        "Processing %s on branch %s in isolated process (PID %d)",
+        finding.component_name, branch_name, os.getpid()
+    )
+
+    tracking_store = make_tracking_store()
+    pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+
+    with RepoOps() as repo:
+        repo.clone_local(source_path, github_repo_url, github_pat)
+        repo._repo.git.fetch('origin', branch_name)
+        repo._repo.git.checkout(branch_name)
+
+        fixer = CodeFixer(repo_path=repo._local_path)
+        ecosystem = get_ecosystem(repo._local_path)
+
+        try:
+            if finding.is_transitive:
+                summary = fixer.run_transitive_fix(
+                    component_name=finding.component_name,
+                    current_version=finding.current_version,
+                    target_version=finding.recommended_version,
+                    introduced_by=finding.introduced_by,
+                    tracking_id=record.tracking_id,
+                    tracking_store=tracking_store,
+                    cve_ids=finding.cve_ids,
+                )
+            else:
+                summary = fixer.run_fresh_fix(
+                    component_name=finding.component_name,
+                    current_version=finding.current_version,
+                    target_version=finding.recommended_version,
+                    tracking_id=record.tracking_id,
+                    tracking_store=tracking_store,
+                    cve_ids=finding.cve_ids,
+                    kb_entry=kb_entry,
+                )
+        except (PomXMLError, PackageJsonError, PythonManifestError) as exc:
+            logger.warning(
+                "Could not process dependency %s in manifest; opening triage issue: %s",
+                finding.component_name, exc,
+            )
+            pr_client.open_triage_issue(
+                finding=finding, bucket=2, rationale=str(exc), kb_entry=kb_entry,
+            )
+            current = tracking_store.get(record.tracking_id)
+            if current is not None:
+                current.status = "TRIAGE_OPENED"
+                tracking_store.update(current)
+            return None
+        except Exception as exc:
+            logger.exception("Fix failed for %s", finding.component_name)
+            current = tracking_store.get(record.tracking_id)
+            if current is not None:
+                current.status = TrackingStatus.ESCALATED.value
+                current.failure_log_excerpt = str(exc)[:4000]
+                tracking_store.update(current)
+            try:
+                pr_client.open_triage_issue(
+                    finding=finding, bucket=2,
+                    rationale=f"Automatic remediation failed: {str(exc)[:1000]}",
+                    kb_entry=kb_entry,
+                )
+            except Exception:
+                pass
+            return None
+
+        tests_passed, test_message = ecosystem.verify_tests(repo._local_path)
+        if not tests_passed:
+            message = f"Runtime verification failed for {finding.component_name}: {test_message[:3500]}"
+            logger.error("%s", message)
+            current = tracking_store.get(record.tracking_id)
+            if current is not None:
+                current.status = TrackingStatus.ESCALATED.value
+                current.failure_log_excerpt = message[:4000]
+                tracking_store.update(current)
+            try:
+                pr_client.open_triage_issue(
+                    finding=finding, bucket=2, rationale=message, kb_entry=kb_entry,
+                )
+            except Exception:
+                pass
+            return None
+
+        # Detect manifest file for diff review (ecosystem-aware)
+        manifest_file = get_manifest_file(Path(repo._local_path))
+
+        try:
+            review = repo.review_dependency_diff(
+                component_name=finding.component_name,
+                target_version=finding.recommended_version,
+                expected_files=summary.files_changed,
+                manifest_file=manifest_file,
+            )
+        except Exception as exc:
+            review = DiffReviewResult(False, f"Diff review could not run: {exc}")
+
+        if not review.passed:
+            message = f"Automated diff review failed: {review.message}"
+            logger.error("%s", message)
+            current = tracking_store.get(record.tracking_id)
+            if current is not None:
+                current.status = TrackingStatus.ESCALATED.value
+                current.failure_log_excerpt = message[:4000]
+                tracking_store.update(current)
+            try:
+                pr_client.open_triage_issue(
+                    finding=finding, bucket=2, rationale=message, kb_entry=kb_entry,
+                )
+            except Exception:
+                pass
+            return None
+
+        fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"
+        commit_msg = (
+            f"fix: upgrade {finding.component_name} to {finding.recommended_version} ({fix_kind})"
+            + (f" ({', '.join(finding.cve_ids)})" if finding.cve_ids else "")
+        )
+
+        lock_path = os.path.join(tempfile.gettempdir(), f"fixer_push_{branch_name.replace('/', '_')}.lock")
+        with FileLock(lock_path, timeout_seconds=180.0):
+            try:
+                repo.commit_changes(commit_msg, files=summary.files_changed)
+                # Fetch and rebase to merge other processes' pushes
+                repo._repo.git.pull('--rebase', 'origin', branch_name)
+                repo.push_branch(branch_name)
+                return (finding, record, summary)
+            except Exception as e:
+                logger.warning("Rebase conflict for %s. Retrying fix holding process lock...", finding.component_name)
+                try:
+                    repo._repo.git.rebase('--abort')
+                except Exception:
+                    pass
+
+                try:
+                    repo._repo.git.fetch('origin', branch_name)
+                    repo._repo.git.reset('--hard', f'origin/{branch_name}')
+
+                    if finding.is_transitive:
+                        summary = fixer.run_transitive_fix(
+                            component_name=finding.component_name,
+                            current_version=finding.current_version,
+                            target_version=finding.recommended_version,
+                            introduced_by=finding.introduced_by,
+                            tracking_id=record.tracking_id,
+                            tracking_store=tracking_store,
+                            cve_ids=finding.cve_ids,
+                        )
+                    else:
+                        summary = fixer.run_fresh_fix(
+                            component_name=finding.component_name,
+                            current_version=finding.current_version,
+                            target_version=finding.recommended_version,
+                            tracking_id=record.tracking_id,
+                            tracking_store=tracking_store,
+                            cve_ids=finding.cve_ids,
+                            kb_entry=kb_entry,
+                        )
+
+                    repo.commit_changes(commit_msg, files=summary.files_changed)
+                    repo.push_branch(branch_name)
+                    return (finding, record, summary)
+                except Exception as inner_e:
+                    logger.error("Failed to re-apply fix during conflict resolution: %s", inner_e)
+                    message = f"Merge conflict could not be automatically resolved: {inner_e}"
+                    current = tracking_store.get(record.tracking_id)
+                    if current is not None:
+                        current.status = TrackingStatus.ESCALATED.value
+                        current.failure_log_excerpt = message[:4000]
+                        tracking_store.update(current)
+                    return None
+
+
 # ── Mode A: fresh scan ────────────────────────────────────────────────────────
 
 def _run_fresh_scan():
@@ -441,13 +740,14 @@ def _do_fresh_scan():
     logger.info("Mode: FRESH SCAN (scheduler-triggered)")
     _fix_state = {"status": "running", "current": 0, "total": 0, "message": "Scanning and classifying findings..."}
 
-    github_repo     = os.environ["GITHUB_REPO_TARGET"]
+    target_repos    = get_target_repos()
+    github_repo     = target_repos[0] if target_repos else get_target_repo()
     github_repo_url = f"https://github.com/{github_repo}.git"
-    github_pat      = os.environ["GITHUB_PAT"]
+    github_pat      = get_github_pat(github_repo)
 
     server_mode = os.environ.get("FIXER_SERVER_MODE", "0") == "1"
 
-    if AUTO_FETCH_SCAN:
+    if AUTO_FETCH_SCAN and not server_mode:
         report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
         logger.info("AUTO_FETCH_SCAN=1 — triggering security-scan workflow on %s", github_repo)
         fetcher = ScanFetcher(
@@ -501,21 +801,42 @@ def _do_fresh_scan():
         source_path, MAX_PARALLEL_FIXES,
     )
 
-    # ── Locality resolution (direct vs. transitive) ───────────────────────────
-    # Ecosystem-pluggable (see ecosystems/) -- Maven-only, single-module POC
-    # scope today. A finding whose locality can't be determined defaults to
-    # is_transitive=False, i.e. falls back to today's pre-existing behavior
-    # (attempt a direct manifest bump) rather than blocking the whole batch
-    # on one lookup failure.
+    # Ecosystem-pluggable (see ecosystems/) -- Maven, npm, and Python are supported.
+    # A finding whose locality can't be determined defaults to direct.
+    # A locality-tool failure is routed to triage; a clean lookup that does not
+    # contain the finding is treated as a stale report and keeps the legacy
+    # direct-dependency fallback.
     ecosystem = get_ecosystem(source_path_obj)
+    locality_failures = {}
+    multi_repo_chain = len(target_repos) > 1
     for finding in findings:
         try:
             locality = ecosystem.resolve_locality(source_path_obj, finding.component_name)
         except EcosystemError as exc:
-            logger.warning(
-                "Locality resolution failed for %s: %s -- treating as direct.",
+            if multi_repo_chain:
+                # The scanner already resolved the dependency graph across the
+                # configured repositories. A local dependency-tree failure must
+                # not suppress the chain coordinator or turn the finding into
+                # manual triage before each repository can be inspected.
+                finding.is_transitive = True
+                finding.introduced_by = None
+                finding.transitive_depth = len(target_repos)
+                logger.warning(
+                    "Locality resolution failed for %s in a multi-repository chain; "
+                    "continuing with scanner-confirmed chain metadata: %s",
+                    finding.component_name,
+                    exc,
+                )
+                continue
+            rationale = (
+                f"Could not resolve dependency locality for {finding.component_name}: "
+                f"{str(exc)[:1000]}. Manual triage required."
+            )
+            logger.error(
+                "Locality resolution failed for %s -- opening triage issue: %s",
                 finding.component_name, exc,
             )
+            locality_failures[finding.component_name] = rationale
             continue
         if not locality.found:
             logger.warning(
@@ -544,7 +865,13 @@ def _do_fresh_scan():
     # Classify all findings; bucket 1/4 get triage issues and are skipped from fixing
     classification = {}  # finding.component_name → ClassifierResult
     for finding in findings:
-        result = classifier.classify(finding)
+        if finding.component_name in locality_failures:
+            result = ClassifierResult(
+                bucket=4,
+                rationale=locality_failures[finding.component_name],
+            )
+        else:
+            result = classifier.classify(finding)
         classification[finding.component_name] = result
         logger.info(
             "Classifier: %s → bucket %d (%s)",
@@ -563,136 +890,177 @@ def _do_fresh_scan():
             )
     # ─────────────────────────────────────────────────────────────────────────
 
+    branch_name = "fix/vulnerability-remediation"
+    
+    if len(target_repos) > 1:
+        logger.info(
+            "Multi-repository dependency chain detected (%d repos: %s). "
+            "Executing MultiRepoChainCoordinator...",
+            len(target_repos), target_repos,
+        )
+        from multi_repo_chain import MultiRepoChainCoordinator
+        coordinator = MultiRepoChainCoordinator(
+            repo_chain=target_repos,
+            github_pat=github_pat,
+            tracking_store=tracking_store,
+            base_branch=base_branch,
+            branch_name=branch_name,
+        )
+        source_repo.cleanup()
+        for finding in findings:
+            result = classification.get(finding.component_name)
+            if result and result.bucket in (1, 4):
+                logger.info("Finding %s is in bucket %d -- skipping multi-repo fix.", finding.component_name, result.bucket)
+                continue
+            coordinator.remediate_finding_across_chain(
+                finding=finding,
+                kb_entry=result.kb_entry if result else None,
+            )
+        logger.info("Multi-repository dependency chain remediation complete.")
+        return
+
     tasks = []
     for finding in findings:
         result = classification[finding.component_name]
         if result.bucket in (1, 4):
             continue  # triage issue already created above
 
-        branch_name = RepoOps.make_branch_name(finding.component_name, finding.current_version)
         record = make_fresh_record(
             vulnerability_id=finding.cve_ids[0] if finding.cve_ids else finding.component_name,
             repo=github_repo,
             component_name=finding.component_name,
             old_version=finding.current_version,
             new_version=finding.recommended_version,
+            is_transitive=finding.is_transitive,
+            introduced_by=finding.introduced_by,
+            transitive_depth=finding.transitive_depth,
         )
         record.branch_name  = branch_name
         record.kb_bucket    = result.bucket
         record.kb_entry_id  = result.kb_entry.entry_id if result.kb_entry else None
         record.classifier_rationale = result.rationale
         tracking_store.create(record)
-        tasks.append((finding, branch_name, record, result.kb_entry))
+        tasks.append((finding, record, result.kb_entry))
 
     _fix_state = {
         "status": "running", "current": 0, "total": len(tasks),
         "message": "Fixing findings..." if tasks else "No fixable findings -- all routed to triage issues.",
     }
 
-    def _fix_one(task):
-        finding, branch_name, record, kb_entry = task
-        logger.info("Processing %s → branch %s", finding.component_name, branch_name)
+    if not tasks:
+        _fix_state["status"] = "done"
+        _fix_state["message"] = "No fixable findings -- all routed to triage issues."
+        source_repo.cleanup()
+        return
 
-        with RepoOps() as repo:
-            repo.clone_local(source_path, github_repo_url, github_pat)
-            branch_created = repo.create_branch(branch_name, skip_if_exists=True)
-            if not branch_created:
-                # The branch existing means a PR was very likely opened for
-                # it on some earlier run -- attach it (whatever its current
-                # state) rather than silently abandoning this tracking
-                # record at CREATED forever. find_any_pr checks state="all",
-                # not just "open", so a PR that's since been closed manually
-                # still gets linked -- see PRClient.find_any_pr's docstring.
-                existing_pr = pr_client.find_any_pr(branch_name, base_branch)
-                if existing_pr:
-                    logger.info(
-                        "Branch already exists for %s -- found PR #%d (%s), attaching to tracking record.",
-                        finding.component_name, existing_pr.pr_number, existing_pr.pr_url,
-                    )
-                    current = tracking_store.get(record.tracking_id)
-                    current.pr_number = existing_pr.pr_number
+    # Create the shared branch once before threads start
+    with RepoOps() as init_repo:
+        init_repo.clone(github_repo_url, github_pat)
+        branch_created = init_repo.create_branch(
+            branch_name,
+            skip_if_exists=True,
+            base_branch=base_branch,
+        )
+        if not branch_created:
+            existing_open_pr = pr_client._find_open_pr(branch_name, base_branch)
+            if existing_open_pr:
+                logger.info(
+                    "Branch already exists with active open PR #%d (%s) -- attaching to tracking records.",
+                    existing_open_pr.number, existing_open_pr.html_url,
+                )
+                for finding, record, kb_entry in tasks:
+                    current = tracking_store.get(record.tracking_id) or record
+                    current.pr_number = existing_open_pr.number
                     current.status = TrackingStatus.PR_OPENED.value
                     tracking_store.update(current)
-                else:
-                    logger.warning(
-                        "Branch already exists for %s but no PR found for it in any "
-                        "state -- leaving tracking record as CREATED for manual investigation.",
-                        finding.component_name,
-                    )
-                return None
+                source_repo.cleanup()
+                return
+            else:
+                logger.info(
+                    "Remote branch '%s' exists but has no open PR (previous PR was closed/merged). "
+                    "Resetting remote branch from %s so a fresh remediation PR can be opened.",
+                    branch_name, base_branch,
+                )
+                try:
+                    init_repo._repo.git.push('origin', '--delete', branch_name)
+                    logger.info("Deleted stale remote branch '%s' on origin", branch_name)
+                except Exception as del_err:
+                    logger.warning("Could not delete stale remote branch: %s", del_err)
 
-            fixer = CodeFixer(repo_path=repo._local_path)
-            try:
-                if finding.is_transitive:
-                    summary = fixer.run_transitive_fix(
-                        component_name=finding.component_name,
-                        current_version=finding.current_version,
-                        target_version=finding.recommended_version,
-                        introduced_by=finding.introduced_by,
-                        tracking_id=record.tracking_id,
-                        tracking_store=tracking_store,
-                        cve_ids=finding.cve_ids,
-                    )
-                else:
-                    summary = fixer.run_fresh_fix(
-                        component_name=finding.component_name,
-                        current_version=finding.current_version,
-                        target_version=finding.recommended_version,
-                        tracking_id=record.tracking_id,
-                        tracking_store=tracking_store,
-                        cve_ids=finding.cve_ids,
-                        kb_entry=kb_entry,
-                    )
-            except Exception as exc:
-                logger.error("Fix failed for %s: %s", finding.component_name, exc)
-                return None
-
-            fix_kind = f"transitive, via {finding.introduced_by}" if finding.is_transitive else "direct"
-            commit_msg = (
-                f"fix: upgrade {finding.component_name} to {finding.recommended_version} ({fix_kind})"
-                + (f" ({', '.join(finding.cve_ids)})" if finding.cve_ids else "")
-            )
-            repo.commit_changes(commit_msg)
-            repo.push_branch(branch_name)
-
-        return (finding, branch_name, record, summary)
-
-    try:
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_FIXES) as executor:
-            futures = {executor.submit(_fix_one, t): t for t in tasks}
-
-            for future in as_completed(futures):
-                result = future.result()
-                _fix_state["current"] += 1
-                _fix_state["message"] = f"Processed {_fix_state['current']}/{_fix_state['total']} finding(s)..."
-                if result is None:
-                    continue
-
-                finding, branch_name, record, summary = result
-
-                pr_result = pr_client.open_remediation_pr(
-                    branch_name=branch_name,
+                # Recreate branch from fresh base_branch
+                init_repo.checkout_base_branch(base_branch)
+                try:
+                    init_repo._repo.git.pull('origin', base_branch)
+                except Exception:
+                    pass
+                if branch_name in [h.name for h in init_repo._repo.heads]:
+                    try:
+                        init_repo._repo.git.branch('-D', branch_name)
+                    except Exception:
+                        pass
+                init_repo.create_branch(
+                    branch_name,
+                    skip_if_exists=False,
                     base_branch=base_branch,
-                    change_summary=summary,
                 )
 
-                record = tracking_store.get(record.tracking_id)
-                record.pr_number = pr_result.pr_number
-                record.status = TrackingStatus.PR_OPENED.value
-                tracking_store.update(record)
+        # push the initial branch so workers can pull from it
+        init_repo.push_branch(branch_name)
 
-                if pr_result.was_existing:
-                    logger.info("PR already existed: %s", pr_result.pr_url)
-                else:
-                    logger.info("Opened PR #%d: %s", pr_result.pr_number, pr_result.pr_url)
-                    record.status = TrackingStatus.CI_PENDING.value
-                    tracking_store.update(record)
+    worker_tasks = [
+        {
+            "finding": finding,
+            "record": record,
+            "kb_entry": kb_entry,
+            "source_path": source_path,
+            "branch_name": branch_name,
+            "github_repo": github_repo,
+            "github_repo_url": github_repo_url,
+            "github_pat": github_pat,
+            "base_branch": base_branch,
+        }
+        for finding, record, kb_entry in tasks
+    ]
+
+    successful_fixes = []
+
+    try:
+        logger.info(
+            "Executing %d remediation task(s) using ProcessPoolExecutor (max_workers=%d, multiprocessing)",
+            len(worker_tasks), MAX_PARALLEL_FIXES,
+        )
+        with ProcessPoolExecutor(max_workers=MAX_PARALLEL_FIXES) as executor:
+            futures = {executor.submit(_fix_one_process_worker, t): t for t in worker_tasks}
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                    if res:
+                        successful_fixes.append(res)
+                except Exception as exc:
+                    logger.error("Process worker error: %s", exc, exc_info=True)
     finally:
         source_repo.cleanup()
         logger.info("Source clone cleaned up.")
 
+    if successful_fixes:
+        pr_result = pr_client.open_combined_remediation_pr(
+            branch_name=branch_name,
+            base_branch=base_branch,
+            successful_fixes=successful_fixes,
+        )
+        for finding, record, summary in successful_fixes:
+            current = tracking_store.get(record.tracking_id) or record
+            current.pr_number = pr_result.pr_number
+            current.status = TrackingStatus.PR_OPENED.value if pr_result.was_existing else TrackingStatus.CI_PENDING.value
+            tracking_store.update(current)
+            
+        if pr_result.was_existing:
+            logger.info("Combined PR already existed: %s", pr_result.pr_url)
+        else:
+            logger.info("Opened Combined PR #%d: %s", pr_result.pr_number, pr_result.pr_url)
+
     _fix_state["status"] = "done"
-    _fix_state["message"] = f"Done -- {_fix_state['current']}/{_fix_state['total']} finding(s) processed."
+    _fix_state["message"] = f"Done -- {len(successful_fixes)}/{len(tasks)} finding(s) fixed."
 
 
 # ── Mode B: Watcher retry ─────────────────────────────────────────────────────
@@ -700,9 +1068,9 @@ def _do_fresh_scan():
 def _run_retry(tracking_id: str):
     logger.info("Mode: WATCHER RETRY (tracking_id=%s)", tracking_id[:8])
 
-    github_repo     = os.environ["GITHUB_REPO_TARGET"]
+    github_repo     = get_target_repo()
     github_repo_url = f"https://github.com/{github_repo}.git"
-    github_pat      = os.environ["GITHUB_PAT"]
+    github_pat      = get_github_pat()
 
     tracking_store = make_tracking_store()
     record = tracking_store.get(tracking_id)
@@ -718,66 +1086,152 @@ def _run_retry(tracking_id: str):
         )
         sys.exit(1)
 
-    with RepoOps() as repo:
-        repo.clone(github_repo_url, github_pat)
-        repo._repo.git.checkout(record.branch_name)
+    try:
+        with RepoOps() as repo:
+            repo.clone(github_repo_url, github_pat)
+            repo._repo.git.checkout(record.branch_name)
 
-        fixer = CodeFixer(repo_path=repo._local_path)
-        try:
+            fixer = CodeFixer(repo_path=repo._local_path)
             summary = fixer.run_retry_fix(
                 tracking_id=tracking_id,
                 tracking_store=tracking_store,
             )
-        except InvalidRetryError as exc:
-            logger.error("Retry validation failed: %s", exc)
-            sys.exit(1)
-        except EngineExecutionError as exc:
-            # The FixEngine itself failed to run (CLI crash/timeout/missing
-            # binary) -- it never produced a fix to evaluate, so this is not
-            # the same as a fix attempt that ran and turned out wrong. Don't
-            # let the record silently rot in RETRY_REQUESTED forever: mark it
-            # ENGINE_ERROR (excluded from count_attempts_for_pr, so it won't
-            # consume retry budget) and escalate to a human via the PR
-            # instead of leaving the Watcher polling a branch nothing was
-            # ever pushed to.
-            logger.error("Fixer engine failed to run for retry %s: %s", tracking_id[:8], exc)
-            record.status = TrackingStatus.ENGINE_ERROR.value
-            tracking_store.update(record)
-            pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+
+            # A retry must not push a source edit that the CI build will reject.
+            # The engine is instructed to compile, but this gate is authoritative
+            # and also covers engines that cannot execute Maven locally.
+            retry_ecosystem = get_ecosystem(repo._local_path)
+            compiled, compile_message = retry_ecosystem.verify_build(repo._local_path)
+            if not compiled:
+                message = (
+                    f"Retry verification failed for {record.component_name}: "
+                    f"{compile_message[:3500]}"
+                )
+                logger.error("%s", message)
+                current = tracking_store.get(tracking_id)
+                if current is not None:
+                    current.status = TrackingStatus.ESCALATED.value
+                    current.failure_log_excerpt = message[:4000]
+                    tracking_store.update(current)
+                return
+
+            # Detect manifest file for diff review (ecosystem-aware)
+            retry_manifest_file = get_manifest_file(Path(repo._local_path))
+
             try:
-                pr_client.add_comment(
-                    record.pr_number,
-                    "## OSS Remediation Agent — Engine Failure\n\n"
-                    f"Fix attempt {record.attempt_number} could not run "
-                    "(the tooling that generates fixes failed, not the fix itself -- "
-                    "e.g. a crash, timeout, or missing dependency). This attempt did "
-                    "not consume a retry, but automatic retries are paused pending "
-                    f"investigation.\n\n**Error:**\n```\n{str(exc)[:1500]}\n```\n\n"
-                    "Please investigate the Fixer's engine configuration before "
-                    "re-triggering a fix for this PR.",
+                review = repo.review_dependency_diff(
+                    component_name=record.component_name,
+                    target_version=record.new_version,
+                    expected_files=summary.files_changed,
+                    allow_manifest_already_applied=True,
+                    manifest_file=retry_manifest_file,
                 )
-            except Exception as comment_exc:
-                logger.error(
-                    "Could not post engine-failure comment on PR #%s: %s",
-                    record.pr_number, comment_exc,
+            except Exception as exc:
+                review = DiffReviewResult(False, f"Diff review could not run: {exc}")
+            if not review.passed:
+                message = f"Automated diff review failed: {review.message}"
+                logger.error("%s", message)
+                current = tracking_store.get(tracking_id)
+                if current is not None:
+                    current.status = TrackingStatus.ESCALATED.value
+                    current.failure_log_excerpt = message[:4000]
+                    tracking_store.update(current)
+                triage_finding = SimpleNamespace(
+                    component_name=record.component_name,
+                    current_version=record.old_version,
+                    recommended_version=record.new_version,
+                    severity="unknown",
+                    cve_ids=[record.vulnerability_id] if record.vulnerability_id else [],
                 )
-            sys.exit(1)
+                try:
+                    PRClient(repo_full_name=github_repo, github_pat=github_pat).open_triage_issue(
+                        finding=triage_finding,
+                        bucket=2,
+                        rationale=message,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not open triage issue after retry diff review failure for %s.",
+                        record.component_name,
+                    )
+                return
 
-        commit_msg = (
-            f"fix(retry): attempt {record.attempt_number} — "
-            f"{summary.rationale[:120] if summary.rationale else 'CI failure fix'}"
+            commit_msg = (
+                f"fix(retry): attempt {record.attempt_number} — "
+                f"{summary.rationale[:120] if summary.rationale else 'CI failure fix'}"
+            )
+            repo.commit_changes(commit_msg, files=summary.files_changed)
+            repo.push_branch(record.branch_name)
+
+        current = tracking_store.get(tracking_id)
+        if current is not None:
+            current.status = TrackingStatus.CI_PENDING.value
+            tracking_store.update(current)
+
+        # Synchronize all records associated with this PR to CI_PENDING
+        all_records = (
+            tracking_store.get_all_for_pr(record.pr_number)
+            if hasattr(tracking_store, "get_all_for_pr")
+            else []
         )
-        repo.commit_changes(commit_msg)
-        repo.push_branch(record.branch_name)
+        for r in all_records:
+            if r.status in (TrackingStatus.CI_FAILED.value, TrackingStatus.ENGINE_ERROR.value):
+                r.status = TrackingStatus.CI_PENDING.value
+                tracking_store.update(r)
 
-    record = tracking_store.get(tracking_id)
-    record.status = TrackingStatus.CI_PENDING.value
-    tracking_store.update(record)
-
-    logger.info(
-        "Retry fix pushed for PR #%s on branch '%s'.",
-        record.pr_number, record.branch_name,
-    )
+        logger.info(
+            "Retry fix pushed for PR #%s on branch '%s'.",
+            record.pr_number, record.branch_name,
+        )
+    except InvalidRetryError as exc:
+        logger.error("Retry validation failed for %s: %s", tracking_id[:8], exc)
+        current = tracking_store.get(tracking_id)
+        if current is not None:
+            current.status = TrackingStatus.ESCALATED.value
+            current.failure_log_excerpt = f"Retry validation failed: {exc}"[:4000]
+            tracking_store.update(current)
+    except EngineExecutionError as exc:
+        logger.error("Fixer engine failed to run for retry %s: %s", tracking_id[:8], exc)
+        current = tracking_store.get(tracking_id)
+        if current is not None:
+            current.status = TrackingStatus.ENGINE_ERROR.value
+            current.failure_log_excerpt = f"Engine execution error: {exc}"[:4000]
+            tracking_store.update(current)
+        try:
+            pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+            pr_client.add_comment(
+                record.pr_number,
+                "## OSS Remediation Agent — Engine Failure\n\n"
+                f"Fix attempt {record.attempt_number} could not run "
+                "(the tooling that generates fixes failed, not the fix itself -- "
+                "e.g. a crash, timeout, or missing dependency). This attempt did "
+                "not consume a retry, but automatic retries are paused pending "
+                f"investigation.\n\n**Error:**\n```\n{str(exc)[:1500]}\n```\n\n"
+                "Please investigate the Fixer's engine configuration before "
+                "re-triggering a fix for this PR.",
+            )
+        except Exception as comment_exc:
+            logger.error(
+                "Could not post engine-failure comment on PR #%s: %s",
+                record.pr_number, comment_exc,
+            )
+    except Exception as exc:
+        logger.exception("Unexpected error during retry for %s: %s", tracking_id[:8], exc)
+        current = tracking_store.get(tracking_id)
+        if current is not None:
+            current.status = TrackingStatus.ESCALATED.value
+            current.failure_log_excerpt = f"Unexpected retry error: {exc}"[:4000]
+            tracking_store.update(current)
+        try:
+            pr_client = PRClient(repo_full_name=github_repo, github_pat=github_pat)
+            pr_client.add_comment(
+                record.pr_number,
+                f"## OSS Remediation Agent — Retry Escalation\n\n"
+                f"Fix attempt {record.attempt_number} encountered an error: `{exc}`. "
+                "Automatic retry has been escalated for manual review.",
+            )
+        except Exception as comment_exc:
+            logger.error("Could not post escalation comment on PR #%s: %s", record.pr_number, comment_exc)
 
 
 if __name__ == "__main__":

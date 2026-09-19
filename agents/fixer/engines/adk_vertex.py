@@ -24,7 +24,10 @@ from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
 from ecosystems.maven import compile_repo, test_repo
-from engines.base import FixResult
+from ecosystems.npm import install_and_build as npm_install_and_build, test_repo as npm_test_repo
+from ecosystems.python import install_and_build as python_install_and_build, test_repo as python_test_repo
+from ecosystems.factory import get_ecosystem
+from engines.base import FixResult, EngineExecutionError
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +35,14 @@ MAX_TOOL_ROUNDS = 10  # Passed to ADK Runner as max_llm_calls to guard runaway l
 RUN_TESTS = os.environ.get("RUN_TESTS", "0") == "1"  # Opt-in -- see run_maven_test below
 
 
-class CodeFixerError(Exception):
+class CodeFixerError(EngineExecutionError):
     """Raised when the model response cannot be parsed into the expected format."""
 
 
 class AdkVertexEngine:
     """Runs a fix prompt through an ADK Agent on Vertex AI (Gemini), giving
-    it four local FunctionTools (read/grep/apply_change/compile) to edit the
-    cloned repo in place -- plus a fifth (run_maven_test) when RUN_TESTS=1.
+    it local FunctionTools (read/grep/apply_change/compile/test) to edit the
+    cloned repo in place.
     """
 
     supports_tests = True  # see engines/base.py's FixEngine.supports_tests
@@ -56,6 +59,12 @@ class AdkVertexEngine:
     def run_fix(self, repo_path: Path, prompt: str) -> FixResult:
         self._repo_path = repo_path
         self._applied_changes: list = []
+
+        # Detect ecosystem to provide the right build/test tools
+        is_npm = (repo_path / "package.json").exists() and not (repo_path / "pom.xml").exists()
+        is_python = not is_npm and not (repo_path / "pom.xml").exists() and any(
+            (repo_path / name).exists() for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "setup.cfg")
+        )
 
         # ADK derives tool names from func.__name__. Instance methods have names
         # like "_tool_grep_files" but the prompt tells the LLM to call "grep_files".
@@ -78,82 +87,150 @@ class AdkVertexEngine:
             """Compile the repository with 'mvn compile -q'. No tests are executed."""
             return self._tool_run_maven_compile()
 
-        tools = [
+        def run_maven_test() -> str:
+            """Run the repository tests with 'mvn -B test -q'."""
+            return self._tool_run_maven_test()
+
+        def run_npm_install() -> str:
+            """Run 'npm install' to install dependencies and verify the build."""
+            return self._tool_run_npm_install()
+
+        def run_npm_test() -> str:
+            """Run 'npm test' with a bounded timeout."""
+            return self._tool_run_npm_test()
+
+        def run_python_install() -> str:
+            """Install Python dependencies and run compileall."""
+            return self._tool_run_python_install()
+
+        def run_python_test() -> str:
+            """Run Python tests with a bounded timeout."""
+            return self._tool_run_python_test()
+
+        common_tools = [
             FunctionTool(func=read_file),
             FunctionTool(func=grep_files),
             FunctionTool(func=apply_file_change),
-            FunctionTool(func=run_maven_compile),
         ]
 
-        if RUN_TESTS:
-            def run_maven_test() -> str:
-                """Run the full test suite with 'mvn test -q'. Only call this after
-                run_maven_compile has already succeeded."""
-                return self._tool_run_maven_test()
+        tools = list(common_tools)
+        if is_npm:
+            tools.append(FunctionTool(func=run_npm_install))
+            if RUN_TESTS:
+                tools.append(FunctionTool(func=run_npm_test))
+        elif is_python:
+            tools.append(FunctionTool(func=run_python_install))
+            if RUN_TESTS:
+                tools.append(FunctionTool(func=run_python_test))
+        else:
+            tools.append(FunctionTool(func=run_maven_compile))
+            if RUN_TESTS:
+                tools.append(FunctionTool(func=run_maven_test))
 
-            tools.append(FunctionTool(func=run_maven_test))
+        system_instruction = (
+            "You are an autonomous vulnerability remediation agent. "
+            "Use the provided tools to inspect files, apply surgical edits, "
+            "and verify repository compilation and tests."
+        )
 
         agent = Agent(
             name="code_fixer",
             model=self._model_name,
-            instruction=prompt,
+            instruction=system_instruction,
             tools=tools,
         )
 
-        reasoning, prompt_tokens, completion_tokens = asyncio.run(self._run_agent_async(agent))
+        # Sanitize any ${VAR} syntax from compiler/CI failure logs so template parsers never crash
+        safe_prompt = re.sub(r'\$\{([a-zA-Z0-9_]+)\}', r'$(\1)', prompt)
+
+        try:
+            reasoning, prompt_tokens, completion_tokens = asyncio.run(
+                asyncio.wait_for(self._run_agent_async(agent, safe_prompt), timeout=360.0)
+            )
+        except asyncio.TimeoutError as exc:
+            logger.error("ADK Vertex runner timed out after 360s")
+            raise EngineExecutionError("ADK Vertex agent runner timed out after 360s") from exc
+        except Exception as exc:
+            if not isinstance(exc, EngineExecutionError):
+                raise EngineExecutionError(f"ADK Vertex engine failed: {exc}") from exc
+            raise
+
         return FixResult(
-            rationale=reasoning.get("rationale", ""),
+            rationale=reasoning.get("rationale", "") if isinstance(reasoning, dict) else str(reasoning),
             files_changed=list(dict.fromkeys(self._applied_changes)),
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            model_name=self._model_name,
         )
 
-    async def _run_agent_async(self, agent: Agent) -> tuple:
+    async def _run_agent_async(self, agent: Agent, prompt: str) -> tuple:
         """Async runner for the ADK agent. Called via asyncio.run() from run_fix."""
-        session_service = InMemorySessionService()
-        runner = Runner(
-            agent=agent,
-            app_name="vuln-code-fixer",
-            session_service=session_service,
-        )
-
-        session = await session_service.create_session(
-            app_name="vuln-code-fixer",
-            user_id="fixer",
-        )
-
         trigger = genai_types.Content(
             role="user",
-            parts=[genai_types.Part(text="Execute the fix based on your instructions.")],
+            parts=[genai_types.Part(text=prompt)],
         )
 
-        final_text = ""
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
+        max_rate_attempts = 4
+        for attempt in range(1, max_rate_attempts + 1):
+            session_service = InMemorySessionService()
+            runner = Runner(
+                agent=agent,
+                app_name="vuln-code-fixer",
+                session_service=session_service,
+            )
 
-        async for event in runner.run_async(
-            user_id="fixer",
-            session_id=session.id,
-            new_message=trigger,
-        ):
-            if event.is_final_response() and event.content:
-                for part in event.content.parts:
-                    if hasattr(part, "text") and part.text:
-                        final_text += part.text
+            session = await session_service.create_session(
+                app_name="vuln-code-fixer",
+                user_id="fixer",
+            )
 
-            usage = getattr(event, "usage_metadata", None)
-            if usage:
-                total_prompt_tokens     += getattr(usage, "prompt_token_count",     0) or 0
-                total_completion_tokens += getattr(usage, "candidates_token_count", 0) or 0
+            final_text = ""
+            total_prompt_tokens = 0
+            total_completion_tokens = 0
+
+            try:
+                async for event in runner.run_async(
+                    user_id="fixer",
+                    session_id=session.id,
+                    new_message=trigger,
+                ):
+                    if event.is_final_response() and event.content:
+                        for part in event.content.parts:
+                            if hasattr(part, "text") and part.text:
+                                final_text += part.text
+
+                    usage = getattr(event, "usage_metadata", None)
+                    if usage:
+                        total_prompt_tokens     += getattr(usage, "prompt_token_count",     0) or 0
+                        total_completion_tokens += getattr(usage, "candidates_token_count", 0) or 0
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                is_rate_limit = "429" in err_str or "resource_exhausted" in err_str or "resourceexhausted" in type(e).__name__.lower()
+                if is_rate_limit and attempt < max_rate_attempts:
+                    backoff = attempt * 20
+                    logger.warning(
+                        f"ADK Vertex rate limit encountered ({type(e).__name__}). Backing off for {backoff}s (attempt {attempt}/{max_rate_attempts})..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
 
         json_match = re.search(r"```json\s*(.*?)\s*```", final_text, re.DOTALL)
         json_str = json_match.group(1) if json_match else final_text.strip()
-        try:
-            reasoning = json.loads(json_str)
-        except json.JSONDecodeError as exc:
-            raise CodeFixerError(
-                f"Model response could not be parsed as JSON: {exc}\n\nRaw:\n{final_text}"
-            ) from exc
+        reasoning = {}
+        if json_str:
+            try:
+                reasoning = json.loads(json_str)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Model response was not valid JSON; falling back to text rationale: %s",
+                    final_text[:200],
+                )
+                reasoning = {"rationale": final_text.strip()}
+        else:
+            logger.warning("Model response was empty; using fallback rationale.")
+            reasoning = {"rationale": "Applied fix based on vulnerability scan recommendations."}
 
         return reasoning, total_prompt_tokens, total_completion_tokens
 
@@ -163,7 +240,13 @@ class AdkVertexEngine:
         """Read the full contents of a file in the cloned repository."""
         if not relative_path:
             return "ERROR: relative_path is required."
-        target = self._repo_path / relative_path
+        try:
+            target = (self._repo_path / relative_path).resolve()
+            if not target.is_relative_to(self._repo_path.resolve()):
+                return "ERROR: Path traversal detected."
+        except ValueError:
+            return "ERROR: Invalid path."
+            
         if not target.exists():
             return f"ERROR: File not found: {relative_path}"
         try:
@@ -178,7 +261,22 @@ class AdkVertexEngine:
         """Search for a regex pattern across repository source files."""
         if not pattern:
             return "ERROR: pattern is required."
-        exts = set(extensions) if extensions else {".java", ".xml", ".properties", ".yml", ".yaml"}
+        is_npm = (self._repo_path / "package.json").exists() and not (self._repo_path / "pom.xml").exists()
+        is_python = not is_npm and not (self._repo_path / "pom.xml").exists() and any(
+            (self._repo_path / name).exists() for name in ("pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "setup.cfg")
+        )
+        if extensions:
+            exts = set(extensions)
+        elif is_npm:
+            exts = {".js", ".ts", ".jsx", ".tsx", ".json", ".mjs", ".cjs", ".yml", ".yaml"}
+        elif is_python:
+            exts = {".py", ".toml", ".txt", ".yml", ".yaml", ".ini", ".cfg"}
+        else:
+            exts = {".java", ".xml", ".properties", ".yml", ".yaml"}
+        exclude_dirs = (
+            {"node_modules", ".next", "dist", ".nuxt"} if is_npm
+            else ({"target"} if not is_python else {".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist"})
+        )
         try:
             compiled = re.compile(pattern)
         except re.error as exc:
@@ -186,7 +284,7 @@ class AdkVertexEngine:
 
         results = []
         for f in sorted(self._repo_path.rglob("*")):
-            if "target" in f.parts or f.suffix not in exts:
+            if exclude_dirs.intersection(f.parts) or f.suffix not in exts:
                 continue
             try:
                 lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
@@ -220,7 +318,13 @@ class AdkVertexEngine:
         """
         if not relative_path or not find:
             return "ERROR: relative_path and find are both required."
-        target = self._repo_path / relative_path
+        try:
+            target = (self._repo_path / relative_path).resolve()
+            if not target.is_relative_to(self._repo_path.resolve()):
+                return "ERROR: Path traversal detected."
+        except ValueError:
+            return "ERROR: Invalid path."
+            
         if not target.exists():
             return f"ERROR: File not found: {relative_path}"
         content = target.read_text(encoding="utf-8")
@@ -241,6 +345,24 @@ class AdkVertexEngine:
         return message
 
     def _tool_run_maven_test(self) -> str:
-        """Run the full test suite with 'mvn test -q'. Only wired up when RUN_TESTS=1."""
+        """Run the repository tests with 'mvn test -q'."""
         _, message = test_repo(self._repo_path)
+        return message
+
+    def _tool_run_npm_install(self) -> str:
+        """Run 'npm install' to install dependencies and verify the build."""
+        _, message = npm_install_and_build(self._repo_path)
+        return message
+
+    def _tool_run_npm_test(self) -> str:
+        """Run 'npm test' with a bounded timeout."""
+        _, message = npm_test_repo(self._repo_path)
+        return message
+
+    def _tool_run_python_install(self) -> str:
+        _, message = python_install_and_build(self._repo_path)
+        return message
+
+    def _tool_run_python_test(self) -> str:
+        _, message = python_test_repo(self._repo_path)
         return message

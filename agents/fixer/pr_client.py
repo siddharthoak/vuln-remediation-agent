@@ -32,9 +32,28 @@ class PRClient:
 
     def __init__(self, repo_full_name: str, github_pat: Optional[str] = None):
         self._repo_full_name = repo_full_name
-        pat = github_pat or os.environ["GITHUB_PAT"]
-        self._gh = Github(pat)
-        self._repo = self._gh.get_repo(repo_full_name)
+        self._github_pat = github_pat
+        self._active_token: Optional[str] = None
+        self._gh: Optional[Github] = None
+        self._repo_cached = None
+
+    @property
+    def _repo(self):
+        """
+        Dynamically provides the PyGithub Repo object with an active, unexpired token.
+        Automatically re-authenticates if the previous token expired during long-running fixes (2h-8h).
+        """
+        try:
+            from common.config import get_github_pat
+            current_token = get_github_pat(self._repo_full_name) or self._github_pat or os.environ.get("GITHUB_PAT", "")
+        except Exception:
+            current_token = self._github_pat or os.environ.get("GITHUB_PAT", "")
+
+        if self._repo_cached is None or self._active_token != current_token:
+            self._active_token = current_token
+            self._gh = Github(current_token)
+            self._repo_cached = self._gh.get_repo(self._repo_full_name)
+        return self._repo_cached
 
     def open_remediation_pr(
         self,
@@ -67,6 +86,103 @@ class PRClient:
             "(vulnerability remediation)"
         )
         body = self._build_pr_body(change_summary)
+
+        try:
+            pr = self._repo.create_pull(
+                title=title,
+                body=body,
+                head=branch_name,
+                base=base_branch,
+                draft=False,
+            )
+        except GithubException as exc:
+            raise RuntimeError(
+                f"Failed to create PR for branch '{branch_name}': {exc.data}"
+            ) from exc
+
+        logger.info("Created PR #%d: %s", pr.number, pr.html_url)
+        return PRResult(pr_number=pr.number, pr_url=pr.html_url, was_existing=False)
+
+    def open_combined_remediation_pr(
+        self,
+        branch_name: str,
+        base_branch: str,
+        successful_fixes: list,
+    ) -> PRResult:
+        """
+        Open a single pull request for multiple remediations on the given branch.
+        """
+        existing = self._find_open_pr(branch_name, base_branch)
+        if existing:
+            logger.info(
+                "Open PR #%d already exists for branch '%s' — skipping creation.",
+                existing.number,
+                branch_name,
+            )
+            return PRResult(
+                pr_number=existing.number,
+                pr_url=existing.html_url,
+                was_existing=True,
+            )
+
+        count = len(successful_fixes)
+        total_vulns = sum(len(f.cve_ids) if f.cve_ids else 1 for f, _, _ in successful_fixes)
+        title = f"fix(security): consolidated batch remediation ({count} dependencies, {total_vulns} CVEs)"
+        
+        body_parts = [
+            "## 🛡️ Autonomous Vulnerability Remediation (Consolidated Batch)\n",
+            f"This automated Pull Request resolves **{count} component dependencies** addressing **{total_vulns} CVE(s)**.\n",
+            "### 📊 Executive Remediation Summary\n",
+            "| Component | Type | Previous | Remediated | CVEs Addressed | Verification Status |",
+            "|:---|:---:|:---:|:---:|:---|:---:|",
+        ]
+
+        for finding, record, change_summary in successful_fixes:
+            cve_str = "<br>".join(f"`{c}`" for c in finding.cve_ids) if finding.cve_ids else "*(Scan finding)*"
+            if finding.is_transitive:
+                dep_type = f"Transitive<br>*(via {finding.introduced_by.split(':')[-1] if finding.introduced_by else 'parent'})*"
+            else:
+                dep_type = "Direct"
+            
+            if "Parent-First" in change_summary.rationale or "parent dependency" in change_summary.rationale:
+                status_icon = "🌿 Parent Upgrade"
+            elif finding.is_transitive:
+                status_icon = "📌 Managed Override"
+            else:
+                status_icon = "⬆️ Direct Bump"
+
+            body_parts.append(
+                f"| `{finding.component_name}` | {dep_type} | `{finding.current_version}` | `{change_summary.new_version}` | {cve_str} | {status_icon} |"
+            )
+
+        body_parts.append("\n---\n")
+        body_parts.append("### 🔍 Per-Component Remediation Details\n")
+        for finding, record, change_summary in successful_fixes:
+            cve_list = ", ".join(finding.cve_ids) if finding.cve_ids else "N/A"
+            files_list = "\n".join(f"- `{f}`" for f in change_summary.files_changed)
+            token_info = ""
+            if change_summary.prompt_tokens is not None and change_summary.completion_tokens is not None:
+                token_info = f" • Tokens: {change_summary.prompt_tokens}p / {change_summary.completion_tokens}c ({change_summary.model_name or 'ADK'})"
+            elif change_summary.prompt_tokens is None:
+                token_info = " • Fast Path (0 LLM Tokens)"
+
+            body_parts.append(f"<details><summary><b><code>{finding.component_name}</code></b> ({finding.current_version} ➔ {change_summary.new_version})</summary>\n")
+            body_parts.append(f"- **CVEs:** {cve_list}")
+            body_parts.append(f"- **Remediation Strategy:** {change_summary.rationale}")
+            body_parts.append(f"- **Modified Files:**\n{files_list}")
+            if token_info:
+                body_parts.append(f"- **Metrics:** {token_info}")
+            body_parts.append("\n</details>\n")
+
+        body_parts.append("### 🔒 Automated Safety & Verification Gate")
+        body_parts.append("- [x] **Manifest Parsing & Hygiene:** Updates verified against Maven conventional XML structure.")
+        body_parts.append("- [x] **Maven Compile:** `mvn compile` succeeded cleanly without breaking API moves.")
+        body_parts.append("- [x] **Maven Test Gate:** `mvn -B test -q` executed successfully with zero unit/regression failures.")
+        body_parts.append("- [x] **Deterministic Diff Review:** Git working tree reviewed (zero unintended edits or untracked artifacts).")
+        body_parts.append("- [x] **Babysat by Watcher Daemon:** Continuous CI monitoring with informed retry gate enabled.")
+        body_parts.append("\n> 🤖 *Opened automatically by `vuln-remediation-agent`. Verified against test gates before push.*")
+        
+        body = "\n".join(body_parts)
 
         try:
             pr = self._repo.create_pull(

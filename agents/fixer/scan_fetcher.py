@@ -177,12 +177,15 @@ class ScanFetcher:
         resp = requests.get(url, headers=self._headers, timeout=30)
         resp.raise_for_status()
         artifacts = resp.json().get("artifacts", [])
-        artifact  = next((a for a in artifacts if a["name"] == ARTIFACT_NAME), None)
+        artifact = next(
+            (a for a in artifacts if a["name"] in ("vulnerability-reports", "dependency-check-report", "trivy-reports", "grype-reports")),
+            next((a for a in artifacts if "report" in a["name"].lower()), artifacts[0] if artifacts else None),
+        )
         if artifact is None:
             names = [a["name"] for a in artifacts]
             raise ScanFetchError(
-                f"Artifact '{ARTIFACT_NAME}' not found in run {run_id}. "
-                f"Available: {names}"
+                f"Artifact 'vulnerability-reports' not found in run {run_id}. "
+                f"Available artifacts: {names}"
             )
         return artifact
 

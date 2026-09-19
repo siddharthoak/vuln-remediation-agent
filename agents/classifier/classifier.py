@@ -1,5 +1,5 @@
 """
-Classifier — assigns each VulnerabilityFinding to a processing bucket (1–4).
+Classifier — assigns each VulnerabilityFinding to a processing bucket (1-4).
 
 Pure Python: no LLM calls, no network I/O. Reads only from the KB store.
 
@@ -35,6 +35,17 @@ COMPLEX_FRAMEWORKS = frozenset({
     "wicket-core",
     "jsf-api",
     "myfaces-impl",
+    "express",
+    "next",
+    "nuxt",
+    "react",
+    "react-dom",
+    "angular",
+    "@angular/core",
+    "vue",
+    "gatsby",
+    "nestjs",
+    "@nestjs/core",
 })
 
 
@@ -58,8 +69,10 @@ class Classifier:
         old_ver    = finding.current_version
         new_ver    = finding.recommended_version
 
+        kb_entry = self._kb.find_applicable(component, old_ver, new_ver)
+
         # ── Bucket 1: no fix available ────────────────────────────────────────
-        if _is_unknown_version(new_ver):
+        if _is_unknown_version(new_ver) and kb_entry is None:
             return ClassifierResult(
                 bucket=1,
                 rationale=(
@@ -88,8 +101,8 @@ class Classifier:
             )
 
         # ── Bucket 4: transitive dependency, risky chain ──────────────────────
-        # A transitive fix means forcing Maven's version mediation via a
-        # dependencyManagement override -- higher blast radius than a direct
+        # A transitive fix means forcing version resolution via a manifest override
+        # (dependencyManagement for Maven, overrides for npm) -- higher blast radius than a direct
         # bump since it can silently affect unrelated code paths that use the
         # same transitive artifact. Escalate rather than automate when: it's
         # introduced by a complex framework (same reasoning as the bucket-4
@@ -99,19 +112,29 @@ class Classifier:
             introduced_by_stem = _component_stem(finding.introduced_by or "")
             introduced_by_complex = any(f in introduced_by_stem for f in COMPLEX_FRAMEWORKS)
             deep_chain = (finding.transitive_depth or 0) > 2
-            if introduced_by_complex or deep_chain:
-                reason = (
-                    f"introduced by complex framework {finding.introduced_by}"
-                    if introduced_by_complex
-                    else f"chain depth {finding.transitive_depth} (>2 hops from a direct dependency)"
-                )
+
+            # When multi-repository chain is configured (e.g. Repo A -> Repo B -> Repo C),
+            # deep chain fixes are automated across the entire repository chain.
+            from common.config import get_target_repos
+            is_multi_repo = len(get_target_repos()) > 1
+
+            if introduced_by_complex and kb_entry is None:
                 return ClassifierResult(
                     bucket=4,
                     rationale=(
                         f"{component} is a transitive dependency (via {finding.introduced_by}) "
-                        f"with a fix version ({old_ver} → {new_ver}) available, but {reason}. "
-                        "An automated dependencyManagement override is too risky here -- "
-                        "manual triage required."
+                        f"with a fix version ({old_ver} → {new_ver}) available, but introduced by complex framework {finding.introduced_by}. "
+                        "An automated manifest override is too risky here -- manual triage required."
+                    ),
+                )
+            if deep_chain and not is_multi_repo and kb_entry is None:
+                return ClassifierResult(
+                    bucket=4,
+                    rationale=(
+                        f"{component} is a transitive dependency (via {finding.introduced_by}) "
+                        f"with a fix version ({old_ver} → {new_ver}) available, but chain depth {finding.transitive_depth} "
+                        "(more than one hop from a direct dependency). An automated override on a single repository is too risky -- "
+                        "configure multi-repo chain or manual triage required."
                     ),
                 )
 

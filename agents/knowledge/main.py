@@ -9,6 +9,7 @@ Called from the fixer's _do_fresh_scan() before the classifier runs.
 """
 
 import json
+import concurrent.futures
 import logging
 import os
 import uuid
@@ -19,11 +20,10 @@ from vertexai.generative_models import GenerativeModel
 
 from knowledge.release_fetcher import ReleaseFetcher
 from common.knowledge_store import KnowledgeEntry
-
 logger = logging.getLogger(__name__)
 
 EXTRACTION_PROMPT = """\
-You are a Maven dependency migration analyst. Based on the release notes and CVE data below,
+You are a dependency migration analyst. Based on the release notes and CVE data below,
 extract structured migration information for upgrading {component_name} from version
 {from_version} to {to_version}.
 
@@ -32,10 +32,10 @@ extract structured migration information for upgrading {component_name} from ver
 
 ## Instructions
 Identify:
-1. Breaking changes — API removals, renamed classes/methods, config format changes, behavioral changes
-2. API removals — fully-qualified class/method names removed in this upgrade range
+1. Breaking changes — API removals, renamed classes/methods/functions, config format changes, behavioral changes
+2. API removals — fully-qualified class/method/function names removed in this upgrade range
 3. Migration steps — concrete ordered steps to migrate source code
-4. Find/replace patterns — exact Java import or code patterns that can be mechanically replaced
+4. Find/replace patterns — exact import or code patterns that can be mechanically replaced
 
 Return ONLY valid JSON in this exact format (no markdown, no prose):
 {{
@@ -156,10 +156,14 @@ class KnowledgeAgent:
         )
 
         try:
-            response = self._model.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json", "temperature": 0.0},
-            )
+            def _call_model():
+                return self._model.generate_content(
+                    prompt,
+                    generation_config={"response_mime_type": "application/json", "temperature": 0.0},
+                )
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(_call_model)
+                response = future.result(timeout=45)
             data = json.loads(response.text)
         except Exception as exc:
             logger.warning(

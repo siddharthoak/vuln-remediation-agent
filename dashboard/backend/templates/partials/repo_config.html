@@ -1,0 +1,146 @@
+<div id="repo-config-card" class="card repo-config-card">
+  <div class="card-header">
+    <strong>&#9881;&#65039; Target Repository</strong>
+  </div>
+
+  {% if notice %}
+    <div class="notice-banner {{ notice.type }}">
+      {% if notice.type == "ok" %}&#10003;{% elif notice.type == "err" %}&#10007;{% else %}&#9888;{% endif %}
+      {{ notice.message }}
+    </div>
+  {% endif %}
+
+  <form hx-post="/api/config" hx-target="#repo-config-card" hx-swap="outerHTML">
+    <div class="form-group">
+      <label class="form-label" for="repo-input">Target Repository / Chain (Unlimited Repositories)</label>
+      <textarea
+        id="repo-input"
+        name="repo"
+        class="form-input"
+        rows="2"
+        placeholder="e.g. org/repo-a, org/repo-b, org/repo-c, org/repo-d, ..."
+        required
+        style="resize: vertical; font-family: monospace; font-size: 0.85rem;"
+      >{{ config.repo }}</textarea>
+      <small class="form-help">Enter any number of repositories separated by commas or newlines (e.g. <code>repo-a, repo-b, repo-c, ...</code>). The agent resolves the full dependency DAG bottom-up.</small>
+
+      {% if config.is_multi_repo %}
+        <div style="margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px;">
+          {% for r in config.repo_chain %}
+            <span style="background: #1e293b; color: #93c5fd; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; border: 1px solid #334155; font-family: monospace;">
+              <strong>#{{ loop.index }}</strong> {{ r }}
+            </span>
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+
+    {% if config.is_github_app %}
+      <div style="background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 0.82rem; color: #6ee7b7;">
+        <strong>&#10003; Production GitHub App Active</strong> (App ID: <code style="color: #a7f3d0;">{{ config.app_id }}</code>)
+        <div style="color: #94a3b8; font-size: 0.75rem; margin-top: 3px; line-height: 1.3;">
+          Authentication tokens are dynamically minted for each repository link. Zero manual token entry required.
+        </div>
+      </div>
+      <details style="margin-bottom: 12px; font-size: 0.8rem; color: #94a3b8;">
+        <summary style="cursor: pointer; color: #60a5fa; margin-bottom: 6px;">Manual PAT Override (Optional)</summary>
+        <div class="form-group" style="margin-top: 6px;">
+          <input
+            type="password"
+            id="pat-input"
+            name="pat"
+            class="form-input"
+            placeholder="{% if config.has_pat %}{{ config.masked_pat }}{% else %}ghp_... (leave blank to use GitHub App){% endif %}"
+          />
+          <small class="form-help">Leave blank to use the GitHub App credentials.</small>
+        </div>
+      </details>
+    {% else %}
+      <div class="form-group">
+        <label class="form-label" for="pat-input">GitHub PAT</label>
+        <input
+          type="password"
+          id="pat-input"
+          name="pat"
+          class="form-input"
+          placeholder="{% if config.has_pat %}{{ config.masked_pat }}{% else %}ghp_...{% endif %}"
+        />
+        <small class="form-help">{% if config.has_pat %}Configured (leave blank to keep){% else %}Required for GitHub operations unless GitHub App is configured{% endif %}</small>
+      </div>
+    {% endif %}
+
+    <div class="form-group">
+      <label class="form-label" for="nightly-run-time">Nightly Start Time</label>
+      <input
+        type="time"
+        id="nightly-run-time"
+        name="nightly_run_time"
+        class="form-input"
+        value="{{ config.nightly_run_time }}"
+        required
+      />
+      <small class="form-help">Daily start time in {{ config.nightly_timezone }}.</small>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label" for="nightly-duration-minutes">Nightly Run Duration (minutes)</label>
+      <input
+        type="number"
+        id="nightly-duration-minutes"
+        name="nightly_duration_minutes"
+        class="form-input"
+        min="1"
+        max="1440"
+        step="1"
+        value="{{ config.nightly_duration_minutes }}"
+        required
+      />
+      <small class="form-help">Number of minutes the agent remains active each day (1 to 1440).</small>
+    </div>
+
+    <div class="btn-stack">
+      <div class="btn-row">
+        <button type="submit" class="btn btn-primary" title="Save repository chain and PAT configuration">
+          &#128190; Save &amp; Switch
+        </button>
+        <button
+          type="button"
+          class="btn {% if config.nightly_run_enabled %}btn-night-on{% else %}btn-night-off{% endif %}"
+          hx-post="/api/toggle-night-mode"
+          hx-target="#repo-config-card"
+          hx-swap="outerHTML"
+          title="Toggle Night Mode (scheduled vs immediate execution)"
+        >
+          {% if config.nightly_run_enabled %}
+            &#127769; Night Mode: ON ({{ config.nightly_run_time }})
+          {% else %}
+            &#9889; Night Mode: OFF (Run Immediately)
+          {% endif %}
+        </button>
+      </div>
+      <div class="btn-row">
+        <button
+          type="button"
+          class="btn btn-scan"
+          hx-post="/api/trigger-scan"
+          hx-target="#repo-config-card"
+          hx-swap="outerHTML"
+          title="Trigger security-scan.yml on GitHub Actions"
+        >
+          &#9654; Trigger Scan
+        </button>
+        <button
+          type="button"
+          class="btn btn-danger"
+          hx-post="/api/reset"
+          hx-target="#repo-config-card"
+          hx-swap="outerHTML"
+          hx-confirm="Reset all configured repositories? This will close remediation PRs, delete fix branches, close triage issues, and clear shared local state, while keeping your Knowledge Base intact."
+          title="Reset all configured repositories and shared local state (preserves Knowledge Base)"
+        >
+          &#8634; Reset
+        </button>
+      </div>
+    </div>
+  </form>
+</div>

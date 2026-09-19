@@ -1,10 +1,7 @@
 """PackageEcosystem protocol -- the pluggable dependency-manifest contract.
 
-Maven is the only implementation today (ecosystems/maven.py) -- this repo's
-tool prompts, build verification, and manifest handling are all Java/Maven-
-specific by design for this POC. The seam exists so a Python (pip/poetry) or
-Node (npm/yarn) ecosystem can be added later as a new PackageEcosystem
-implementation, without CodeFixer, main.py's locality-resolution loop, or
+Maven, npm, and Python (pip/poetry) implementations share this contract,
+without requiring CodeFixer, main.py's locality-resolution loop, or
 the classifier's transitive-dependency logic needing to change -- none of
 them depend on Maven directly, only on this protocol and on the
 ecosystem-agnostic locality fields already on VulnerabilityFinding
@@ -37,6 +34,7 @@ class DependencyLocality:
     depth: int  # 0 = the project itself, 1 = direct dependency, 2+ = transitive
     introduced_by: Optional[str] = None  # ecosystem-native name of the direct-dep ancestor
     raw_tree: str = ""
+    resolved_version: Optional[str] = None
 
 
 class PackageEcosystem(Protocol):
@@ -60,8 +58,21 @@ class PackageEcosystem(Protocol):
     ) -> None:
         """Pins a transitive dependency's resolved version without adding it
         as a direct dependency (Maven: <dependencyManagement>; npm: package.json
-        "overrides"; pip: a constraints file -- each ecosystem's own primitive
+        "overrides"; Python: a pinned requirement -- each ecosystem's own primitive
         for the same idea).
+        """
+        ...
+
+    def try_parent_dependency_upgrade(
+        self,
+        repo_path: Path,
+        transitive_component: str,
+        target_transitive_version: str,
+        parent_component: str,
+    ) -> Optional[Tuple[str, str, str]]:
+        """Optional capability: attempts upgrading the direct parent dependency
+        instead of forcing a transitive override. Returns (parent_old, parent_new, resolved_transitive)
+        or None if not supported or unsuccessful.
         """
         ...
 
@@ -73,6 +84,12 @@ class PackageEcosystem(Protocol):
         """
         ...
 
+    def verify_tests(self, repo_path: Path) -> Tuple[bool, str]:
+        """Runs the ecosystem's runtime test suite. Never raises -- returns
+        (success, message), including for missing tooling and timeouts.
+        """
+        ...
+
     def run_tests(self, repo_path: Path) -> Tuple[bool, str]:
         """Runs the ecosystem's full test suite. Same contract as
         verify_build() -- never raises, always returns (success, message).
@@ -81,3 +98,12 @@ class PackageEcosystem(Protocol):
         whether to call this at all, not this Protocol.
         """
         ...
+
+    def get_project_coordinates(self, repo_path: Path) -> dict:
+        """Returns metadata about the project itself (e.g. group_id, artifact_id, version, component_name)."""
+        ...
+
+    def has_dependency(self, repo_path: Path, component_name: str) -> bool:
+        """Returns True if component_name is declared in the project's manifest."""
+        ...
+

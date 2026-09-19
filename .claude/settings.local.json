@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl *)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('name:', d.get\\('name'\\)\\); print\\('default_branch:', d.get\\('default_branch'\\)\\); print\\('private:', d.get\\('private'\\)\\); [print\\('perm:', k, '=', v\\) for k,v in d.get\\('permissions',{}\\).items\\(\\)]\")",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git filter-branch *)",
+      "Bash(git push *)",
+      "Bash(docker exec vuln-remediation-agent-fixer-server-1 *)",
+      "Bash(docker compose *)",
+      "Bash(python3 -c ' *)",
+      "Bash(echo \"Fixer started in background, PID $!\")",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(python3 *)",
+      "Bash(streamlit cache *)",
+      "Bash(rm -rf ~/.streamlit/cache)",
+      "Bash(python *)",
+      "Bash(git -C /Users/siddharthoak/_code/Neurealm/nexus-remediation-agent status --short)"
+    ]
+  }
+}

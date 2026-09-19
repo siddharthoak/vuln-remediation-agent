@@ -21,6 +21,7 @@ class FixResult:
     # 0 would misrepresent that as a confirmed zero-cost run.
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
+    model_name: Optional[str] = None
 
 
 class EngineExecutionError(Exception):

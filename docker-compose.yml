@@ -1,15 +1,16 @@
 services:
 
   # ── Fixer server (always-on) ──────────────────────────────────────────────
-  # Start with: docker compose up -d
+  # Start with: podman compose up -d
   #
   # Runs two background workers:
   #   1. ScanPoller — polls GitHub every SCAN_POLL_INTERVAL seconds. When the
   #      security-scan.yml workflow you triggered manually completes, it
-  #      downloads the artifact and kicks off the fix flow automatically.
+  #      downloads the artifacat and kicks off the fix flow automatically.
   #   2. HTTP server on :8080 — accepts POST /retry from the Watcher when
   #      a remediation PR fails CI and needs another fix attempt.
   fixer-server:
+    image: vuln-remediation-agent_fixer-server
     build:
       context: .
       dockerfile: agents/fixer/Dockerfile
@@ -19,9 +20,15 @@ services:
       KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
       FIXER_SERVER_MODE: "1"
+      AUTO_FETCH_SCAN: "1"          # Automatically triggers security-scan.yml if reports are missing or new scan needed
       SCAN_POLL_INTERVAL: "60"      # seconds between GitHub Actions polls
+      MAX_PARALLEL_FIXES: "2"       # Limit concurrent fixes to avoid Vertex AI rate limits
       KB_HYDRATION: "1"             # set to "0" to skip Knowledge Agent (faster local testing)
       RUN_TESTS: "0"                # set to "1" to give the Fixer a run_maven_test tool (adk engine only, slower)
+      NIGHTLY_RUN_ENABLED: "1"      # sleep during the day; run one cycle nightly
+      NIGHTLY_RUN_TIME: "00:00"     # local time in NIGHTLY_RUN_TIMEZONE
+      NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
+      NIGHTLY_SCAN_MAX_WAIT_SECONDS: "7200"
     ports:
       - "8080:8080"
     volumes:
@@ -29,6 +36,7 @@ services:
       - ./scan-reports:/reports
       # Bind mount so the dashboard container can read tracking.json directly
       - ./data:/data
+      - ./config:/config
       # GCP credentials for Vertex AI (ADC)
       - ./config/my-google-service-account.json:/gcp/adc.json:ro
     restart: unless-stopped
@@ -47,6 +55,7 @@ services:
   # so a cycle can be forced on demand instead of waiting for the timer --
   # the dashboard's "Watcher: Check Now" button proxies to this.
   watcher:
+    image: vuln-remediation-agent_watcher
     build:
       context: .
       dockerfile: agents/watcher/Dockerfile
@@ -56,7 +65,10 @@ services:
       KB_STORE_PATH: /data/kb.json
       FIXER_RETRY_URL: http://fixer-server:8080/retry
       WATCHER_DAEMON: "1"
-      WATCHER_SLEEP_SECONDS: "900"  # 15 minutes
+      WATCHER_SLEEP_SECONDS: "${WATCHER_SLEEP_SECONDS:-60}"
+      NIGHTLY_RUN_ENABLED: "1"
+      NIGHTLY_RUN_TIME: "00:00"
+      NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
       WATCHER_PORT: "8090"
     ports:
       # Host port 8091 (not 8090) -- 8090 is already taken by an unrelated
@@ -66,6 +78,8 @@ services:
       - "8091:8090"
     volumes:
       - ./data:/data
+      - ./config:/config
+      - ./config/my-google-service-account.json:/gcp/adc.json:ro
     depends_on:
       - fixer-server
     restart: unless-stopped
@@ -79,6 +93,7 @@ services:
   # credentials or calls an LLM directly.
   # View at: http://localhost:8501
   dashboard:
+    image: vuln-remediation-agent_dashboard
     build:
       context: .
       dockerfile: dashboard/Dockerfile
@@ -91,6 +106,8 @@ services:
       TRACKING_STORE_PATH: /data/tracking.json
       KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
+      TZ: "Asia/Kolkata"
+      NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
       FIXER_SERVER_URL: http://fixer-server:8080
       WATCHER_URL: http://watcher:8090
     ports:
@@ -98,25 +115,28 @@ services:
     depends_on:
       - fixer-server
     volumes:
-      - ./data:/data:ro
-      - ./scan-reports:/reports:ro
+      - ./data:/data
+      - ./scan-reports:/reports
+      - ./config:/config
     restart: unless-stopped
 
   # ── Fixer one-shot (manual use) ───────────────────────────────────────────
   # For ad-hoc runs outside the always-on flow.
   #   Fresh scan (reports already in ./scan-reports):
-  #     docker compose run --rm --profile manual fixer
+  #     podman compose --profile manual run --rm fixer
   #   Fresh scan + auto-trigger + download:
-  #     docker compose run --rm --profile manual -e AUTO_FETCH_SCAN=1 fixer
+  #     podman compose --profile manual run --rm -e AUTO_FETCH_SCAN=1 fixer
   #   Retry a specific tracking ID:
-  #     docker compose run --rm --profile manual -e RETRY_TRACKING_ID=<id> fixer
+  #     podman compose --profile manual run --rm -e RETRY_TRACKING_ID=<id> fixer
   fixer:
+    image: vuln-remediation-agent_fixer
     build:
       context: .
       dockerfile: agents/fixer/Dockerfile
     env_file: config/.env
     environment:
       TRACKING_STORE_PATH: /data/tracking.json
+      KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
       RUN_TESTS: "0"                # set to "1" to give the Fixer a run_maven_test tool (adk engine only, slower)
     volumes:

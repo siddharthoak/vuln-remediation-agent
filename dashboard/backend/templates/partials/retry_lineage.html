@@ -20,7 +20,7 @@
     {% for r in lineage %}
       <details class="record-card status-{{ r.status_class }}" {% if loop.last %}open{% endif %}>
         <summary>{{ r.status_icon }} Attempt {{ r.attempt_number }} &mdash; {{ r.status }} <small>&mdash; {{ r.status_description }}</small>
-          <small>({{ r.created_at[:16] if r.created_at else "—" }})</small></summary>
+          <small>({{ r.created_at_local or (r.created_at[:16].replace("T", " ") if r.created_at else "—") }})</small></summary>
         <div class="metric-row">
           <div class="metric metric-text"><div class="value" title="{{ r.component_name }}">{{ r.component_name }}</div><div class="label">Component</div></div>
           <div class="metric metric-text"><div class="value" title="{{ r.old_version }} → {{ r.new_version }}">{{ r.old_version }} &rarr; {{ r.new_version }}</div><div class="label">Version change</div></div>
@@ -35,7 +35,7 @@
           <div class="metric"><div class="value">{{ "{:,}".format(r.total_tokens) }}</div><div class="label">Tokens ({{ r.prompt_tokens }}p / {{ r.completion_tokens }}c)</div></div>
           {% endif %}
         </div>
-        <p><small>Tracking ID: <code>{{ r.tracking_id }}</code>{% if r.parent_tracking_id %} &nbsp;|&nbsp; Parent attempt: <code>{{ r.parent_tracking_id[:8] }}&hellip;</code>{% endif %}</small></p>
+        <p><small>Tracking ID: <code>{{ r.tracking_id }}</code>{% if r.parent_tracking_id %} &nbsp;|&nbsp; Parent attempt: <code>{{ r.parent_tracking_id[:8] }}&hellip;</code>{% endif %}{% if r.updated_at_local %} &nbsp;|&nbsp; Last updated: {{ r.updated_at_local }}{% endif %}</small></p>
         {% if r.failure_log_excerpt %}
           <p><strong>CI failure excerpt passed to retry prompt:</strong></p>
           <pre>{{ r.failure_log_excerpt[:2000] }}</pre>

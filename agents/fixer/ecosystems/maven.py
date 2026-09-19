@@ -3,7 +3,7 @@
 The only ecosystem this POC actually supports. Everything Maven/pom.xml-
 specific lives here: dependency-tree resolution (locality), the two pom.xml
 edit paths (direct-dependency bump, dependencyManagement override), and
-build verification (`mvn compile`). CodeFixer and main.py never touch pom.xml
+build/test verification (`mvn compile` and `mvn -B test -q`). CodeFixer and main.py never touch pom.xml
 or shell out to `mvn` directly -- they only call through this class via the
 PackageEcosystem protocol (ecosystems/base.py).
 
@@ -16,6 +16,7 @@ fixture text, not a live `mvn` run (no Maven in this dev environment).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import xml.etree.ElementTree as ET
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 # real repo (e.g. vulnerable-java-app with jackson-dataformat-yaml added)
 # and confirm it correctly classifies org.yaml:snakeyaml as transitive.
 
-_GAV_RE = re.compile(r"^(?P<groupId>[^:\s]+):(?P<artifactId>[^:\s]+):\S+$")
+_GAV_RE = re.compile(r"^(?P<groupId>[^:\s]+):(?P<artifactId>[^:\s]+):[^\s:]+(?::[^\s:]+)*(?:\s+.*)?$")
 _MARKER_RE = re.compile(r"^((?:\|  |   )*)(\+- |\\- )")
 
 
@@ -100,9 +101,22 @@ def _parse_ga(line: str) -> Optional[str]:
     return f"{gav.group('groupId')}:{gav.group('artifactId')}" if gav else None
 
 
+def _parse_version_from_gav_line(line: str) -> Optional[str]:
+    match = _MARKER_RE.match(line)
+    content = line[match.end():] if match else line.strip()
+    clean = re.sub(r"\s+\(.*?\)$", "", content).strip()
+    parts = clean.split(":")
+    if len(parts) == 4 or len(parts) == 5:
+        return parts[3]
+    elif len(parts) >= 6:
+        return parts[4]
+    return None
+
+
 def _parse_tree(stdout: str, group_id: str, artifact_id: str) -> DependencyLocality:
     target = f"{group_id}:{artifact_id}"
     ancestor_at: Dict[int, str] = {}
+    best_match = None
 
     for raw_line in stdout.splitlines():
         line = _strip_info_prefix(raw_line)
@@ -115,15 +129,21 @@ def _parse_tree(stdout: str, group_id: str, artifact_id: str) -> DependencyLocal
         ancestor_at[depth] = ga
 
         if ga == target and depth > 0:
+            ver = _parse_version_from_gav_line(line)
             if depth == 1:
-                return DependencyLocality(found=True, is_transitive=False, depth=depth, raw_tree=stdout)
-            return DependencyLocality(
-                found=True,
-                is_transitive=True,
-                depth=depth,
-                introduced_by=ancestor_at.get(depth - 1),
-                raw_tree=stdout,
-            )
+                return DependencyLocality(found=True, is_transitive=False, depth=depth, raw_tree=stdout, resolved_version=ver)
+            if best_match is None:
+                best_match = DependencyLocality(
+                    found=True,
+                    is_transitive=True,
+                    depth=depth,
+                    introduced_by=ancestor_at.get(1),
+                    raw_tree=stdout,
+                    resolved_version=ver,
+                )
+
+    if best_match is not None:
+        return best_match
 
     return DependencyLocality(found=False, is_transitive=False, depth=-1, raw_tree=stdout)
 
@@ -165,7 +185,10 @@ class MavenEcosystem:
         if not pom_path.exists():
             raise PomXMLError(f"pom.xml not found at {pom_path}")
 
-        tree = ET.parse(str(pom_path))
+        try:
+            tree = ET.parse(str(pom_path))
+        except ET.ParseError as exc:
+            raise PomXMLError(f"Could not parse pom.xml at {pom_path}: {exc}") from exc
         root = tree.getroot()
         ns, tag, subtag, prop_xpath, dep_xpath, ns_uri = _pom_namespace_helpers(root)
         ET.register_namespace("", ns_uri)
@@ -215,16 +238,15 @@ class MavenEcosystem:
         tree.write(str(pom_path), xml_declaration=True, encoding="utf-8")
 
     def add_transitive_override(self, repo_path: Path, component_name: str, target_version: str) -> None:
-        """POC scope: single-module only. Appends <dependencyManagement> as a
-        direct child of <project> if it doesn't already exist -- Maven's
-        parser doesn't enforce strict element ordering, so this is valid even
-        though it isn't in the IDE-conventional position.
-        """
+        """Add or update a project-level dependencyManagement override."""
         pom_path = repo_path / "pom.xml"
         if not pom_path.exists():
             raise PomXMLError(f"pom.xml not found at {pom_path}")
 
-        tree = ET.parse(str(pom_path))
+        try:
+            tree = ET.parse(str(pom_path))
+        except ET.ParseError as exc:
+            raise PomXMLError(f"Could not parse pom.xml at {pom_path}: {exc}") from exc
         root = tree.getroot()
         ns, tag, subtag, _prop_xpath, _dep_xpath, ns_uri = _pom_namespace_helpers(root)
         ET.register_namespace("", ns_uri)
@@ -238,7 +260,26 @@ class MavenEcosystem:
 
         dm = root.find(tag("dependencyManagement"), ns)
         if dm is None:
-            dm = ET.SubElement(root, subtag("dependencyManagement"))
+            dm = ET.Element(subtag("dependencyManagement"))
+            # Keep Maven's conventional top-level model order so generated POMs
+            # remain consumable by strict Maven/XML tooling.
+            insert_before = {
+                "dependencies",
+                "repositories",
+                "pluginRepositories",
+                "build",
+                "reporting",
+                "profiles",
+            }
+            insert_at = next(
+                (
+                    index
+                    for index, child in enumerate(root)
+                    if child.tag.rsplit("}", 1)[-1] in insert_before
+                ),
+                len(root),
+            )
+            root.insert(insert_at, dm)
 
         dm_deps = dm.find(tag("dependencies"), ns)
         if dm_deps is None:
@@ -271,9 +312,264 @@ class MavenEcosystem:
 
     def verify_build(self, repo_path: Path) -> Tuple[bool, str]:
         return compile_repo(repo_path)
+    def verify_tests(self, repo_path: Path) -> Tuple[bool, str]:
+        return test_repo(repo_path)
 
     def run_tests(self, repo_path: Path) -> Tuple[bool, str]:
         return test_repo(repo_path)
+
+    def get_project_coordinates(self, repo_path: Path) -> dict:
+        """Returns metadata about the project itself (groupId, artifactId, version, component_name)."""
+        pom_path = repo_path / "pom.xml"
+        if not pom_path.exists():
+            return {}
+        try:
+            tree = ET.parse(str(pom_path))
+            root = tree.getroot()
+            ns, tag, _, _, _, _ = _pom_namespace_helpers(root)
+            gid_el = root.find(tag("groupId"), ns)
+            if gid_el is None or not gid_el.text:
+                parent_el = root.find(tag("parent"), ns)
+                if parent_el is not None:
+                    gid_el = parent_el.find(tag("groupId"), ns)
+            aid_el = root.find(tag("artifactId"), ns)
+            ver_el = root.find(tag("version"), ns)
+            if ver_el is None or not ver_el.text:
+                parent_el = root.find(tag("parent"), ns)
+                if parent_el is not None:
+                    ver_el = parent_el.find(tag("version"), ns)
+
+            group_id = gid_el.text.strip() if gid_el is not None and gid_el.text else ""
+            artifact_id = aid_el.text.strip() if aid_el is not None and aid_el.text else ""
+            version = ver_el.text.strip() if ver_el is not None and ver_el.text else ""
+            return {
+                "group_id": group_id,
+                "artifact_id": artifact_id,
+                "version": version,
+                "component_name": f"{group_id}:{artifact_id}" if group_id and artifact_id else artifact_id,
+            }
+        except Exception as exc:
+            logger.warning("Could not read project coordinates from %s: %s", pom_path, exc)
+            return {}
+
+    def has_dependency(self, repo_path: Path, component_name: str) -> bool:
+        """Checks if component_name (groupId:artifactId or artifactId) is declared in pom.xml."""
+        pom_path = repo_path / "pom.xml"
+        if not pom_path.exists():
+            return False
+        try:
+            tree = ET.parse(str(pom_path))
+            root = tree.getroot()
+            ns, tag, _, _, dep_xpath, _ = _pom_namespace_helpers(root)
+            group_id, artifact_id = _split_ga(component_name)
+            for dep in root.findall(dep_xpath, ns):
+                aid_el = dep.find(tag("artifactId"), ns)
+                gid_el = dep.find(tag("groupId"), ns)
+                if aid_el is not None and aid_el.text == artifact_id:
+                    if group_id is None or (gid_el is not None and gid_el.text == group_id):
+                        return True
+            dm = root.find(tag("dependencyManagement"), ns)
+            if dm is not None:
+                for dep in dm.findall(dep_xpath, ns):
+                    aid_el = dep.find(tag("artifactId"), ns)
+                    gid_el = dep.find(tag("groupId"), ns)
+                    if aid_el is not None and aid_el.text == artifact_id:
+                        if group_id is None or (gid_el is not None and gid_el.text == group_id):
+                            return True
+        except Exception:
+            pass
+        return False
+
+    def get_declared_dependency_version(self, repo_path: Path, component_name: str) -> Optional[str]:
+        """Returns the declared version of component_name directly in pom.xml, resolving ${properties}."""
+        pom_path = repo_path / "pom.xml"
+        if not pom_path.exists():
+            return None
+        try:
+            tree = ET.parse(str(pom_path))
+            root = tree.getroot()
+            ns, tag, _, prop_xpath, dep_xpath, _ = _pom_namespace_helpers(root)
+            group_id, artifact_id = _split_ga(component_name)
+            for dep in root.findall(dep_xpath, ns):
+                aid_el = dep.find(tag("artifactId"), ns)
+                gid_el = dep.find(tag("groupId"), ns)
+                ver_el = dep.find(tag("version"), ns)
+                if aid_el is None or ver_el is None or not ver_el.text:
+                    continue
+                if aid_el.text != artifact_id:
+                    continue
+                if group_id is not None and gid_el is not None and gid_el.text != group_id:
+                    continue
+                ver_text = ver_el.text.strip()
+                if ver_text.startswith("${") and ver_text.endswith("}"):
+                    prop_name = ver_text[2:-1]
+                    prop_el = root.find(prop_xpath(prop_name), ns)
+                    if prop_el is not None and prop_el.text:
+                        return prop_el.text.strip()
+                return ver_text
+        except Exception as exc:
+            logger.debug("Error reading declared dependency version for %s: %s", component_name, exc)
+        return None
+
+    def try_parent_dependency_upgrade(
+        self,
+        repo_path: Path,
+        transitive_component: str,
+        target_transitive_version: str,
+        parent_component: str,
+    ) -> Optional[Tuple[str, str, str]]:
+        """Dependency Hygiene: Checks if upgrading the direct parent dependency
+        resolves the transitive vulnerability cleanly, avoiding unnecessary <dependencyManagement>.
+        Returns (parent_current_version, candidate_version, resolved_transitive_version) if successful, else None.
+        """
+        pom_path = repo_path / "pom.xml"
+        if not pom_path.exists():
+            return None
+
+        parent_cur_ver = self.get_declared_dependency_version(repo_path, parent_component)
+        if not parent_cur_ver:
+            return None
+
+        parent_gid, parent_aid = _split_ga(parent_component)
+        if not parent_gid or not parent_aid:
+            return None
+
+        candidates = _fetch_newer_parent_versions(parent_gid, parent_aid, parent_cur_ver)
+        if not candidates:
+            return None
+
+        original_pom = pom_path.read_text(encoding="utf-8")
+        logger.info(
+            "Dependency Hygiene: Evaluating %d parent upgrade candidate(s) for %s to resolve %s",
+            len(candidates), parent_component, transitive_component,
+        )
+
+        for cand_ver in candidates[:4]:
+            succeeded = False
+            try:
+                self.bump_direct_dependency(repo_path, parent_component, parent_cur_ver, cand_ver)
+                loc = self.resolve_locality(repo_path, transitive_component)
+                if loc.found and loc.resolved_version and _compare_versions(loc.resolved_version, target_transitive_version) >= 0:
+                    compiled, _ = self.verify_build(repo_path)
+                    if compiled:
+                        tested, _ = self.verify_tests(repo_path)
+                        if tested:
+                            logger.info(
+                                "Dependency Hygiene: Successfully upgraded direct parent %s (%s -> %s) "
+                                "which resolved transitive %s to %s!",
+                                parent_component, parent_cur_ver, cand_ver, transitive_component, loc.resolved_version,
+                            )
+                            succeeded = True
+                            return (parent_cur_ver, cand_ver, loc.resolved_version)
+            except Exception as exc:
+                logger.debug("Candidate parent upgrade %s to %s failed verification: %s", parent_component, cand_ver, exc)
+            finally:
+                if not succeeded:
+                    pom_path.write_text(original_pom, encoding="utf-8")
+
+        return None
+
+
+def _parse_major(version: str) -> int:
+    try:
+        return int(version.strip().lstrip("v").split(".")[0])
+    except (ValueError, IndexError, AttributeError):
+        return -1
+
+
+def _compare_versions(v1: str, v2: str) -> int:
+    """Compares two Maven version strings. Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal."""
+    qualifier_order = {
+        "snapshot": -5, "alpha": -4, "a": -4, "beta": -3, "b": -3,
+        "milestone": -2, "m": -2, "rc": -1, "cr": -1,
+        "final": 0, "ga": 0, "release": 0,
+    }
+
+    def _to_parts(v: str) -> tuple[tuple[int, ...], tuple[int, str]]:
+        clean = v.strip().lstrip("v")
+        match = re.match(r"^(\d+(?:\.\d+)*)(?:[-_.]?([A-Za-z]+)(\d*)|$)", clean)
+        if not match:
+            return (0,), (0, "")
+        numeric = tuple(int(part) for part in match.group(1).split("."))
+        qualifier = match.group(2)
+        if not qualifier:
+            return numeric, (0, "")
+        return numeric, (
+            qualifier_order.get(qualifier.lower(), -6),
+            qualifier.lower(),
+        )
+
+    numeric1, qualifier1 = _to_parts(v1)
+    numeric2, qualifier2 = _to_parts(v2)
+    max_len = max(len(numeric1), len(numeric2))
+    padded1 = numeric1 + (0,) * (max_len - len(numeric1))
+    padded2 = numeric2 + (0,) * (max_len - len(numeric2))
+    if padded1 != padded2:
+        return 1 if padded1 > padded2 else -1
+    if qualifier1 != qualifier2:
+        return 1 if qualifier1 > qualifier2 else -1
+    return 0
+
+
+def _fetch_newer_parent_versions(group_id: str, artifact_id: str, current_version: str) -> list[str]:
+    """Queries Maven Central for newer patch/minor releases of the direct parent dependency.
+    Prefers repo1.maven.org Fastly CDN maven-metadata.xml for speed and reliability,
+    falling back to Solr search.maven.org if needed.
+    """
+    import urllib.parse
+    import urllib.request
+    import xml.etree.ElementTree as ET
+    import json
+
+    raw_versions: list[str] = []
+
+    # 1. Primary: Fastly CDN canonical maven-metadata.xml
+    g_path = group_id.replace(".", "/")
+    cdn_url = f"https://repo1.maven.org/maven2/{g_path}/{artifact_id}/maven-metadata.xml"
+    try:
+        req = urllib.request.Request(cdn_url, headers={"User-Agent": "vuln-remediation-agent"})
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            root = ET.fromstring(resp.read())
+            raw_versions = [
+                el.text.strip()
+                for el in root.findall(".//version")
+                if el.text and el.text.strip()
+            ]
+    except Exception as exc:
+        logger.debug("repo1.maven.org metadata query for %s:%s failed: %s", group_id, artifact_id, exc)
+
+    # 2. Fallback: Solr search.maven.org
+    if not raw_versions:
+        solr_url = f"https://search.maven.org/solrsearch/select?q=g:%22{group_id}%22+AND+a:%22{artifact_id}%22&core=gav&rows=40&wt=json"
+        try:
+            req = urllib.request.Request(solr_url, headers={"User-Agent": "vuln-remediation-agent"})
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                docs = data.get("response", {}).get("docs", [])
+                raw_versions = [d.get("v", "") for d in docs if d.get("v")]
+        except Exception as exc:
+            logger.debug("search.maven.org lookup for %s:%s failed: %s", group_id, artifact_id, exc)
+
+    if not raw_versions:
+        return []
+
+    cur_major = _parse_major(current_version)
+    candidates = []
+    seen = set()
+    for ver in raw_versions:
+        if not ver or ver in seen:
+            continue
+        seen.add(ver)
+        if re.search(r"(?i)(?:alpha|beta|milestone|(?:^|[.\-_])(?:a|b|m|rc|cr|snapshot)(?:$|[.\-_]))", ver):
+            continue
+        if cur_major != -1 and _parse_major(ver) != cur_major:
+            continue
+        if _compare_versions(ver, current_version) > 0:
+            candidates.append(ver)
+
+    import functools
+    candidates.sort(key=functools.cmp_to_key(_compare_versions))
+    return candidates
 
 
 def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str]:
@@ -283,6 +579,7 @@ def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str
     tool -- extracted without changing its output text, since that text is
     part of the prompt contract the model has been tuned against.
     """
+    safe_env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_PAT", "GOOGLE_APPLICATION_CREDENTIALS")}
     try:
         result = subprocess.run(
             ["mvn", "compile", "-q", "--batch-mode"],
@@ -290,6 +587,7 @@ def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            env=safe_env,
         )
     except FileNotFoundError:
         return False, "ERROR: mvn not found — Maven must be installed in the container image."
@@ -317,6 +615,7 @@ def test_repo(repo_path: Path, timeout_seconds: int = 600) -> Tuple[bool, str]:
     tool; only ever invoked when RUN_TESTS=1 and the active engine
     advertises supports_tests (see engines/base.py).
     """
+    safe_env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_PAT", "GOOGLE_APPLICATION_CREDENTIALS")}
     try:
         result = subprocess.run(
             ["mvn", "test", "-q", "--batch-mode"],
@@ -324,6 +623,7 @@ def test_repo(repo_path: Path, timeout_seconds: int = 600) -> Tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
+            env=safe_env,
         )
     except FileNotFoundError:
         return False, "ERROR: mvn not found — Maven must be installed in the container image."

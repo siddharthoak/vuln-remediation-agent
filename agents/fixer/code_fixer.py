@@ -16,10 +16,10 @@ logic; they only moved where that logic lives.
 
 What is UNCHANGED (verbatim from nexus-remediation-agent):
   - ChangeSummary dataclass
-  - FRESH_FIX_PROMPT and RETRY_FIX_PROMPT strings
-  - pom.xml editing semantics (now in ecosystems/maven.py, not this class)
+  - FRESH_FIX_PROMPT and RETRY_FIX_PROMPT structure
+  - ecosystem manifest editing semantics (now in ecosystems/, not this class)
   - run_fresh_fix() and run_retry_fix() public entry points
-  - _execute_fix() structure
+  - _execute_fix() routing and retry semantics
   - InvalidRetryError
 
 CodeFixerError (ADK's model-response parsing) lives in engines.adk_vertex.
@@ -34,7 +34,10 @@ from pathlib import Path
 from typing import Optional
 
 from common.tracking_store import TrackingStatus
-from ecosystems.factory import get_ecosystem
+from ecosystems.factory import get_ecosystem, get_manifest_file
+from ecosystems.maven import PomXMLError
+from ecosystems.npm import PackageJsonError
+from ecosystems.python import PythonManifestError
 from engines.factory import get_engine
 
 logger = logging.getLogger(__name__)
@@ -57,9 +60,10 @@ class ChangeSummary:
     # reasoning. 0 would misrepresent "no LLM used" as "confirmed zero cost".
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
+    model_name: Optional[str] = None
 
 
-# ── Prompt templates (UNCHANGED from nexus-remediation-agent) ─────────────────
+# ── Prompt templates ─────────────────────────────────────────────────────────
 
 FRESH_FIX_PROMPT = """\
 You are a Java/Maven dependency upgrade specialist. Apply the MINIMAL set of code
@@ -149,6 +153,130 @@ dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix
 ```
 """
 
+FRESH_FIX_PROMPT_NODE = """\
+You are a Node.js/npm dependency upgrade specialist. Apply the MINIMAL set of code
+changes required to upgrade a specific dependency from one version to another.
+
+## Dependency being upgraded
+- Component: {component_name}
+- Current version: {current_version}
+- Target version: {target_version}
+{kb_context}
+## Repository file tree (paths only)
+{file_listing}
+
+## Available tools
+- `grep_files(pattern, extensions?)` — regex search across file contents.
+- `read_file(relative_path)` — read a file's full content.
+- `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
+- `run_npm_install()` — run 'npm install'. Returns error output on failure.
+- `run_npm_test()` — run 'npm test' with a bounded timeout. Returns test failure output.
+
+## Your workflow
+1. Call grep_files with the import/require pattern for {component_name}
+   (e.g. for "express", search "require\\(['\"]express['\"]\\)" or "from ['\"]express['\"]").
+2. Call read_file on each affected file to inspect the actual source code.
+3. Identify which API/behavioral changes between {current_version} and {target_version}
+   require source-level changes (removed/renamed methods, config format changes).
+4. Call apply_file_change for each required edit.
+   The "find" value MUST be an exact substring of the file content from read_file — never guess.
+   Do NOT edit package.json — the version bump is already applied.
+5. Call run_npm_install to verify dependencies install cleanly.
+6. If install fails: read the error, inspect the affected files, apply corrections, install again.
+7. Call run_npm_test when installation succeeds to catch runtime/test regressions.
+8. When installation and tests succeed (or if no source changes are needed), return end_turn with JSON.
+
+## CRITICAL CONSTRAINTS
+- Only apply changes strictly required by the version upgrade.
+- Do NOT refactor, rename, reformat, or improve unrelated code.
+- Never pass a "find" value you have not verified verbatim in read_file output.
+
+```json
+{{
+  "rationale": "<key API changes between versions and summary of what was changed>"
+}}
+```
+"""
+
+RETRY_FIX_PROMPT_NODE = """\
+You are a Node.js/npm dependency upgrade specialist. A previous fix attempt for this
+dependency upgrade FAILED CI. Diagnose the CI failure and apply a corrective fix.
+
+## Dependency being upgraded
+- Component: {component_name}
+- Current version: {current_version}
+- Target version: {target_version}
+
+## Previous CI failure log (root cause of the failure)
+```
+{failure_log_excerpt}
+```
+
+## Repository file tree (paths only)
+{file_listing}
+
+## Available tools
+- `grep_files(pattern, extensions?)` — regex search across file contents.
+- `read_file(relative_path)` — read a file's full content.
+- `apply_file_change(relative_path, find, replace, change_description?)` — write a find→replace edit to disk immediately.
+- `run_npm_install()` — run 'npm install'. Returns error output on failure.
+- `run_npm_test()` — run 'npm test' with a bounded timeout. Returns test failure output.
+
+## Your workflow
+1. Analyse the CI failure log to identify the ROOT CAUSE.
+2. Use grep_files and read_file to inspect the files mentioned in the failure log.
+3. Call apply_file_change for the specific, minimal change that fixes the CI failure.
+   Do NOT repeat the same change from the previous attempt unless the log shows it was incomplete.
+4. Call run_npm_install to verify the fix installs cleanly.
+5. If installation fails: read the error, inspect affected files, apply corrections, install again.
+6. Call run_npm_test when installation succeeds to catch runtime/test regressions.
+7. When installation and tests succeed, return end_turn with JSON.
+
+## CRITICAL CONSTRAINTS
+- Fix only what the CI failure log tells you is broken.
+- Do NOT refactor, rename, reformat, or improve unrelated code.
+- Do NOT edit package.json.
+- Never pass a "find" value you have not verified verbatim in read_file output.
+
+```json
+{{
+  "rationale": "<diagnosis of the CI failure and summary of what was changed>"
+}}
+```
+"""
+
+FRESH_FIX_PROMPT_PYTHON = """\
+You are a Python dependency remediation specialist. Apply only the minimal source
+changes required to upgrade {component_name} from {current_version} to {target_version}.
+
+## Repository file tree
+{file_listing}
+
+## Available tools
+- `grep_files(pattern, extensions?)`, `read_file(relative_path)`, and `apply_file_change(...)`
+- `run_python_install()` verifies dependency installation and Python compilation.
+- `run_python_test()` runs the repository tests.
+
+The dependency manifest has already been updated. Do not edit the manifest. Inspect
+the actual source before making any compatibility change, then verify install and tests.
+Return JSON with a concise rationale when complete.
+"""
+
+RETRY_FIX_PROMPT_PYTHON = """\
+You are a Python dependency remediation specialist. A previous upgrade of
+{component_name} from {current_version} to {target_version} failed CI.
+
+## CI failure
+{failure_log_excerpt}
+
+## Repository file tree
+{file_listing}
+
+Use grep_files/read_file to identify the root cause, make only the smallest required
+source edit with apply_file_change, then run_python_install and run_python_test.
+Do not edit the dependency manifest. Return JSON with a concise rationale.
+"""
+
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
@@ -231,7 +359,8 @@ class CodeFixer:
     for its security caveats before using it in production).
 
     Package ecosystem: pluggable via PackageEcosystem (ecosystems/),
-    auto-detected from repo contents (Maven/pom.xml only in this POC --
+    auto-detected from repo contents (Maven/pom.xml, npm/package.json, or
+    Python/pyproject.toml/requirements.txt --
     see ecosystems/factory.py). Manifest handling and prompt construction
     are engine- and ecosystem-agnostic.
     """
@@ -249,6 +378,49 @@ class CodeFixer:
         self._run_tests_enabled = (
             os.environ.get("RUN_TESTS", "0") == "1" and getattr(self._engine, "supports_tests", False)
         )
+
+    @property
+    def _manifest_file(self) -> str:
+        """Returns the ecosystem's manifest filename for use in ChangeSummary.files_changed."""
+        return get_manifest_file(self._repo_path)
+
+    @property
+    def _is_npm(self) -> bool:
+        return self._manifest_file == "package.json"
+
+    @property
+    def _is_python(self) -> bool:
+        return self._manifest_file in {"pyproject.toml", "requirements.txt", "requirements-dev.txt", "Pipfile", "setup.cfg"}
+
+    def _snapshot_python_support_files(self) -> dict:
+        if self._is_npm:
+            names = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+        elif self._is_python:
+            names = ("constraints.txt", "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock")
+        else:
+            return {}
+        return {
+            name: (self._repo_path / name).read_bytes()
+            for name in names
+            if (self._repo_path / name).exists()
+        }
+
+    def _changed_python_support_files(self, before: dict) -> list:
+        if self._is_npm:
+            names = ("package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml")
+        elif self._is_python:
+            names = ("constraints.txt", "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock")
+        else:
+            return []
+        changed = []
+        for name in names:
+            path = self._repo_path / name
+            current = path.read_bytes() if path.exists() else None
+            if current is not None and before.get(name) != current:
+                changed.append(name)
+            elif current is not None and name not in before:
+                changed.append(name)
+        return changed
 
     # ── Public entry points (UNCHANGED) ──────────────────────────────────────
 
@@ -281,6 +453,7 @@ class CodeFixer:
         record.token_usage = {
             "prompt_tokens": summary.prompt_tokens,
             "completion_tokens": summary.completion_tokens,
+            "model_name": summary.model_name,
         }
         tracking_store.update(record)
         return summary
@@ -322,10 +495,12 @@ class CodeFixer:
             target_version=record.new_version,
             cve_ids=[record.vulnerability_id] if record.vulnerability_id else [],
             failure_log_excerpt=record.failure_log_excerpt,
+            is_retry=True,
         )
         record.token_usage = {
             "prompt_tokens": summary.prompt_tokens,
             "completion_tokens": summary.completion_tokens,
+            "model_name": summary.model_name,
         }
         tracking_store.update(record)
         return summary
@@ -363,6 +538,7 @@ class CodeFixer:
         record.token_usage = {
             "prompt_tokens": summary.prompt_tokens,
             "completion_tokens": summary.completion_tokens,
+            "model_name": summary.model_name,
         }
         tracking_store.update(record)
         return summary
@@ -377,21 +553,97 @@ class CodeFixer:
         cve_ids: list,
         failure_log_excerpt: Optional[str],
         kb_entry=None,
+        is_retry: bool = False,
     ) -> ChangeSummary:
-        self._ecosystem.bump_direct_dependency(
-            self._repo_path, component_name, current_version, target_version
+        manifest = self._manifest_file
+        support_before = self._snapshot_python_support_files()
+        bumped = False
+        compile_failure = None
+        try:
+            self._ecosystem.bump_direct_dependency(
+                self._repo_path, component_name, current_version, target_version
+            )
+            bumped = True
+        except (PomXMLError, PackageJsonError, PythonManifestError):
+            if not is_retry:
+                return self._execute_transitive_fix(
+                    component_name=component_name,
+                    current_version=current_version,
+                    target_version=target_version,
+                    introduced_by="dependency tree resolution",
+                    cve_ids=cve_ids,
+                )
+            # A retry runs on a branch where the original manifest change is
+            # already present. Do not mistake the missing old version for a
+            # transitive finding; send the CI failure to the repair engine.
+        if bumped:
+            compiled, compile_message = self._ecosystem.verify_build(self._repo_path)
+            if compiled:
+                support_files = self._changed_python_support_files(support_before)
+                return ChangeSummary(
+                    component_name=component_name,
+                    old_version=current_version,
+                    new_version=target_version,
+                    files_changed=[manifest, *support_files],
+                    rationale=(
+                        f"Dependency upgraded from {current_version} to {target_version} "
+                        f"in {manifest}; the repository compiled successfully without source changes."
+                    ),
+                    cve_ids=cve_ids,
+                )
+            compile_failure = compile_message
+            logger.warning(
+                "%s: direct dependency bump did not compile cleanly; "
+                "falling back to FixEngine. %s",
+                component_name,
+                compile_message[:200],
+            )
+        prompt_failure = failure_log_excerpt
+        if compile_failure:
+            prompt_failure = (
+                f"{failure_log_excerpt}\n\n" if failure_log_excerpt else ""
+            ) + f"Compile verification after the {manifest} bump failed:\n" + compile_failure
+
+        # Handle the known Struts 2.5+ package move deterministically before
+        # asking an LLM to diagnose it. This is a compile-only compatibility
+        # change and prevents a predictable broken PR when the model misses the
+        # import in a multi-finding remediation branch.
+        known_files = self._apply_known_compatibility_fixes(
+            component_name=component_name,
+            target_version=target_version,
         )
+        if known_files:
+            compiled, compatibility_message = self._ecosystem.verify_build(self._repo_path)
+            if compiled:
+                return ChangeSummary(
+                    component_name=component_name,
+                    old_version=current_version,
+                    new_version=target_version,
+                    files_changed=[manifest, *known_files],
+                    rationale=(
+                        f"Dependency upgraded from {current_version} to {target_version}; "
+                        "updated the Struts filter package for the upgraded API."
+                    ),
+                    cve_ids=cve_ids,
+                )
+            prompt_failure = (
+                f"{prompt_failure}\n\n"
+                "Compile verification after the deterministic compatibility fix failed:\n"
+                f"{compatibility_message}"
+            )
+
         file_listing = self._build_file_listing()
         prompt = self._build_prompt(
             component_name=component_name,
             current_version=current_version,
             target_version=target_version,
             file_listing=file_listing,
-            failure_log_excerpt=failure_log_excerpt,
+            failure_log_excerpt=prompt_failure,
             kb_entry=kb_entry,
         )
         result = self._engine.run_fix(self._repo_path, prompt)
-        files_changed = ["pom.xml"] + list(dict.fromkeys(result.files_changed))
+        files_changed = [manifest, *self._changed_python_support_files(support_before)]
+        files_changed += list(dict.fromkeys(result.files_changed))
         return ChangeSummary(
             component_name=component_name,
             old_version=current_version,
@@ -401,7 +653,49 @@ class CodeFixer:
             cve_ids=cve_ids,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
+            model_name=result.model_name,
         )
+
+    def _apply_known_compatibility_fixes(
+        self,
+        component_name: str,
+        target_version: str,
+    ) -> list:
+        """Apply narrow, well-known source migrations for Maven API moves."""
+        if component_name != "org.apache.struts:struts2-core":
+            return []
+
+        try:
+            version_parts = [int(part) for part in target_version.split(".")[:2]]
+        except (ValueError, AttributeError):
+            return []
+        if len(version_parts) < 2:
+            return []
+        major, minor = version_parts[0], version_parts[1]
+        # Matches Struts 2.5+ as well as Struts 6+ and beyond
+        if not (major > 2 or (major == 2 and minor >= 5)):
+            return []
+
+        replacements = [
+            ("org.apache.struts2.dispatcher.ng.filter.StrutsPrepareAndExecuteFilter", "org.apache.struts2.dispatcher.filter.StrutsPrepareAndExecuteFilter"),
+            ("org.apache.struts2.dispatcher.StrutsFilter", "org.apache.struts2.dispatcher.filter.StrutsPrepareAndExecuteFilter"),
+            ("StrutsFilter.class", "StrutsPrepareAndExecuteFilter.class"),
+            ("StrutsFilter", "StrutsPrepareAndExecuteFilter"),
+        ]
+
+        changed = []
+        for source_file in self._repo_path.rglob("*.java"):
+            if "target" in source_file.parts:
+                continue
+            content = source_file.read_text(encoding="utf-8")
+            modified = content
+            for old_text, new_text in replacements:
+                if old_text in modified:
+                    modified = modified.replace(old_text, new_text)
+            if modified != content:
+                source_file.write_text(modified, encoding="utf-8")
+                changed.append(str(source_file.relative_to(self._repo_path)))
+        return changed
 
     def _execute_transitive_fix(
         self,
@@ -412,40 +706,79 @@ class CodeFixer:
         cve_ids: list,
     ) -> ChangeSummary:
         """Deterministic path for a transitive-dependency finding: pins the
-        resolved version via a <dependencyManagement> override (see
-        _add_dependency_management_override) -- no LLM call, no source
-        changes, no prompt_tokens/completion_tokens (None, not 0 -- see
+        resolved version via a manifest override (dependencyManagement for Maven,
+        overrides for npm) -- no LLM call, no source changes, no
+        prompt_tokens/completion_tokens (None, not 0 -- see
         engines.base.FixResult on why 0 would misrepresent "no LLM used" as
         "confirmed zero cost").
 
         Verified by compiling. If the version bump itself breaks the build --
-        version-mediation fallout, not something a pom.xml-only edit can fix
+        version-mediation fallout, not something a manifest-only edit can fix
         further -- falls back to the FixEngine with the compile failure as
         context, reusing the exact same RETRY_FIX_PROMPT path a CI-failure
         retry would use (_build_prompt selects it whenever failure_log_excerpt
         is set, regardless of why).
         """
+        manifest = self._manifest_file
+        support_before = self._snapshot_python_support_files()
+        override_mechanism = "overrides" if self._is_npm else ("pinned requirement" if self._is_python else "dependencyManagement")
+
+        # ── Dependency Hygiene: Try Parent-First upgrade before manifest override ──
+        if introduced_by and hasattr(self._ecosystem, "try_parent_dependency_upgrade"):
+            try:
+                parent_upgrade = self._ecosystem.try_parent_dependency_upgrade(
+                    repo_path=self._repo_path,
+                    transitive_component=component_name,
+                    target_transitive_version=target_version,
+                    parent_component=introduced_by,
+                )
+                if parent_upgrade is not None:
+                    parent_old, parent_new, resolved_trans = parent_upgrade
+                    logger.info(
+                        "Dependency Hygiene: Upgraded direct parent %s (%s → %s) resolving %s to %s",
+                        introduced_by, parent_old, parent_new, component_name, resolved_trans,
+                    )
+                    return ChangeSummary(
+                        component_name=component_name,
+                        old_version=current_version,
+                        new_version=resolved_trans,
+                        files_changed=[manifest, *self._changed_python_support_files(support_before)],
+                        rationale=(
+                            f"Dependency Hygiene: Upgraded direct parent dependency {introduced_by} "
+                            f"({parent_old} → {parent_new}), which cleanly resolved transitive vulnerability "
+                            f"in {component_name} ({current_version} → {resolved_trans}) without requiring "
+                            f"an artificial {override_mechanism} override."
+                        ),
+                        cve_ids=cve_ids,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Parent-first upgrade attempt for %s via %s encountered an error: %s -- falling back to %s.",
+                    component_name, introduced_by, e, override_mechanism,
+                )
+
         self._ecosystem.add_transitive_override(self._repo_path, component_name, target_version)
 
         compiled, message = self._ecosystem.verify_build(self._repo_path)
         if compiled:
+            changed_files = [manifest, *self._changed_python_support_files(support_before)]
             return ChangeSummary(
                 component_name=component_name,
                 old_version=current_version,
                 new_version=target_version,
-                files_changed=["pom.xml"],
+                files_changed=changed_files,
                 rationale=(
                     f"Transitive dependency (introduced by {introduced_by}) pinned to "
-                    f"{target_version} via a dependencyManagement override. No source "
+                    f"{target_version} via a {override_mechanism} override. No source "
                     "changes required."
                 ),
                 cve_ids=cve_ids,
             )
 
         logger.warning(
-            "%s: dependencyManagement override to %s did not compile cleanly -- "
+            "%s: %s override to %s did not compile cleanly -- "
             "falling back to FixEngine with the compile failure as context. %s",
-            component_name, target_version, message[:200],
+            component_name, override_mechanism, target_version, message[:200],
         )
         file_listing = self._build_file_listing()
         prompt = self._build_prompt(
@@ -456,7 +789,8 @@ class CodeFixer:
             failure_log_excerpt=message,
         )
         result = self._engine.run_fix(self._repo_path, prompt)
-        files_changed = ["pom.xml"] + list(dict.fromkeys(result.files_changed))
+        files_changed = [manifest, *self._changed_python_support_files(support_before)]
+        files_changed += list(dict.fromkeys(result.files_changed))
         return ChangeSummary(
             component_name=component_name,
             old_version=current_version,
@@ -464,13 +798,14 @@ class CodeFixer:
             files_changed=files_changed,
             rationale=(
                 f"Transitive dependency (introduced by {introduced_by}) pinned to "
-                f"{target_version} via a dependencyManagement override; that broke "
+                f"{target_version} via a {override_mechanism} override; that broke "
                 f"compilation, so the FixEngine applied a corrective source fix. "
                 f"{result.rationale}"
             ),
             cve_ids=cve_ids,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
+            model_name=result.model_name,
         )
 
     # ── Prompt construction (engine-agnostic) ─────────────────────────────────
@@ -484,38 +819,83 @@ class CodeFixer:
         failure_log_excerpt: Optional[str],
         kb_entry=None,
     ) -> str:
-        """Selects and formats FRESH_FIX_PROMPT or RETRY_FIX_PROMPT. The result is
-        handed to whichever FixEngine is configured -- prompt content doesn't
-        change based on which engine will run it, only on self._run_tests_enabled
-        (a capability the engine itself already reported, not an engine-name
-        branch here -- see __init__).
+        """Selects and formats the appropriate FRESH_FIX or RETRY_FIX prompt
+        based on the detected ecosystem (Java/Maven, Node.js/npm, or Python).
+        The result is handed to whichever FixEngine is configured -- prompt content
+        doesn't change based on which engine will run it, only on self._run_tests_enabled
+        (a capability the engine itself already reported, not an engine-name branch here).
         """
-        if failure_log_excerpt:
-            return RETRY_FIX_PROMPT.format(
+        if self._is_npm:
+            if failure_log_excerpt:
+                return RETRY_FIX_PROMPT_NODE.format(
+                    component_name=component_name,
+                    current_version=current_version,
+                    target_version=target_version,
+                    failure_log_excerpt=failure_log_excerpt[:6000],
+                    file_listing=file_listing,
+                )
+            return FRESH_FIX_PROMPT_NODE.format(
                 component_name=component_name,
                 current_version=current_version,
                 target_version=target_version,
-                failure_log_excerpt=failure_log_excerpt[:6000],
                 file_listing=file_listing,
-                test_tool_line=_render_test_tool_line(self._run_tests_enabled),
-                test_workflow_step=_render_test_workflow_step("5a", self._run_tests_enabled),
+                kb_context=_render_kb_context(kb_entry),
             )
-        return FRESH_FIX_PROMPT.format(
-            component_name=component_name,
-            current_version=current_version,
-            target_version=target_version,
-            file_listing=file_listing,
-            kb_context=_render_kb_context(kb_entry),
-            test_tool_line=_render_test_tool_line(self._run_tests_enabled),
-            test_workflow_step=_render_test_workflow_step("6a", self._run_tests_enabled),
-        )
+        elif self._is_python:
+            if failure_log_excerpt:
+                return RETRY_FIX_PROMPT_PYTHON.format(
+                    component_name=component_name,
+                    current_version=current_version,
+                    target_version=target_version,
+                    failure_log_excerpt=failure_log_excerpt[:6000],
+                    file_listing=file_listing,
+                )
+            return FRESH_FIX_PROMPT_PYTHON.format(
+                component_name=component_name,
+                current_version=current_version,
+                target_version=target_version,
+                file_listing=file_listing,
+                kb_context=_render_kb_context(kb_entry),
+            )
+        else:
+            if failure_log_excerpt:
+                return RETRY_FIX_PROMPT.format(
+                    component_name=component_name,
+                    current_version=current_version,
+                    target_version=target_version,
+                    failure_log_excerpt=failure_log_excerpt[:6000],
+                    file_listing=file_listing,
+                    test_tool_line=_render_test_tool_line(self._run_tests_enabled),
+                    test_workflow_step=_render_test_workflow_step("5a", self._run_tests_enabled),
+                )
+            return FRESH_FIX_PROMPT.format(
+                component_name=component_name,
+                current_version=current_version,
+                target_version=target_version,
+                file_listing=file_listing,
+                kb_context=_render_kb_context(kb_entry),
+                test_tool_line=_render_test_tool_line(self._run_tests_enabled),
+                test_workflow_step=_render_test_workflow_step("6a", self._run_tests_enabled),
+            )
 
-    # ── File listing (UNCHANGED) ──────────────────────────────────────────────
+    # ── File listing ──────────────────────────────────────────────────────────
 
     def _build_file_listing(self) -> str:
+        """Builds a file listing for the prompt, including ecosystem-appropriate
+        file extensions appropriate to the detected ecosystem.
+        """
         files = []
-        for ext in ("*.java", "*.xml", "*.properties", "*.yml", "*.yaml"):
+        if self._is_npm:
+            extensions = ("*.js", "*.ts", "*.jsx", "*.tsx", "*.json", "*.mjs", "*.cjs", "*.yml", "*.yaml")
+            exclude_dirs = {"node_modules", ".next", "dist", "build", ".nuxt"}
+        elif self._is_python:
+            extensions = ("*.py", "*.toml", "*.txt", "*.yml", "*.yaml", "*.ini", "*.cfg")
+            exclude_dirs = {".venv", "venv", "__pycache__", ".pytest_cache", "build", "dist"}
+        else:
+            extensions = ("*.java", "*.xml", "*.properties", "*.yml", "*.yaml")
+            exclude_dirs = {"target"}
+        for ext in extensions:
             for f in self._repo_path.rglob(ext):
-                if "target" not in f.parts:
+                if not exclude_dirs.intersection(f.parts):
                     files.append(str(f.relative_to(self._repo_path)))
         return "\n".join(sorted(files)[:200])
