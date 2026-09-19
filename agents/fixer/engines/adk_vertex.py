@@ -32,6 +32,7 @@ from engines.base import FixResult, EngineExecutionError
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 10  # Passed to ADK Runner as max_llm_calls to guard runaway loops
+RUN_TESTS = os.environ.get("RUN_TESTS", "0") == "1"  # Opt-in -- see run_maven_test below
 
 
 class CodeFixerError(EngineExecutionError):
@@ -40,9 +41,11 @@ class CodeFixerError(EngineExecutionError):
 
 class AdkVertexEngine:
     """Runs a fix prompt through an ADK Agent on Vertex AI (Gemini), giving
-    it five local FunctionTools (read/grep/apply_change/compile/test) to edit the
+    it local FunctionTools (read/grep/apply_change/compile/test) to edit the
     cloned repo in place.
     """
+
+    supports_tests = True  # see engines/base.py's FixEngine.supports_tests
 
     def __init__(self, model_name: Optional[str] = None):
         self._model_name = model_name or os.environ.get("VERTEX_MODEL", "gemini-2.5-flash")
@@ -110,21 +113,19 @@ class AdkVertexEngine:
             FunctionTool(func=apply_file_change),
         ]
 
+        tools = list(common_tools)
         if is_npm:
-            tools = common_tools + [
-                FunctionTool(func=run_npm_install),
-                FunctionTool(func=run_npm_test),
-            ]
+            tools.append(FunctionTool(func=run_npm_install))
+            if RUN_TESTS:
+                tools.append(FunctionTool(func=run_npm_test))
         elif is_python:
-            tools = common_tools + [
-                FunctionTool(func=run_python_install),
-                FunctionTool(func=run_python_test),
-            ]
+            tools.append(FunctionTool(func=run_python_install))
+            if RUN_TESTS:
+                tools.append(FunctionTool(func=run_python_test))
         else:
-            tools = common_tools + [
-                FunctionTool(func=run_maven_compile),
-                FunctionTool(func=run_maven_test),
-            ]
+            tools.append(FunctionTool(func=run_maven_compile))
+            if RUN_TESTS:
+                tools.append(FunctionTool(func=run_maven_test))
 
         system_instruction = (
             "You are an autonomous vulnerability remediation agent. "
@@ -344,7 +345,7 @@ class AdkVertexEngine:
         return message
 
     def _tool_run_maven_test(self) -> str:
-        """Run the repository tests with 'mvn -B test -q'."""
+        """Run the repository tests with 'mvn test -q'."""
         _, message = test_repo(self._repo_path)
         return message
 

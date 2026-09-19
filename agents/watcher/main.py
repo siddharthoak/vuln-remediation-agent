@@ -20,7 +20,10 @@ The Watcher NEVER:
 import logging
 import os
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json as _json
 
 from github import Github
 from ci_status import CIStatusWatcher, CIOutcome
@@ -62,6 +65,16 @@ _TERMINAL_STATUSES = {
     TrackingStatus.ENGINE_ERROR.value,
 }
 
+# ── Manual "check now" trigger (POST /check-now, GET /check-now/status) ───────
+# Shared by BOTH the scheduled daemon loop and the manual HTTP trigger (see
+# _scheduled_loop/_make_watcher_server below), so a demo click can't race a
+# scheduled cycle into running _run_once() twice at once -- whichever gets
+# the lock first runs; the other waits (scheduled loop, blocking acquire) or
+# gets told 409/busy (manual trigger, non-blocking acquire). Same in-memory,
+# lock-guarded shape as fixer-server's job state (agents/fixer/main.py).
+_check_lock = threading.Lock()
+_check_state = {"status": "idle", "message": ""}
+
 
 def find_open_remediation_prs(repo):
     """Return open PRs whose head branch starts with the remediation prefix."""
@@ -75,59 +88,135 @@ def main():
 
     if daemon:
         logger.info("Watcher daemon mode started.")
-        while True:
-            try:
-                if is_nightly_run_enabled():
-                    run_time = get_nightly_run_time()
-                    duration_seconds = get_nightly_scan_max_wait_seconds()
+        loop_thread = threading.Thread(
+            target=_scheduled_loop, daemon=True, name="watcher-loop",
+        )
+        loop_thread.start()
 
-                    is_active, remaining_seconds, seconds_until_next = get_active_window_status(
-                        run_time=run_time,
-                        duration_seconds=duration_seconds,
-                        timezone_name=timezone_name,
-                    )
-
-                    if not is_active:
-                        logger.info(
-                            "Watcher Night Mode: outside active window. Sleeping until %s %s (%.1f hours).",
-                            timezone_name,
-                            run_time,
-                            seconds_until_next / 3600.0,
-                        )
-                        became_active = sleep_until_active_window(
-                            timezone_name=timezone_name,
-                            check_cancel_fn=lambda: not is_nightly_run_enabled(),
-                        )
-                        if not became_active:
-                            logger.info("Night Mode toggled OFF: running watcher immediately.")
-                            _run_once()
-                            continue
-                        # Recompute window status upon waking
-                        is_active, remaining_seconds, _ = get_active_window_status(
-                            run_time=get_nightly_run_time(),
-                            duration_seconds=get_nightly_scan_max_wait_seconds(),
-                            timezone_name=timezone_name,
-                        )
-
-                    logger.info(
-                        "Watcher Night Mode active window (%.1f minutes remaining). Checking PR CI status...",
-                        remaining_seconds / 60.0,
-                    )
-                    _run_once()
-                    cycle_interval = get_watcher_sleep_seconds()
-                    time.sleep(cycle_interval)
-                else:
-                    _run_once()
-                    cycle_interval = get_watcher_sleep_seconds()
-                    logger.info("Watcher sleeping %d seconds until next cycle.", cycle_interval)
-                    time.sleep(cycle_interval)
-            except Exception as exc:
-                logger.error("Watcher cycle error: %s", exc, exc_info=True)
-                time.sleep(10)
+        port = int(os.environ.get("WATCHER_PORT", "8090"))
+        server = _make_watcher_server(port)
+        logger.info("Watcher HTTP server listening on :%d", port)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            logger.info("Watcher shutting down.")
     else:
         _run_once()
 
 
+def _scheduled_loop():
+    timezone_name = os.environ.get("NIGHTLY_RUN_TIMEZONE", "Asia/Kolkata")
+    while True:
+        try:
+            if is_nightly_run_enabled():
+                run_time = get_nightly_run_time()
+                duration_seconds = get_nightly_scan_max_wait_seconds()
+
+                is_active, remaining_seconds, seconds_until_next = get_active_window_status(
+                    run_time=run_time,
+                    duration_seconds=duration_seconds,
+                    timezone_name=timezone_name,
+                )
+
+                if not is_active:
+                    logger.info(
+                        "Watcher Night Mode: outside active window. Sleeping until %s %s (%.1f hours).",
+                        timezone_name,
+                        run_time,
+                        seconds_until_next / 3600.0,
+                    )
+                    became_active = sleep_until_active_window(
+                        timezone_name=timezone_name,
+                        check_cancel_fn=lambda: not is_nightly_run_enabled(),
+                    )
+                    if not became_active:
+                        logger.info("Night Mode toggled OFF: running watcher immediately.")
+                        with _check_lock:
+                            _run_check_now_locked()
+                        continue
+                    # Recompute window status upon waking
+                    is_active, remaining_seconds, _ = get_active_window_status(
+                        run_time=get_nightly_run_time(),
+                        duration_seconds=get_nightly_scan_max_wait_seconds(),
+                        timezone_name=timezone_name,
+                    )
+
+                logger.info(
+                    "Watcher Night Mode active window (%.1f minutes remaining). Checking PR CI status...",
+                    remaining_seconds / 60.0,
+                )
+                with _check_lock:
+                    _run_check_now_locked()
+                cycle_interval = get_watcher_sleep_seconds()
+                time.sleep(cycle_interval)
+            else:
+                with _check_lock:
+                    _run_check_now_locked()
+                cycle_interval = get_watcher_sleep_seconds()
+                logger.info("Watcher sleeping %d seconds until next cycle.", cycle_interval)
+                time.sleep(cycle_interval)
+        except Exception as exc:
+            logger.error("Watcher cycle error: %s", exc, exc_info=True)
+
+
+def _run_check_now_locked():
+    """Runs one watch cycle and updates _check_state. Caller must already
+    hold _check_lock -- this function only does the work, it never
+    acquires/releases the lock itself (both _scheduled_loop and the manual
+    /check-now handler own that decision).
+    """
+    global _check_state
+    _check_state = {"status": "running", "message": "Checking open remediation PRs..."}
+    try:
+        _run_once()
+        _check_state = {"status": "done", "message": "Cycle complete."}
+    except Exception as exc:
+        logger.error("Watcher cycle error: %s", exc, exc_info=True)
+        _check_state = {"status": "error", "message": str(exc)}
+
+
+def _make_watcher_server(port: int) -> HTTPServer:
+    class CheckHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/check-now":
+                self._handle_check_now()
+            else:
+                self.send_error(404)
+
+        def do_GET(self):
+            if self.path == "/check-now/status":
+                self._send_json(200, _check_state)
+            else:
+                self.send_error(404)
+
+        def _send_json(self, status: int, payload) -> None:
+            body = _json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _handle_check_now(self):
+            if not _check_lock.acquire(blocking=False):
+                self._send_json(409, _check_state)
+                return
+
+            def _run():
+                try:
+                    _run_check_now_locked()
+                finally:
+                    _check_lock.release()
+
+            self.send_response(202)
+            self.end_headers()
+            threading.Thread(target=_run, daemon=True, name="check-now").start()
+            logger.info("Manual check-now accepted.")
+
+        def log_message(self, fmt, *args):  # suppress default access log noise
+            logger.debug("HTTP %s", fmt % args)
+
+    return HTTPServer(("0.0.0.0", port), CheckHandler)
 
 
 def _run_once():

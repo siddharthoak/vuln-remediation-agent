@@ -104,7 +104,6 @@ DATA_DIR = TRACKING_PATH.parent
 CHECKPOINT_PATH = DATA_DIR / "scan_poll_checkpoint.json"
 SCAN_DIR = Path(os.environ.get("SCAN_REPORT_PATH", "./scan-reports"))
 
-
 def _resolve_report_file(label: str) -> Optional[Path]:
     """Locate a scanner report JSON file whether placed directly in SCAN_DIR or a nested subfolder."""
     if label == "Trivy":
@@ -133,6 +132,14 @@ def _resolve_report_file(label: str) -> Optional[Path]:
             return found[0]
     return candidates[0] if candidates else None
 
+
+# fixer-server already has GCP/GitHub credentials mounted and runs the actual
+# KnowledgeAgent hydration -- the dashboard stays credential-free and just
+# proxies the trigger/status calls over the podman-compose network.
+FIXER_SERVER_URL = os.environ.get("FIXER_SERVER_URL", "http://fixer-server:8080")
+# Same credential-free proxy relationship as FIXER_SERVER_URL above, for the
+# Watcher's "check now" trigger.
+WATCHER_URL = os.environ.get("WATCHER_URL", "http://watcher:8090")
 
 REPORT_FILES = {
     "Trivy": SCAN_DIR / "trivy-report.json",
@@ -179,6 +186,17 @@ STATUS_DESCRIPTIONS = {
 # treating the status column as redundant with the PR badge.
 _ACTIVE_PR_STATUSES = {TrackingStatus.PR_OPENED.value, TrackingStatus.CI_PENDING.value}
 
+# Drives the Demo Controls "Next:" hint -- any record still moving through
+# the pipeline, not just the PR_OPENED/CI_PENDING subset _ACTIVE_PR_STATUSES
+# covers (a CI_FAILED/RETRY_REQUESTED record is also mid-flight, just
+# between Watcher cycles rather than waiting on GitHub).
+_ACTIVE_TRACKING_STATUSES = {
+    TrackingStatus.PR_OPENED.value,
+    TrackingStatus.CI_PENDING.value,
+    TrackingStatus.CI_FAILED.value,
+    TrackingStatus.RETRY_REQUESTED.value,
+}
+
 # General bucket-taxonomy definitions, matching agents/classifier/classifier.py's
 # own docstring. A TrackingRecord only ever exists for bucket 2 or 3 -- bucket
 # 1/4 findings get a GitHub triage issue instead and never reach the fixer, so
@@ -221,6 +239,31 @@ _ESCALATED_STATUSES = {
 # visual grouping, not a business metric.
 _OK_STATUSES = {TrackingStatus.CI_PASSED.value}
 _ERR_DISPLAY_STATUSES = _ESCALATED_STATUSES | {TrackingStatus.CI_FAILED.value}
+
+# Pipeline tab: collapses the 9 raw TrackingStatus values into the 4 stages
+# a finding visibly moves through, plus a side "escalated" bucket. There's no
+# per-finding "Scan"/"Classify" stage here on purpose -- a TrackingRecord
+# only ever exists for bucket 2/3 findings (see BUCKET_DEFINITIONS above);
+# bucket 1/4 findings go straight to a GitHub triage issue and never reach
+# this store at all, so classification isn't observable per-finding. The
+# Pipeline tab's "Intake" node is an aggregate count instead (see
+# _pipeline_context below), not a 5th stage in this mapping.
+_PIPELINE_STAGE = {
+    TrackingStatus.CREATED.value:            "fix",
+    TrackingStatus.PR_OPENED.value:          "pr_ci",
+    TrackingStatus.CI_PENDING.value:         "pr_ci",
+    TrackingStatus.CI_FAILED.value:          "retry",
+    TrackingStatus.RETRY_REQUESTED.value:    "retry",
+    TrackingStatus.CI_PASSED.value:          "done",
+    TrackingStatus.FAILED_MAX_RETRIES.value: "escalated",
+    TrackingStatus.ESCALATED.value:          "escalated",
+    TrackingStatus.ENGINE_ERROR.value:       "escalated",
+}
+_PIPELINE_STAGE_LABELS = {"fix": "Fix", "pr_ci": "PR / CI", "retry": "Retry", "done": "Done", "escalated": "Escalated"}
+# Linear order for the per-record dot stepper -- "escalated" is a side
+# branch off PR/CI, not a step on this line, so it's excluded here and shown
+# as its own "Needs Attention" list instead (see _pipeline_context).
+_STEPPER_STAGES = ["fix", "pr_ci", "retry", "done"]
 
 
 def _status_class(status: str) -> str:
@@ -484,6 +527,24 @@ def _percentile(sorted_values: list, pct: float) -> float:
     return sorted_values[idx]
 
 
+def _demo_next_hint(scan_finding_count: int, records: list) -> str:
+    """One-line "what to click next" for the Demo Controls card -- purely a
+    read of state that's already computed elsewhere (scan finding count,
+    tracking records), not a new source of truth.
+    """
+    if not scan_finding_count:
+        return "Next: Step 1 -- run a scan to load findings."
+    if not records:
+        return "Next: Step 2 -- Trigger Fixer to classify and fix these findings."
+    if any(r["status"] in _ACTIVE_TRACKING_STATUSES for r in records):
+        # Deliberately not phrased as "Step 3" -- the Watcher already polls
+        # CI and retries failures on its own timer with no user action
+        # required; "Skip the Wait" is an optional demo-pacing shortcut,
+        # not a step in the flow (see sidebar.html's .demo-utility section).
+        return 'CI is running -- the Watcher will pick this up automatically within 15 min (or use "Skip the Wait" below).'
+    return "Demo complete for this data -- Reset Demo to run through again."
+
+
 def _sidebar_status() -> dict:
     checkpoint = None
     if CHECKPOINT_PATH.exists():
@@ -507,14 +568,24 @@ def _sidebar_status() -> dict:
         else:
             reports[label] = {"present": False, "age_minutes": None}
 
+    scan_finding_count = _scan_finding_count()
+    records = _records_as_dicts()
     fixer_status = _fixer_status_info()
+
     return {
         "checkpoint": checkpoint,
         "reports": reports,
         "fixer_active": fixer_status["badge_class"] == "ok",
         "fixer_status": fixer_status,
-        "scan_finding_count": _scan_finding_count(),
+        "scan_finding_count": scan_finding_count,
         "tracking_path": str(TRACKING_PATH),
+        # Seeds the Demo Controls card's initial render (page load / the
+        # sidebar's own 30s self-poll) so each button already reflects
+        # whether a job is mid-run, without waiting for its own first poll.
+        "scan_live": _scan_live_status(),
+        "fix": _fix_status(),
+        "watcher_check": _watcher_check_status(),
+        "demo_next_hint": _demo_next_hint(scan_finding_count, records),
     }
 
 
@@ -576,6 +647,7 @@ def index(request: Request):
         "sidebar": _sidebar_status(),
         **_repo_config_context(),
         **_run_history_context(records),
+        **_how_it_works_context(),
     })
 
 
@@ -887,6 +959,35 @@ def partial_sidebar(request: Request):
     return templates.TemplateResponse(request, "partials/sidebar.html", {"sidebar": _sidebar_status()})
 
 
+def _how_it_works_context() -> dict:
+    """Shared by the index route's default tab and /partials/how-it-works
+    directly -- both need the exact same context, so index() can't just
+    {% include %} the template without also passing this.
+    """
+    return {
+        "max_retry_attempts": os.environ.get("MAX_RETRY_ATTEMPTS", "3"),
+        "watcher_sleep_minutes": int(os.environ.get("WATCHER_SLEEP_SECONDS", "900")) // 60,
+        "max_parallel_fixes": os.environ.get("MAX_PARALLEL_FIXES", "5"),
+        # Same "read the same default the real service reads" pattern as the
+        # three above -- reflects agents/fixer/engines/adk_vertex.py's own
+        # RUN_TESTS check, not a dashboard-local flag.
+        "run_tests_enabled": os.environ.get("RUN_TESTS", "0") == "1",
+    }
+
+
+@app.get("/partials/how-it-works")
+def partial_how_it_works(request: Request):
+    """Static, doesn't self-poll -- unlike every other tab this isn't a view
+    over live data, it's a narrated explainer for a demo. The numbers it
+    quotes (retry limit, tool-loop rounds, watcher interval) are read from
+    the same env vars fixer-server/watcher default to, so a POC deployment
+    that customizes them stays accurate here without a second place to edit
+    -- MAX_TOOL_ROUNDS is the one exception (hardcoded in code_fixer.py, not
+    env-configurable), called out as such in the template.
+    """
+    return templates.TemplateResponse(request, "partials/how_it_works.html", _how_it_works_context())
+
+
 def _group_by_run(view: list) -> list:
     """Groups records by (repo, created_at truncated to the minute).
 
@@ -957,6 +1058,82 @@ def _run_history_context(records: list, status: str = "", component: str = "", r
     }
 
 
+def _format_elapsed(updated_at: str, now: datetime) -> str:
+    try:
+        updated = datetime.fromisoformat(updated_at)
+    except (TypeError, ValueError):
+        return ""
+    seconds = max(0, int((now - updated).total_seconds()))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h"
+
+
+def _dot_states(stage: str) -> list:
+    """Per-record state ("done"/"current"/"pending") for each dot in the
+    4-step stepper -- computed here rather than in the template so the
+    template just renders, it doesn't do index arithmetic.
+    """
+    if stage not in _STEPPER_STAGES:
+        return ["pending"] * len(_STEPPER_STAGES)
+    pos = _STEPPER_STAGES.index(stage)
+    return ["done" if i < pos else "current" if i == pos else "pending" for i in range(len(_STEPPER_STAGES))]
+
+
+def _pipeline_context() -> dict:
+    records = _records_as_dicts()
+
+    # A retry writes a NEW TrackingRecord per attempt (same pr_number, higher
+    # attempt_number) -- only the latest attempt reflects where that PR
+    # actually is right now, same "collapse to latest per pr_number" logic
+    # partial_metrics already uses above. A record with no pr_number yet
+    # (status=CREATED) has nothing to collapse -- it stands on its own.
+    latest_by_pr: dict = {}
+    standalone: list = []
+    for r in records:
+        pr = r.get("pr_number")
+        if pr is None:
+            standalone.append(r)
+            continue
+        prev = latest_by_pr.get(pr)
+        if prev is None or (r.get("attempt_number") or 0) >= (prev.get("attempt_number") or 0):
+            latest_by_pr[pr] = r
+    current = standalone + list(latest_by_pr.values())
+
+    now = datetime.now(tz=timezone.utc)
+    counts = {key: 0 for key in _PIPELINE_STAGE_LABELS}
+    in_flight: list = []
+    needs_attention: list = []
+    for r in current:
+        stage = _PIPELINE_STAGE.get(r["status"])
+        if stage is None:
+            continue
+        counts[stage] += 1
+        row = dict(r)
+        row["pipeline_stage"] = stage
+        row["elapsed"] = _format_elapsed(r.get("updated_at"), now)
+        row["dot_states"] = _dot_states(stage)
+        if stage in ("fix", "pr_ci", "retry"):
+            in_flight.append(row)
+        elif stage == "escalated":
+            needs_attention.append(row)
+
+    in_flight.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+    needs_attention.sort(key=lambda r: r.get("updated_at") or "", reverse=True)
+
+    return {
+        "counts": counts,
+        "stage_labels": _PIPELINE_STAGE_LABELS,
+        "stepper_stages": _STEPPER_STAGES,
+        "in_flight": in_flight,
+        "needs_attention": needs_attention,
+        "intake": {"count": _scan_finding_count(), "fixer_active": _fixer_active()},
+    }
+
+
 @app.get("/partials/run-history")
 def partial_run_history(request: Request, status: str = "", component: str = "", repo: str = "", locality: str = ""):
     records = _records_as_dicts()
@@ -982,6 +1159,11 @@ def partial_retry_lineage(request: Request, pr_number: str = ""):
         "selected_pr": selected_pr,
         "lineage": lineage,
     })
+
+
+@app.get("/partials/pipeline")
+def partial_pipeline(request: Request):
+    return templates.TemplateResponse(request, "partials/pipeline.html", _pipeline_context())
 
 
 @app.get("/partials/metrics")
@@ -1088,6 +1270,207 @@ def _bars(items: list) -> list:
     return [{"label": str(label), "value": value, "pct": round(value / max_val * 100, 1)} for label, value in items]
 
 
+# ── Generic job-proxy helpers ───────────────────────────────────────────────
+# Every trigger below (KB import, demo/live scan, fixer trigger, watcher
+# check-now) follows the same shape: dashboard has no credentials, it only
+# tells fixer-server/watcher (which already have what they need mounted) to
+# start, then polls a status endpoint. Fails soft everywhere -- an
+# unreachable backend renders as a clear "unreachable" state, not a broken
+# dashboard page.
+
+def _proxy_get(base_url: str, path: str, default: dict, timeout: int = 5) -> dict:
+    try:
+        with urllib.request.urlopen(f"{base_url}{path}", timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        logger.warning("Could not reach %s%s: %s", base_url, path, exc)
+        return default
+
+
+def _proxy_post(base_url: str, path: str, default: dict, timeout: int = 5) -> dict:
+    """Like _proxy_get, but POSTs first -- used where the backend returns a
+    JSON body directly from the POST itself (e.g. /scan/demo is synchronous
+    and has no separate status endpoint to poll).
+    """
+    try:
+        req = urllib.request.Request(f"{base_url}{path}", method="POST", data=b"")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:
+        logger.warning("Could not trigger %s%s: %s", base_url, path, exc)
+        return default
+
+
+def _proxy_post_fire_and_forget(base_url: str, path: str, timeout: int = 5) -> None:
+    """Used where the backend's POST returns no body (202, empty) -- the
+    trigger and the status live on separate endpoints (scan/live, fix/trigger,
+    watcher check-now all work this way, mirroring /import-kb).
+    """
+    try:
+        req = urllib.request.Request(f"{base_url}{path}", method="POST", data=b"")
+        urllib.request.urlopen(req, timeout=timeout)
+    except Exception as exc:
+        logger.warning("Could not trigger %s%s: %s", base_url, path, exc)
+
+
+def _kb_import_status() -> dict:
+    return _proxy_get(FIXER_SERVER_URL, "/import-kb/status", {"status": "unreachable", "current": 0, "total": 0, "message": "fixer-server unreachable"})
+
+
+def _scan_live_status() -> dict:
+    return _proxy_get(FIXER_SERVER_URL, "/scan/live/status", {"status": "unreachable", "message": "fixer-server unreachable"})
+
+
+def _fix_status() -> dict:
+    return _proxy_get(FIXER_SERVER_URL, "/fix/status", {"status": "unreachable", "current": 0, "total": 0, "message": "fixer-server unreachable"})
+
+
+def _watcher_check_status() -> dict:
+    return _proxy_get(WATCHER_URL, "/check-now/status", {"status": "unreachable", "message": "watcher unreachable"})
+
+
+@app.post("/actions/import-kb")
+def trigger_kb_import(request: Request):
+    """Proxies fixer-server's POST /import-kb -- the dashboard itself never
+    touches GCP/GitHub credentials or runs the LLM call; it only tells
+    fixer-server (which already has those credentials mounted) to start.
+    """
+    _proxy_post_fire_and_forget(FIXER_SERVER_URL, "/import-kb")
+    # just_triggered=True: the background thread on fixer-server may not have
+    # flipped status to "running" yet by the time we check -- without this,
+    # that race would render the "idle" branch (no polling attached) and the
+    # UI would silently never refresh again despite a job actually running.
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _kb_import_status(), "just_triggered": True, "show_bar": True, "poll_interval": "1.5s",
+        "target_id": "kb-import-progress", "trigger_url": "/actions/import-kb", "poll_url": "/partials/kb-import-progress",
+        "button_label": "Trigger KB Import",
+        "button_title": "Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding.",
+    })
+
+
+@app.get("/partials/kb-import-progress")
+def kb_import_progress(request: Request):
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _kb_import_status(), "just_triggered": False, "show_bar": True, "poll_interval": "1.5s",
+        "target_id": "kb-import-progress", "trigger_url": "/actions/import-kb", "poll_url": "/partials/kb-import-progress",
+        "button_label": "Trigger KB Import",
+        "button_title": "Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding.",
+    })
+
+
+@app.post("/actions/scan-demo")
+def trigger_scan_demo(request: Request):
+    """Synchronous -- writing two small curated JSON files takes
+    milliseconds, so unlike the other triggers below this doesn't need a
+    background job/poll cycle at all; the result is already known by the
+    time this handler returns.
+    """
+    result = _proxy_post(FIXER_SERVER_URL, "/scan/demo", {"status": "error", "message": "fixer-server unreachable"}, timeout=15)
+    if result.get("status") == "done":
+        cves = result.get("cve_ids", [])
+        job = {"status": "done", "message": f"Loaded {len(cves)} demo finding(s): {', '.join(cves)}"}
+    else:
+        job = {"status": "error", "message": result.get("message", "Unknown error")}
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": job, "just_triggered": False, "show_bar": False,
+        "target_id": "scan-demo-progress", "trigger_url": "/actions/scan-demo", "poll_url": "",
+        "button_label": "Load Demo Scan Reports",
+        "button_title": "Writes a curated demo trivy/grype report set (3 findings spanning buckets 2/3/4) -- no GitHub Actions run, for timing-controlled demos.",
+    })
+
+
+@app.post("/actions/scan-live")
+def trigger_scan_live(request: Request):
+    _proxy_post_fire_and_forget(FIXER_SERVER_URL, "/scan/live")
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _scan_live_status(), "just_triggered": True, "show_bar": False, "poll_interval": "5s",
+        "target_id": "scan-live-progress", "trigger_url": "/actions/scan-live", "poll_url": "/partials/scan-live-progress",
+        "button_label": "Run Live Scan",
+        "button_title": "Dispatches the real security-scan.yml GitHub Actions workflow and waits for it -- can take up to ~20 minutes.",
+    })
+
+
+@app.get("/partials/scan-live-progress")
+def scan_live_progress(request: Request):
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _scan_live_status(), "just_triggered": False, "show_bar": False, "poll_interval": "5s",
+        "target_id": "scan-live-progress", "trigger_url": "/actions/scan-live", "poll_url": "/partials/scan-live-progress",
+        "button_label": "Run Live Scan",
+        "button_title": "Dispatches the real security-scan.yml GitHub Actions workflow and waits for it -- can take up to ~20 minutes.",
+    })
+
+
+@app.post("/actions/trigger-fix")
+def trigger_fix(request: Request):
+    _proxy_post_fire_and_forget(FIXER_SERVER_URL, "/fix/trigger")
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _fix_status(), "just_triggered": True, "show_bar": True, "poll_interval": "2s",
+        "target_id": "fix-progress", "trigger_url": "/actions/trigger-fix", "poll_url": "/partials/fix-progress",
+        "button_label": "Trigger Fixer",
+        "button_title": "Runs the fresh-fix pipeline against whatever's currently in scan-reports/ -- classify, fix, open PRs.",
+    })
+
+
+@app.get("/partials/fix-progress")
+def fix_progress(request: Request):
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _fix_status(), "just_triggered": False, "show_bar": True, "poll_interval": "2s",
+        "target_id": "fix-progress", "trigger_url": "/actions/trigger-fix", "poll_url": "/partials/fix-progress",
+        "button_label": "Trigger Fixer",
+        "button_title": "Runs the fresh-fix pipeline against whatever's currently in scan-reports/ -- classify, fix, open PRs.",
+    })
+
+
+@app.post("/actions/watcher-check")
+def trigger_watcher_check(request: Request):
+    _proxy_post_fire_and_forget(WATCHER_URL, "/check-now")
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _watcher_check_status(), "just_triggered": True, "show_bar": False, "poll_interval": "2s",
+        "target_id": "watcher-check-progress", "trigger_url": "/actions/watcher-check", "poll_url": "/partials/watcher-check-progress",
+        "button_label": "Skip the Wait",
+        "button_title": "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer -- purely a demo-pacing shortcut, not something the real system needs.",
+    })
+
+
+@app.get("/partials/watcher-check-progress")
+def watcher_check_progress(request: Request):
+    return templates.TemplateResponse(request, "partials/job_progress.html", {
+        "job": _watcher_check_status(), "just_triggered": False, "show_bar": False, "poll_interval": "2s",
+        "target_id": "watcher-check-progress", "trigger_url": "/actions/watcher-check", "poll_url": "/partials/watcher-check-progress",
+        "button_label": "Skip the Wait",
+        "button_title": "Forces one Watcher cycle immediately instead of waiting for its normal 15-minute timer -- purely a demo-pacing shortcut, not something the real system needs.",
+    })
+
+
+@app.post("/actions/reset")
+def trigger_reset(request: Request):
+    """Proxies fixer-server's POST /reset. Synchronous -- deleting a handful
+    of small local files is fast, no job/poll cycle needed. The button that
+    hits this carries hx-confirm in the template, not a server-side
+    confirmation step -- see sidebar.html.
+    """
+    result = _proxy_post(FIXER_SERVER_URL, "/reset", {"status": "error", "message": "fixer-server unreachable"}, timeout=15)
+    return templates.TemplateResponse(request, "partials/reset_result.html", {
+        "error": None if result.get("status") == "done" else result.get("message", "Unknown error"),
+        "cleared": result.get("cleared", []),
+    })
+
+
+@app.get("/partials/findings")
+def partial_findings(request: Request):
+    """Proxies fixer-server's GET /findings -- a read-only preview (scan
+    reports + classifier, no KB hydration, no fix) so bucket-1/4 findings
+    (which never get a TrackingRecord -- see BUCKET_DEFINITIONS) are visible
+    somewhere in the dashboard, not just as a GitHub Issue.
+    """
+    result = _proxy_get(FIXER_SERVER_URL, "/findings", {"findings": [], "error": "fixer-server unreachable"})
+    return templates.TemplateResponse(request, "partials/findings.html", {
+        "findings": result.get("findings", []),
+        "error": result.get("error"),
+        "bucket_definitions": BUCKET_DEFINITIONS,
+    })
+
+
 @app.get("/partials/kb")
 def partial_kb(request: Request, source: str = ""):
     try:
@@ -1111,4 +1494,5 @@ def partial_kb(request: Request, source: str = ""):
         "selected_source": source,
         "sources": sorted({e.source for e in entries}),
         "confidence_help": KB_CONFIDENCE_HELP,
+        "kb_import_progress": _kb_import_status(),
     })

@@ -32,5 +32,9 @@ COPY agents/knowledge/ /app/knowledge/
 COPY agents/classifier/ /app/classifier/
 COPY agents/fixer/ /app/
 COPY playbooks/ /app/playbooks/
+# POST /scan/demo (dashboard "Load Demo Scan Reports" button) imports this
+# directly rather than shelling out -- flat filename to match this image's
+# existing flat-namespace imports (scan_report_client, scan_fetcher, ...).
+COPY scripts/generate_demo_scan_reports.py /app/demo_scan_reports.py
 
 CMD ["python", "main.py"]

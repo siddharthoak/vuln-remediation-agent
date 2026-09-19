@@ -24,6 +24,7 @@ services:
       SCAN_POLL_INTERVAL: "60"      # seconds between GitHub Actions polls
       MAX_PARALLEL_FIXES: "2"       # Limit concurrent fixes to avoid Vertex AI rate limits
       KB_HYDRATION: "1"             # set to "0" to skip Knowledge Agent (faster local testing)
+      RUN_TESTS: "0"                # set to "1" to give the Fixer a run_maven_test tool (adk engine only, slower)
       NIGHTLY_RUN_ENABLED: "1"      # sleep during the day; run one cycle nightly
       NIGHTLY_RUN_TIME: "00:00"     # local time in NIGHTLY_RUN_TIMEZONE
       NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
@@ -43,13 +44,16 @@ services:
       - "host.docker.internal:host-gateway"
 
   # ── Watcher (always-on) ───────────────────────────────────────────────────
-  # Starts automatically with: podman compose up -d
+  # Starts automatically with: docker compose up -d
   #
   # Runs a cycle every WATCHER_SLEEP_SECONDS (default 15 min):
   #   - Finds open fix/* PRs in the target repo
   #   - Polls CI status for each
   #   - On CI pass → marks tracking record resolved
   #   - On CI fail → invokes the fixer-server /retry endpoint
+  # Also runs an HTTP server on :8090 (POST /check-now, GET /check-now/status)
+  # so a cycle can be forced on demand instead of waiting for the timer --
+  # the dashboard's "Watcher: Check Now" button proxies to this.
   watcher:
     image: vuln-remediation-agent_watcher
     build:
@@ -65,7 +69,13 @@ services:
       NIGHTLY_RUN_ENABLED: "1"
       NIGHTLY_RUN_TIME: "00:00"
       NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
-
+      WATCHER_PORT: "8090"
+    ports:
+      # Host port 8091 (not 8090) -- 8090 is already taken by an unrelated
+      # project on this machine. Container-internal port stays 8090;
+      # dashboard's WATCHER_URL talks to it over the compose network, which
+      # isn't affected by this host-side remap.
+      - "8091:8090"
     volumes:
       - ./data:/data
       - ./config:/config
@@ -75,10 +85,13 @@ services:
     restart: unless-stopped
 
   # ── Dashboard (always-on) ─────────────────────────────────────────────────
-  # Starts automatically with: podman compose up -d
-  # Observability UI — read-only, reads tracking/KB state from the same
-  # bind-mounted ./data volume the fixer-server and watcher write to.
-  # View at: http://172.31.144.52:8501
+  # Starts automatically with: docker compose up -d
+  # Observability UI -- reads tracking/KB state from the same bind-mounted
+  # ./data volume the fixer-server and watcher write to. The one action it
+  # exposes (Trigger KB Import) is just a proxy to fixer-server's own
+  # /import-kb endpoint -- the dashboard itself never touches GCP/GitHub
+  # credentials or calls an LLM directly.
+  # View at: http://localhost:8501
   dashboard:
     image: vuln-remediation-agent_dashboard
     build:
@@ -95,8 +108,12 @@ services:
       SCAN_REPORT_PATH: /reports
       TZ: "Asia/Kolkata"
       NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
+      FIXER_SERVER_URL: http://fixer-server:8080
+      WATCHER_URL: http://watcher:8090
     ports:
       - "8501:8000"
+    depends_on:
+      - fixer-server
     volumes:
       - ./data:/data
       - ./scan-reports:/reports
@@ -121,6 +138,7 @@ services:
       TRACKING_STORE_PATH: /data/tracking.json
       KB_STORE_PATH: /data/kb.json
       SCAN_REPORT_PATH: /reports
+      RUN_TESTS: "0"                # set to "1" to give the Fixer a run_maven_test tool (adk engine only, slower)
     volumes:
       - ./scan-reports:/reports
       - ./data:/data

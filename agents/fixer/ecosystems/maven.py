@@ -312,8 +312,10 @@ class MavenEcosystem:
 
     def verify_build(self, repo_path: Path) -> Tuple[bool, str]:
         return compile_repo(repo_path)
-
     def verify_tests(self, repo_path: Path) -> Tuple[bool, str]:
+        return test_repo(repo_path)
+
+    def run_tests(self, repo_path: Path) -> Tuple[bool, str]:
         return test_repo(repo_path)
 
     def get_project_coordinates(self, repo_path: Path) -> dict:
@@ -605,11 +607,18 @@ def compile_repo(repo_path: Path, timeout_seconds: int = 300) -> Tuple[bool, str
 
 
 def test_repo(repo_path: Path, timeout_seconds: int = 600) -> Tuple[bool, str]:
-    """Runs the Maven test suite with a bounded timeout."""
+    """Runs `mvn test -q --batch-mode` in repo_path. Returns (success, message).
+
+    Same shape as compile_repo -- longer default timeout since test suites
+    run noticeably slower than a compile-only pass. Shared by
+    MavenEcosystem.run_tests and engines/adk_vertex.py's run_maven_test
+    tool; only ever invoked when RUN_TESTS=1 and the active engine
+    advertises supports_tests (see engines/base.py).
+    """
     safe_env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_PAT", "GOOGLE_APPLICATION_CREDENTIALS")}
     try:
         result = subprocess.run(
-            ["mvn", "-B", "test", "-q"],
+            ["mvn", "test", "-q", "--batch-mode"],
             cwd=str(repo_path),
             capture_output=True,
             text=True,

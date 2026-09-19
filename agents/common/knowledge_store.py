@@ -27,7 +27,25 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-PLAYBOOKS_DIR = Path(__file__).parent.parent.parent / "playbooks"
+def _default_playbooks_dir() -> Path:
+    """Every Dockerfile in this project flattens agents/common/ -> /app/common/
+    (COPY agents/common/ /app/common/), one level shallower than this file's
+    position in the source tree (agents/common/knowledge_store.py, two
+    levels under the repo root). A single fixed parent-count breaks one of
+    the two layouts -- try the container layout first (playbooks/ next to
+    /app's other flattened dirs), then fall back to the source-tree layout
+    for local/dev runs where the repo structure is intact. PLAYBOOKS_DIR env
+    var overrides both if set.
+    """
+    container_layout   = Path(__file__).parent.parent / "playbooks"     # /app/common/../playbooks -> /app/playbooks
+    source_tree_layout = Path(__file__).parent.parent.parent / "playbooks"  # agents/common/../../playbooks -> repo-root/playbooks
+    for candidate in (container_layout, source_tree_layout):
+        if candidate.exists():
+            return candidate
+    return container_layout  # neither exists yet -- _load_playbooks() below handles that gracefully
+
+
+PLAYBOOKS_DIR = Path(os.environ["PLAYBOOKS_DIR"]) if os.environ.get("PLAYBOOKS_DIR") else _default_playbooks_dir()
 _FIRESTORE_COLLECTION = "oss-remediation-kb"
 TIER_PRIORITY = {"tier1_learned": 3, "tier2_playbook": 2, "knowledge_agent": 1}
 

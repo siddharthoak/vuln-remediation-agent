@@ -73,22 +73,29 @@ class KnowledgeAgent:
         )
         self._model = GenerativeModel(self._model_name)
 
-    def hydrate(self, findings: list, kb_store) -> None:
+    def hydrate(self, findings: list, kb_store, on_progress=None) -> None:
         """
         For each finding not already in the KB, fetch release data and extract a KnowledgeEntry.
         Deduplicates by (component_name, from_version, to_version) across the findings list.
+
+        on_progress(current, total, message), if given, is called once per
+        unique finding (after it's handled, whether hydrated/skipped/failed)
+        -- lets a caller report progress on what's otherwise a serial,
+        multi-second-per-finding LLM loop. Optional and side-effect-free by
+        default so the normal fresh-scan call site (main.py) is unaffected.
         """
         if os.environ.get("KB_HYDRATION", "1") != "1":
             logger.info("KnowledgeAgent: KB_HYDRATION disabled — skipping.")
             return
 
-        seen = set()
-        for finding in findings:
-            key = (finding.component_name, finding.current_version, finding.recommended_version)
-            if key in seen:
-                continue
-            seen.add(key)
+        seen = {}
+        for f in findings:
+            key = (f.component_name, f.current_version, f.recommended_version)
+            seen.setdefault(key, f)  # first occurrence wins, matching the original dedup order
+        unique = list(seen.values())
+        total = len(unique)
 
+        for i, finding in enumerate(unique, start=1):
             existing = kb_store.find_applicable(
                 finding.component_name, finding.current_version, finding.recommended_version
             )
@@ -97,12 +104,16 @@ class KnowledgeAgent:
                     "KnowledgeAgent: KB hit (%s) for %s — skipping research.",
                     existing.source, finding.component_name,
                 )
+                if on_progress:
+                    on_progress(i, total, f"{finding.component_name}: already in KB, skipped")
                 continue
 
             logger.info(
                 "KnowledgeAgent: researching %s %s→%s",
                 finding.component_name, finding.current_version, finding.recommended_version,
             )
+            if on_progress:
+                on_progress(i - 1, total, f"{finding.component_name}: researching...")
             entry = self._research(finding)
             if entry:
                 kb_store.create(entry)
@@ -112,11 +123,15 @@ class KnowledgeAgent:
                     finding.component_name, entry.confidence,
                     len(entry.breaking_changes), len(entry.patterns),
                 )
+                if on_progress:
+                    on_progress(i, total, f"{finding.component_name}: stored (confidence={entry.confidence})")
             else:
                 logger.info(
                     "KnowledgeAgent: no useful data found for %s — KB entry skipped.",
                     finding.component_name,
                 )
+                if on_progress:
+                    on_progress(i, total, f"{finding.component_name}: no useful data found")
 
     def _research(self, finding) -> Optional[KnowledgeEntry]:
         source_data = self._fetcher.fetch(

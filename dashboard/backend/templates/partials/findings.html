@@ -1,0 +1,50 @@
+<div id="findings-root" hx-get="/partials/findings" hx-trigger="every 30s" hx-target="this" hx-swap="outerHTML">
+  <h2>Findings</h2>
+
+  {% if error %}
+    <p class="err">Could not reach fixer-server ({{ error }}) -- is it running?</p>
+  {% elif not findings %}
+    <p>No findings in the current scan reports. Use the sidebar's Demo Controls to load a scan.</p>
+  {% else %}
+    <p><small>Read-only preview of the current scan reports, run through the classifier -- shown before (or
+       without) any fix attempt. This is the only place a Bucket 1/4 finding (no safe fix, or too risky to
+       automate) is visible in the dashboard at all; those never get a Run History record, only a GitHub
+       triage issue.</small></p>
+
+    <table class="kb-table findings-table">
+      <colgroup>
+        <col class="col-component">
+        <col class="col-version">
+        <col style="width: 90px;">
+        <col style="width: 130px;">
+        <col class="col-details">
+      </colgroup>
+      <thead>
+        <tr>
+          <th>Component</th>
+          <th>Version Change</th>
+          <th>Severity</th>
+          <th>CVE(s)</th>
+          <th>Bucket</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in findings %}
+        <tr>
+          <td class="truncate" title="{{ f.component_name }}">{{ f.component_name }}</td>
+          <td class="truncate">{{ f.current_version }} &rarr; {{ f.recommended_version }}</td>
+          <td>{{ f.severity }}</td>
+          <td class="truncate">
+            {% for cve in f.cve_ids %}{% if not loop.first %}, {% endif %}<a class="link" href="https://nvd.nist.gov/vuln/detail/{{ cve }}" target="_blank" rel="noopener">{{ cve }}</a>{% endfor %}
+          </td>
+          <td title="{{ bucket_definitions.get(f.bucket, '') }}{% if f.rationale %}&#10;&#10;{{ f.rationale }}{% endif %}">
+            <span class="bucket-badge {{ 'bucket-auto' if f.bucket in (2, 3) else 'bucket-triage' }}">
+              Bucket {{ f.bucket }} &middot; {{ 'auto-fix' if f.bucket in (2, 3) else 'triage' }}
+            </span>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>

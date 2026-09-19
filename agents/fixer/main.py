@@ -17,6 +17,7 @@ import threading
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 import json as _json
 from types import SimpleNamespace
 from typing import Optional
@@ -59,8 +60,14 @@ from common.config import (
     get_nightly_scan_max_wait_seconds,
     set_scan_requested,
 )
-from knowledge.main import KnowledgeAgent
 from classifier.classifier import Classifier, ClassifierResult
+try:
+    from demo_scan_reports import write_demo_reports
+except ImportError:
+    try:
+        from scripts.generate_demo_scan_reports import write_demo_reports
+    except ImportError:
+        write_demo_reports = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,6 +81,30 @@ AUTO_FETCH_SCAN    = os.environ.get("AUTO_FETCH_SCAN", "0") == "1"
 
 # Prevents concurrent fresh-scan runs if the poller fires while one is in progress.
 _fresh_scan_lock = threading.Lock()
+
+# ── KB import job state (POST /import-kb, GET /import-kb/status) ──────────────
+# In-memory only -- one fixer-server process, no need for a persisted job
+# store. Guarded by _kb_import_lock so a second trigger while one is already
+# running gets told so (409) instead of racing the same KnowledgeAgent/store.
+_kb_import_lock = threading.Lock()
+_kb_import_state = {"status": "idle", "current": 0, "total": 0, "message": ""}
+
+# ── Live scan job state (POST /scan/live, GET /scan/live/status) ──────────────
+# Same in-memory/lock-guarded shape as KB import above. Genuinely slow (the
+# underlying ScanFetcher.trigger_and_download() dispatches a real GitHub
+# Actions run and can block up to ~20 minutes), so this always runs in a
+# background thread -- never call _run_scan_fetch() synchronously from a
+# request handler.
+_scan_lock = threading.Lock()
+_scan_state = {"status": "idle", "message": ""}
+
+# ── Fresh-fix job state (POST /fix/trigger, GET /fix/status) ──────────────────
+# Mirrors _kb_import_state's shape. Updated from inside _do_fresh_scan()
+# itself (not just the trigger handler) so BOTH the manual "Trigger Fixer"
+# button and the automatic ScanPoller-driven run show live progress -- there's
+# only one fresh-scan job at a time (_fresh_scan_lock already guarantees
+# that), so a single global state object is enough either way.
+_fix_state = {"status": "idle", "current": 0, "total": 0, "message": ""}
 
 
 def main():
@@ -195,6 +226,92 @@ def _run_fixer_poller_loop(poller: ScanPoller) -> None:
             time.sleep(10)
 
 
+def _run_kb_import():
+    """Runs KnowledgeAgent.hydrate() against the current scan reports on
+    disk, reporting progress into _kb_import_state as it goes. Deliberately
+    skips locality resolution and classification entirely -- KB import is
+    about researching each finding's upgrade, not deciding whether/how to
+    fix it, so it only needs the raw findings list.
+    """
+    global _kb_import_state
+    try:
+        report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
+        scanner = ScanReportClient(report_dir=report_dir)
+        findings = scanner.get_vulnerability_report()
+
+        if not findings:
+            _kb_import_state = {"status": "done", "current": 0, "total": 0, "message": "No findings in scan reports."}
+            return
+
+        _kb_import_state = {"status": "running", "current": 0, "total": len(findings), "message": "Starting..."}
+
+        def on_progress(current, total, message):
+            _kb_import_state["current"] = current
+            _kb_import_state["total"] = total
+            _kb_import_state["message"] = message
+
+        kb_store = make_knowledge_store()
+        agent = KnowledgeAgent(github_pat=os.environ.get("GITHUB_PAT"))
+        agent.hydrate(findings, kb_store, on_progress=on_progress)
+
+        _kb_import_state["status"] = "done"
+        _kb_import_state["message"] = f"Done -- {_kb_import_state['total']} unique finding(s) processed."
+    except Exception as exc:
+        logger.exception("KB import failed")
+        _kb_import_state = {"status": "error", "current": 0, "total": 0, "message": str(exc)}
+
+
+def _run_scan_fetch():
+    """Background-thread target for POST /scan/live -- dispatches the real
+    security-scan.yml GitHub Actions workflow and waits for it. Only writes
+    reports to disk; deliberately does NOT also run _run_fresh_scan() --
+    "run a scan" and "trigger the fixer" are separate demo steps on purpose
+    (see agents/fixer/main.py's POST /fix/trigger for the second step).
+    """
+    global _scan_state
+    try:
+        github_repo = os.environ["GITHUB_REPO_TARGET"]
+        github_pat  = os.environ["GITHUB_PAT"]
+        report_dir  = os.environ.get("SCAN_REPORT_PATH", "/reports")
+        _scan_state = {"status": "running", "message": f"Dispatching security-scan.yml on {github_repo}..."}
+        fetcher = ScanFetcher(repo_full_name=github_repo, github_pat=github_pat, report_dir=report_dir)
+        fetcher.trigger_and_download()
+        _scan_state = {"status": "done", "message": "Scan complete -- reports downloaded."}
+    except ScanFetchError as exc:
+        logger.error("Live scan fetch failed: %s", exc)
+        _scan_state = {"status": "error", "message": str(exc)}
+    except Exception as exc:
+        logger.exception("Live scan fetch failed")
+        _scan_state = {"status": "error", "message": str(exc)}
+
+
+def _findings_preview() -> list:
+    """Read-only preview for GET /findings -- parses scan reports and runs
+    the classifier, WITHOUT hydrating the KB, resolving locality, or fixing
+    anything.
+    """
+    report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
+    scanner = ScanReportClient(report_dir=report_dir)
+    findings = scanner.get_vulnerability_report()
+
+    kb_store = make_knowledge_store()
+    classifier = Classifier(kb_store=kb_store)
+
+    out = []
+    for finding in findings:
+        result = classifier.classify(finding)
+        out.append({
+            "component_name": finding.component_name,
+            "current_version": finding.current_version,
+            "recommended_version": finding.recommended_version,
+            "severity": finding.severity,
+            "cve_ids": finding.cve_ids,
+            "bucket": result.bucket,
+            "rationale": result.rationale,
+        })
+    return out
+
+
 def _make_retry_server(port: int, poller: Optional[ScanPoller] = None) -> HTTPServer:
     class RetryHandler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -205,34 +322,54 @@ def _make_retry_server(port: int, poller: Optional[ScanPoller] = None) -> HTTPSe
                     "scan_running": poller.is_scan_running() if poller else False,
                     "has_reports": poller.has_reports() if poller else False,
                 }
-                body = _json.dumps(payload).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-            self.send_error(404)
+                self._send_json(200, payload)
+            elif self.path == "/import-kb/status":
+                self._send_json(200, _kb_import_state)
+            elif self.path == "/scan/live/status":
+                self._send_json(200, _scan_state)
+            elif self.path == "/fix/status":
+                self._send_json(200, _fix_state)
+            elif self.path == "/findings":
+                try:
+                    self._send_json(200, {"findings": _findings_preview()})
+                except ScanReportError as exc:
+                    self._send_json(200, {"findings": [], "error": str(exc)})
+            else:
+                self.send_error(404)
 
         def do_POST(self):
-            if self.path == "/scan":
+            if self.path == "/retry":
+                self._handle_retry()
+            elif self.path == "/import-kb":
+                self._handle_import_kb()
+            elif self.path == "/scan/demo":
+                self._handle_scan_demo()
+            elif self.path == "/scan/live":
+                self._handle_scan_live()
+            elif self.path == "/fix/trigger":
+                self._handle_fix_trigger()
+            elif self.path == "/reset":
+                self._handle_reset()
+            elif self.path == "/scan":
                 dispatched = False
                 if poller:
                     dispatched = poller.dispatch_scan()
-                body = _json.dumps({
+                self._send_json(202 if dispatched else 500, {
                     "status": "dispatched" if dispatched else "failed_or_no_poller",
                     "workflow": "security-scan.yml",
-                }).encode("utf-8")
-                self.send_response(202 if dispatched else 500)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-                return
-
-            if self.path != "/retry":
+                })
+            else:
                 self.send_error(404)
-                return
+
+        def _send_json(self, status: int, payload) -> None:
+            body = _json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _handle_retry(self):
             length = int(self.headers.get("Content-Length", 0))
             body   = self.rfile.read(length)
             try:
@@ -252,6 +389,134 @@ def _make_retry_server(port: int, poller: Optional[ScanPoller] = None) -> HTTPSe
                 name=f"retry-{tracking_id[:8]}",
             ).start()
             logger.info("Retry accepted for tracking_id=%s (spawned process)", tracking_id[:8])
+
+        def _handle_import_kb(self):
+            if not _kb_import_lock.acquire(blocking=False):
+                self._send_json(409, _kb_import_state)
+                return
+
+            def _run():
+                try:
+                    _run_kb_import()
+                finally:
+                    _kb_import_lock.release()
+
+            self.send_response(202)
+            self.end_headers()
+            threading.Thread(target=_run, daemon=True, name="kb-import").start()
+            logger.info("KB import accepted.")
+
+        def _handle_scan_demo(self):
+            # Synchronous on purpose -- writing two small JSON files takes
+            # milliseconds, nowhere near ScanFetcher's up-to-20-minute real
+            # scan, so there's no reason to make the caller poll for this.
+            # No lock: harmless to overlap (worst case one write clobbers
+            # another with equally-valid demo content).
+            report_dir = os.environ.get("SCAN_REPORT_PATH", "/reports")
+            try:
+                cves = write_demo_reports(Path(report_dir))
+                self._send_json(200, {"status": "done", "cve_ids": cves})
+                logger.info("Demo scan reports written to %s (%d finding(s)).", report_dir, len(cves))
+            except Exception as exc:
+                logger.exception("Writing demo scan reports failed")
+                self._send_json(500, {"status": "error", "message": str(exc)})
+
+        def _handle_scan_live(self):
+            if not _scan_lock.acquire(blocking=False):
+                self._send_json(409, _scan_state)
+                return
+
+            def _run():
+                try:
+                    _run_scan_fetch()
+                finally:
+                    _scan_lock.release()
+
+            self.send_response(202)
+            self.end_headers()
+            threading.Thread(target=_run, daemon=True, name="scan-live").start()
+            logger.info("Live scan accepted.")
+
+        def _handle_fix_trigger(self):
+            # Acquires _fresh_scan_lock directly (same lock ScanPoller's
+            # _run_fresh_scan() guards itself with) and calls _do_fresh_scan()
+            # under it here, rather than going through _run_fresh_scan()'s own
+            # acquire/release -- that avoids a release-then-reacquire race
+            # where the poller could sneak in between this handler's check
+            # and the background thread actually starting.
+            if not _fresh_scan_lock.acquire(blocking=False):
+                self._send_json(409, _fix_state)
+                return
+
+            def _run():
+                try:
+                    _do_fresh_scan()
+                except Exception:
+                    logger.exception("Fresh-fix run failed")
+                    _fix_state["status"] = "error"
+                    _fix_state["message"] = "Fresh-fix run failed -- see fixer-server logs."
+                finally:
+                    _fresh_scan_lock.release()
+
+            self.send_response(202)
+            self.end_headers()
+            threading.Thread(target=_run, daemon=True, name="fix-trigger").start()
+            logger.info("Fresh-fix run accepted.")
+
+        def _handle_reset(self):
+            """Clears local demo state -- tracking.json, kb.json, the scan
+            poll checkpoint, and current scan reports -- so a demo can start
+            clean. Deliberately does NOT touch GitHub: it doesn't close PRs
+            or delete branches. That's a human decision, not something a
+            reset button silently automates (see the "how does this handle
+            an already-used-up target repo" discussion this was built for).
+            Refuses (409) while a fixer run or live scan is in flight, reusing
+            the same non-blocking acquire/release check-then-act pattern the
+            other handlers above use, so a reset can't delete files out from
+            under an active job.
+            """
+            if not _fresh_scan_lock.acquire(blocking=False):
+                self._send_json(409, {"status": "error", "message": "A fixer run is in progress -- wait for it to finish before resetting."})
+                return
+            _fresh_scan_lock.release()
+            if not _scan_lock.acquire(blocking=False):
+                self._send_json(409, {"status": "error", "message": "A live scan is in progress -- wait for it to finish before resetting."})
+                return
+            _scan_lock.release()
+
+            report_dir      = Path(os.environ.get("SCAN_REPORT_PATH", "/reports"))
+            tracking_path   = Path(os.environ.get("TRACKING_STORE_PATH", "/data/tracking.json"))
+            kb_path         = Path(os.environ.get("KB_STORE_PATH", "/data/kb.json"))
+            checkpoint_path = tracking_path.parent / "scan_poll_checkpoint.json"
+
+            to_clear = [
+                tracking_path, kb_path, checkpoint_path,
+                report_dir / "trivy-report.json",
+                report_dir / "grype-report.json",
+                report_dir / "dependency-check-report" / "dependency-check-report.json",
+            ]
+            cleared = []
+            try:
+                for path in to_clear:
+                    if path.exists():
+                        path.unlink()
+                        cleared.append(str(path))
+            except Exception as exc:
+                logger.exception("Reset failed")
+                self._send_json(500, {"status": "error", "message": str(exc)})
+                return
+
+            # Mutated in place rather than reassigned -- avoids needing a
+            # `global` declaration for three names in this nested method.
+            _kb_import_state.clear()
+            _kb_import_state.update({"status": "idle", "current": 0, "total": 0, "message": ""})
+            _scan_state.clear()
+            _scan_state.update({"status": "idle", "message": ""})
+            _fix_state.clear()
+            _fix_state.update({"status": "idle", "current": 0, "total": 0, "message": ""})
+
+            logger.info("Demo reset: cleared %d file(s): %s", len(cleared), cleared)
+            self._send_json(200, {"status": "done", "cleared": cleared})
 
         def log_message(self, fmt, *args):  # suppress default access log noise
             logger.debug("HTTP %s", fmt % args)
@@ -456,12 +721,24 @@ def _run_fresh_scan():
         return
     try:
         _do_fresh_scan()
+    except Exception:
+        # Without this, an exception anywhere in _do_fresh_scan() past its
+        # first couple of explicit error branches leaves _fix_state stuck at
+        # "running" forever -- the dashboard's progress bar would spin
+        # indefinitely even though the run actually died. Re-raised so the
+        # CLI one-shot caller (main()'s non-server-mode branch) still fails
+        # loudly, same as before this except existed.
+        _fix_state["status"] = "error"
+        _fix_state["message"] = "Fresh-fix run failed -- see fixer-server logs."
+        raise
     finally:
         _fresh_scan_lock.release()
 
 
 def _do_fresh_scan():
+    global _fix_state
     logger.info("Mode: FRESH SCAN (scheduler-triggered)")
+    _fix_state = {"status": "running", "current": 0, "total": 0, "message": "Scanning and classifying findings..."}
 
     target_repos    = get_target_repos()
     github_repo     = target_repos[0] if target_repos else get_target_repo()
@@ -482,6 +759,7 @@ def _do_fresh_scan():
             fetcher.trigger_and_download()
         except ScanFetchError as exc:
             logger.error("Scan fetch failed: %s", exc)
+            _fix_state = {"status": "error", "current": 0, "total": 0, "message": str(exc)}
             if server_mode:
                 return
             sys.exit(1)
@@ -493,12 +771,14 @@ def _do_fresh_scan():
         findings = scanner.get_vulnerability_report()
     except ScanReportError as exc:
         logger.error("Scan report load failed: %s", exc)
+        _fix_state = {"status": "error", "current": 0, "total": 0, "message": str(exc)}
         if server_mode:
             return
         sys.exit(1)
 
     if not findings:
         logger.info("No vulnerabilities found in scan reports. Nothing to do.")
+        _fix_state = {"status": "done", "current": 0, "total": 0, "message": "No vulnerabilities found in scan reports."}
         return
 
     logger.info("Found %d vulnerability finding(s).", len(findings))
@@ -510,24 +790,28 @@ def _do_fresh_scan():
     # locality resolution needs a real checkout to run `mvn dependency:tree`
     # against before we can classify direct vs. transitive findings.
     source_repo = RepoOps()
-    source_path = source_repo.clone(github_repo_url, github_pat)
+    source_path = source_repo.clone(github_repo_url, github_pat)  # str -- RepoOps.clone_local() below needs it as str
+    # ecosystems/ (get_ecosystem, resolve_locality) is typed against Path and
+    # does real Path-only operations (repo_path / "pom.xml") -- RepoOps.clone()
+    # returns a plain str, so wrap it once here rather than changing
+    # RepoOps.clone()'s return type and every other str-typed caller of it.
+    source_path_obj = Path(source_path)
     logger.info(
         "Source clone ready at %s — up to %d parallel fixes will copy from here.",
         source_path, MAX_PARALLEL_FIXES,
     )
 
-    # ── Locality resolution (direct vs. transitive) ───────────────────────────
     # Ecosystem-pluggable (see ecosystems/) -- Maven, npm, and Python are supported.
     # A finding whose locality can't be determined defaults to direct.
     # A locality-tool failure is routed to triage; a clean lookup that does not
     # contain the finding is treated as a stale report and keeps the legacy
     # direct-dependency fallback.
-    ecosystem = get_ecosystem(source_path)
+    ecosystem = get_ecosystem(source_path_obj)
     locality_failures = {}
     multi_repo_chain = len(target_repos) > 1
     for finding in findings:
         try:
-            locality = ecosystem.resolve_locality(source_path, finding.component_name)
+            locality = ecosystem.resolve_locality(source_path_obj, finding.component_name)
         except EcosystemError as exc:
             if multi_repo_chain:
                 # The scanner already resolved the dependency graph across the
@@ -658,7 +942,14 @@ def _do_fresh_scan():
         tracking_store.create(record)
         tasks.append((finding, record, result.kb_entry))
 
+    _fix_state = {
+        "status": "running", "current": 0, "total": len(tasks),
+        "message": "Fixing findings..." if tasks else "No fixable findings -- all routed to triage issues.",
+    }
+
     if not tasks:
+        _fix_state["status"] = "done"
+        _fix_state["message"] = "No fixable findings -- all routed to triage issues."
         source_repo.cleanup()
         return
 
@@ -768,7 +1059,8 @@ def _do_fresh_scan():
         else:
             logger.info("Opened Combined PR #%d: %s", pr_result.pr_number, pr_result.pr_url)
 
-
+    _fix_state["status"] = "done"
+    _fix_state["message"] = f"Done -- {len(successful_fixes)}/{len(tasks)} finding(s) fixed."
 
 
 # ── Mode B: Watcher retry ─────────────────────────────────────────────────────

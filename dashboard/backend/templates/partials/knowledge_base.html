@@ -1,6 +1,15 @@
 <div id="kb-root" hx-get="/partials/kb?source={{ selected_source | urlencode }}" hx-trigger="every 60s" hx-target="this" hx-swap="outerHTML">
   <h2>Knowledge Base</h2>
 
+  <div class="card">
+    {% with job = kb_import_progress, just_triggered = False, show_bar = True, poll_interval = "1.5s",
+            target_id = "kb-import-progress", trigger_url = "/actions/import-kb", poll_url = "/partials/kb-import-progress",
+            button_label = "Trigger KB Import",
+            button_title = "Runs the Knowledge Agent (one Gemini call per unique finding in the current scan reports) against fixer-server -- takes real time, several seconds to tens of seconds per finding." %}
+      {% include "partials/job_progress.html" %}
+    {% endwith %}
+  </div>
+
   {% if not has_entries %}
     <p>No KB entries yet. Tier 2 playbook entries load from <code>playbooks/*.yaml</code> at fixer startup;
        Knowledge Agent entries are added during each fresh scan; Tier 1 learned entries are added by the
@@ -43,35 +52,39 @@
           <td>{{ e.confidence }}</td>
           <td>
             {% if e.breaking_changes or e.migration_steps or e.patterns or e.api_removals %}
-              <details>
+              <details class="kb-detail">
                 <summary>View details</summary>
-                <p><small>Entry ID: <code>{{ e.entry_id }}</code></small></p>
+                <div class="kb-detail-panel">
+                  <button type="button" class="kb-detail-close" aria-label="Close"
+                          onclick="this.closest('details').removeAttribute('open')">&times;</button>
+                  <p><small>Entry ID: <code>{{ e.entry_id }}</code></small></p>
 
-                {% if e.breaking_changes %}
-                  <p><strong>Breaking changes:</strong></p>
-                  <ul>{% for bc in e.breaking_changes %}<li>{{ bc }}</li>{% endfor %}</ul>
-                {% endif %}
+                  {% if e.breaking_changes %}
+                    <p><strong>Breaking changes:</strong></p>
+                    <ul>{% for bc in e.breaking_changes %}<li>{{ bc }}</li>{% endfor %}</ul>
+                  {% endif %}
 
-                {% if e.migration_steps %}
-                  <p><strong>Migration steps:</strong></p>
-                  <ol>{% for step in e.migration_steps %}<li>{{ step }}</li>{% endfor %}</ol>
-                {% endif %}
+                  {% if e.migration_steps %}
+                    <p><strong>Migration steps:</strong></p>
+                    <ol>{% for step in e.migration_steps %}<li>{{ step }}</li>{% endfor %}</ol>
+                  {% endif %}
 
-                {% if e.patterns %}
-                  <p><strong>Find&rarr;replace patterns ({{ e.patterns | length }}):</strong></p>
-                  {% for p in e.patterns %}
-                    <div class="pattern">
-                      <code>{{ p.get("find", "") }}</code>
-                      <code>{{ p.get("replace", "") }}</code>
-                    </div>
-                    {% if p.get("description") %}<p><small>{{ p.description }}</small></p>{% endif %}
-                  {% endfor %}
-                {% endif %}
+                  {% if e.patterns %}
+                    <p><strong>Find&rarr;replace patterns ({{ e.patterns | length }}):</strong></p>
+                    {% for p in e.patterns %}
+                      <div class="pattern">
+                        <code>{{ p.get("find", "") }}</code>
+                        <code>{{ p.get("replace", "") }}</code>
+                      </div>
+                      {% if p.get("description") %}<p><small>{{ p.description }}</small></p>{% endif %}
+                    {% endfor %}
+                  {% endif %}
 
-                {% if e.api_removals %}
-                  <p><strong>Removed APIs:</strong></p>
-                  <pre>{{ e.api_removals | join("\n") }}</pre>
-                {% endif %}
+                  {% if e.api_removals %}
+                    <p><strong>Removed APIs:</strong></p>
+                    <pre>{{ e.api_removals | join("\n") }}</pre>
+                  {% endif %}
+                </div>
               </details>
             {% else %}
               <span class="muted">&mdash;</span>

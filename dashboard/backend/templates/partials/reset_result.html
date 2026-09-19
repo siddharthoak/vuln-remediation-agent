@@ -1,0 +1,7 @@
+<div id="reset-result">
+  {% if error %}
+    <p class="err">&#10007; Reset failed: {{ error }}</p>
+  {% else %}
+    <p class="ok">&#10003; Reset complete &mdash; cleared {{ cleared | length }} file(s). GitHub PRs/branches were not touched.</p>
+  {% endif %}
+</div>

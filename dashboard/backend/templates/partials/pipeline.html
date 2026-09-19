@@ -1,0 +1,80 @@
+<div id="pipeline-root" hx-get="/partials/pipeline" hx-trigger="every 3s" hx-target="this" hx-swap="outerHTML">
+  <h2>Pipeline</h2>
+
+  <div class="pipeline-diagram">
+    <div class="pnode pnode-intake{% if intake.fixer_active %} pnode-active{% endif %}">
+      <div class="pnode-count">{{ intake.count }}</div>
+      <div class="pnode-label">Intake</div>
+      <div class="pnode-sub">finding(s) in latest scan{% if intake.fixer_active %} &middot; fixer active{% endif %}</div>
+    </div>
+    <div class="pconnector" aria-hidden="true">&#8594;</div>
+    <div class="pnode{% if counts.fix %} pnode-active{% endif %}">
+      <div class="pnode-count">{{ counts.fix }}</div>
+      <div class="pnode-label">Fix</div>
+    </div>
+    <div class="pconnector" aria-hidden="true">&#8594;</div>
+    <div class="pnode{% if counts.pr_ci %} pnode-active{% endif %}">
+      <div class="pnode-count">{{ counts.pr_ci }}</div>
+      <div class="pnode-label">PR / CI</div>
+    </div>
+    <div class="pconnector" aria-hidden="true">&#8594;</div>
+    <div class="pnode pnode-ok{% if counts.done %} pnode-active{% endif %}">
+      <div class="pnode-count">{{ counts.done }}</div>
+      <div class="pnode-label">Done</div>
+    </div>
+  </div>
+
+  <div class="pipeline-branches">
+    <div class="pbranch{% if counts.retry %} pnode-active{% endif %}">
+      <span class="pbranch-arrow" aria-hidden="true">&#8630;</span>
+      <span class="pbranch-count">{{ counts.retry }}</span>
+      <span class="pbranch-label">Retry</span>
+      <span class="pbranch-note">loops back to Fix</span>
+    </div>
+    <div class="pbranch pbranch-err{% if counts.escalated %} pnode-active{% endif %}">
+      <span class="pbranch-arrow" aria-hidden="true">&#8631;</span>
+      <span class="pbranch-count">{{ counts.escalated }}</span>
+      <span class="pbranch-label">Escalated</span>
+      <span class="pbranch-note">needs a human</span>
+    </div>
+  </div>
+
+  <p class="pipeline-caption"><small>"Intake" is an aggregate count, not a per-finding stage &mdash; a finding only becomes individually trackable once classified and handed to the Fixer (bucket 2/3). No-fix and high-risk findings (bucket 1/4) go straight to a GitHub triage issue instead and never appear below.</small></p>
+
+  <h2>In Flight</h2>
+  {% if in_flight %}
+    <div class="record-list pipeline-list">
+      {% for r in in_flight %}
+      <div class="pipeline-row status-{{ r.status_class }}">
+        <div class="pipeline-stepper" title="{{ stage_labels[r.pipeline_stage] }}">
+          {% for stage in stepper_stages %}
+            <span class="pdot pdot-{{ r.dot_states[loop.index0] }}"></span>
+          {% endfor %}
+        </div>
+        <span class="pipeline-icon" aria-hidden="true">{{ r.status_icon }}</span>
+        <span class="pipeline-component truncate" title="{{ r.component_name }}">{{ r.component_name }}</span>
+        <span class="pipeline-version truncate">{{ r.old_version }} &rarr; {{ r.new_version }}</span>
+        <span class="pipeline-stage-label">{{ stage_labels[r.pipeline_stage] }}</span>
+        <span class="pipeline-elapsed">{{ r.elapsed }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p>No active fix attempts right now.</p>
+  {% endif %}
+
+  {% if needs_attention %}
+    <h2>Needs Attention</h2>
+    <div class="record-list pipeline-list">
+      {% for r in needs_attention %}
+      <div class="pipeline-row status-{{ r.status_class }}">
+        <span class="pipeline-icon" aria-hidden="true">{{ r.status_icon }}</span>
+        <span class="pipeline-component truncate" title="{{ r.component_name }}">{{ r.component_name }}</span>
+        <span class="pipeline-version truncate">{{ r.old_version }} &rarr; {{ r.new_version }}</span>
+        <span class="pipeline-stage-label">{{ r.status_description }}</span>
+        <span class="pipeline-elapsed">{{ r.elapsed }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>

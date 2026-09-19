@@ -1,0 +1,40 @@
+{# Shared trigger+status partial for every background job the dashboard can
+   kick off (KB import, live scan, fixer trigger, watcher check-now) --
+   originally KB-import-specific (kb_import_progress.html), generalized once
+   three more callers needed the identical status/current/total/message shape.
+   Expects: job (dict), target_id, trigger_url, poll_url, button_label,
+   just_triggered, show_bar, and optionally button_title/poll_interval. #}
+{% set importing = job.status == "running" or (just_triggered and job.status == "idle") %}
+<div id="{{ target_id }}" class="kb-import-row">
+  <button class="btn btn-primary" hx-post="{{ trigger_url }}" hx-target="#{{ target_id }}" hx-swap="outerHTML"
+          {% if importing %}disabled{% endif %}
+          {% if button_title %}title="{{ button_title }}"{% endif %}>
+    {% if importing %}
+      <span class="spinner" aria-hidden="true"></span> Running&hellip;
+    {% else %}
+      <span class="icon" aria-hidden="true">&#8635;</span> {{ button_label }}
+    {% endif %}
+  </button>
+
+  <div class="kb-import-status">
+    {% if importing %}
+      <div hx-get="{{ poll_url }}" hx-trigger="every {{ poll_interval or '1.5s' }}" hx-target="#{{ target_id }}" hx-swap="outerHTML">
+        {% if show_bar and job.total %}
+          <div class="bar-row">
+            <div class="bar-track"><div class="bar-fill" style="width: {{ (job.current / job.total * 100) if job.total else 0 }}%"></div></div>
+            <div class="bar-value">{{ job.current }}/{{ job.total }}</div>
+          </div>
+        {% endif %}
+        <p><small>{{ job.message or "Starting..." }}</small></p>
+      </div>
+    {% elif job.status == "done" %}
+      <p class="ok">&#10003; {{ job.message }}</p>
+    {% elif job.status == "error" %}
+      <p class="err">&#10007; {{ job.message }}</p>
+    {% elif job.status == "unreachable" %}
+      <p class="err">{{ job.message }}</p>
+    {% else %}
+      <p><small>Idle.</small></p>
+    {% endif %}
+  </div>
+</div>

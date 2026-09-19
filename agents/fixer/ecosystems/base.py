@@ -90,6 +90,15 @@ class PackageEcosystem(Protocol):
         """
         ...
 
+    def run_tests(self, repo_path: Path) -> Tuple[bool, str]:
+        """Runs the ecosystem's full test suite. Same contract as
+        verify_build() -- never raises, always returns (success, message).
+        Only invoked when RUN_TESTS=1 and the active FixEngine advertises
+        supports_tests (see engines/base.py) -- CodeFixer is what decides
+        whether to call this at all, not this Protocol.
+        """
+        ...
+
     def get_project_coordinates(self, repo_path: Path) -> dict:
         """Returns metadata about the project itself (e.g. group_id, artifact_id, version, component_name)."""
         ...
@@ -97,3 +106,4 @@ class PackageEcosystem(Protocol):
     def has_dependency(self, repo_path: Path, component_name: str) -> bool:
         """Returns True if component_name is declared in the project's manifest."""
         ...
+
