@@ -25,7 +25,7 @@ services:
       MAX_PARALLEL_FIXES: "2"       # Limit concurrent fixes to avoid Vertex AI rate limits
       KB_HYDRATION: "1"             # set to "0" to skip Knowledge Agent (faster local testing)
       RUN_TESTS: "0"                # set to "1" to give the Fixer a run_maven_test tool (adk engine only, slower)
-      NIGHTLY_RUN_ENABLED: "1"      # sleep during the day; run one cycle nightly
+      NIGHTLY_RUN_ENABLED: "0"      # set to 0 for demo/active mode
       NIGHTLY_RUN_TIME: "00:00"     # local time in NIGHTLY_RUN_TIMEZONE
       NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
       NIGHTLY_SCAN_MAX_WAIT_SECONDS: "7200"
@@ -37,6 +37,7 @@ services:
       # Bind mount so the dashboard container can read tracking.json directly
       - ./data:/data
       - ./config:/config
+      - ./playbooks:/app/playbooks:ro
       # GCP credentials for Vertex AI (ADC)
       - ./config/my-google-service-account.json:/gcp/adc.json:ro
     restart: unless-stopped
@@ -66,7 +67,7 @@ services:
       FIXER_RETRY_URL: http://fixer-server:8080/retry
       WATCHER_DAEMON: "1"
       WATCHER_SLEEP_SECONDS: "${WATCHER_SLEEP_SECONDS:-60}"
-      NIGHTLY_RUN_ENABLED: "1"
+      NIGHTLY_RUN_ENABLED: "0"
       NIGHTLY_RUN_TIME: "00:00"
       NIGHTLY_RUN_TIMEZONE: "Asia/Kolkata"
       WATCHER_PORT: "8090"
@@ -79,6 +80,7 @@ services:
     volumes:
       - ./data:/data
       - ./config:/config
+      - ./playbooks:/app/playbooks:ro
       - ./config/my-google-service-account.json:/gcp/adc.json:ro
     depends_on:
       - fixer-server
@@ -118,6 +120,7 @@ services:
       - ./data:/data
       - ./scan-reports:/reports
       - ./config:/config
+      - ./playbooks:/app/playbooks:ro
     restart: unless-stopped
 
   # ── Fixer one-shot (manual use) ───────────────────────────────────────────

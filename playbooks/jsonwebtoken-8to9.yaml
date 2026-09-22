@@ -1,0 +1,22 @@
+component: "jsonwebtoken"
+from_major: 8
+to_major: 9
+confidence: high
+breaking_changes:
+  - "The 'algorithms' option is now mandatory in jwt.verify() when verifying asymmetric tokens (RS256, ES256) to prevent key confusion attacks (CVE-2022-23529)."
+  - "jwt.sign() no longer accepts a plain object as the secret key when using HMAC algorithms."
+  - "Dropped support for Node.js versions older than 14."
+api_removals:
+  - "Legacy string-based options parsing removed in favor of standard options object."
+migration_steps:
+  - "Update package.json dependency: \"jsonwebtoken\": \"^9.0.2\""
+  - "Inspect all jwt.verify() calls and add explicit algorithms option: jwt.verify(token, secret, { algorithms: ['HS256'] })"
+  - "Ensure secret or private key passed to jwt.sign() is a String or Buffer, not a plain Object."
+  - "Verify error handling for JsonWebTokenError and TokenExpiredError."
+patterns:
+  - find: "jwt.verify(token, secret)"
+    replace: "jwt.verify(token, secret, { algorithms: ['HS256'] })"
+    description: "Enforce explicit algorithm in jwt.verify to mitigate key confusion attacks"
+  - find: "jwt.verify(token, publicKey)"
+    replace: "jwt.verify(token, publicKey, { algorithms: ['RS256'] })"
+    description: "Enforce explicit RS256 algorithm for RSA verification"

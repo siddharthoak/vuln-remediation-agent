@@ -1,0 +1,19 @@
+component: "axios"
+from_major: 0
+to_major: 1
+confidence: high
+breaking_changes:
+  - "AxiosError is now a subclass of Error with standardized .code, .response, and .request properties."
+  - "Custom request headers are no longer deeply merged into defaults; set headers explicitly per request."
+api_removals:
+  - "axios.all() is deprecated in favor of native Promise.all()"
+  - "axios.spread() is deprecated in favor of array destructuring"
+migration_steps:
+  - "Update package.json: \"axios\": \"^1.7.9\""
+  - "Replace axios.all([p1, p2]) with Promise.all([p1, p2])"
+  - "Replace axios.spread((r1, r2) => ...) with array destructuring on Promise.all().then(([r1, r2]) => ...)"
+  - "Update catch blocks to check axios.isAxiosError(error) before accessing error.response"
+patterns:
+  - find: "axios.all("
+    replace: "Promise.all("
+    description: "Replace deprecated axios.all with native Promise.all"
